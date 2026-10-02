@@ -315,7 +315,16 @@ fn from_hex(s: &str) -> Option<Fingerprint> {
     bytes.try_into().ok()
 }
 
+/// `$LANKVM_DATA_DIR` gives an instance its own identity, trust lists and log, so a second copy
+/// can run on the same Mac as a separate device (see `scripts/second-instance.sh`).
+fn data_dir_override() -> Option<PathBuf> {
+    std::env::var_os("LANKVM_DATA_DIR").filter(|d| !d.is_empty()).map(PathBuf::from)
+}
+
 fn data_dir() -> PathBuf {
+    if let Some(dir) = data_dir_override() {
+        return dir;
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join("Library/Application Support/lankvm")
 }
@@ -324,7 +333,10 @@ fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"));
     // Log to a file too: a Finder-launched app has no terminal.
-    let log_path = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs/lankvm.log"));
+    let log_path = match data_dir_override() {
+        Some(dir) => std::fs::create_dir_all(&dir).ok().map(|()| dir.join("lankvm.log")),
+        None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs/lankvm.log")),
+    };
     let file = log_path.and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
     let builder = tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false);
     let _ = match file {

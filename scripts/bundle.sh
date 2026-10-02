@@ -23,6 +23,9 @@ fi
 command -v cargo >/dev/null || { echo "error: cargo not found; install Rust (rustup) first." >&2; exit 1; }
 
 cargo build --release -p lankvm-core
+# SwiftPM doesn't track the Rust static library as an input, so it won't relink when only the
+# Rust code changed. Removing the old executable forces the link step.
+rm -f macos/.build/release/LanKVM
 swift build -c release --package-path macos
 
 rm -rf "$APP"

@@ -360,7 +360,11 @@ fn new_decoder(video: &VideoFrame, shared: &Arc<Shared>) -> Result<Decoder> {
     Decoder::new(video.codec, &video.param_sets, video.nal_length_size, move |decoded| {
         let mut timing = *shared.decoding.lock().unwrap();
         timing.decoded_us = clock::now_us();
-        shared.stats.lock().unwrap().decode.add(timing.decoded_us.saturating_sub(timing.received_us) as f64);
+        {
+            let mut stats = shared.stats.lock().unwrap();
+            stats.decode.add(timing.decoded_us.saturating_sub(timing.received_us) as f64);
+            stats.frames_decoded += 1;
+        }
         shared.slot.publish(ReadyFrame { pixel_buffer: decoded.pixel_buffer, timing });
     })
 }

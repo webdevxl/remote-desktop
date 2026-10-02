@@ -78,6 +78,39 @@ certificate (it asks for your login password once):
 
 Set `LANKVM_PORT` to change the UDP port (default 47800).
 
+## Testing a connection on one Mac
+
+Connecting LanKVM to itself isn't a real test: one process plays both roles with one identity.
+Run two separate devices instead. `LANKVM_DATA_DIR` gives an instance its own certificate,
+trust lists and log, and `LANKVM_PORT` its own port.
+
+**Two apps.** With the normal LanKVM running, start a second one, "LanKVM 2", on port 47801:
+
+```bash
+./scripts/second-instance.sh
+```
+
+In LanKVM 2, connect to `127.0.0.1:47800` and type the PIN that LanKVM shows. LanKVM 2 is a
+copy with its own bundle id, so macOS keeps its permissions separate, as on another Mac. It
+only needs Screen Recording if you view it from the first instance. Its log is in
+`~/Library/Application Support/lankvm-2/lankvm.log`.
+
+**Headless viewer.** For a repeatable check with numbers, the probe connects, pairs, decodes
+the host's screen and prints the viewer's stats every second. It exits 0 only if frames were
+decoded:
+
+```bash
+cargo run --release -p lankvm-core --example probe -- 127.0.0.1:47800 --seconds 10
+```
+
+The first run asks for the PIN shown on the host. Later runs reconnect without one (the probe
+keeps its identity in `~/Library/Application Support/lankvm-probe`). `--max 1920x1200` limits
+the stream size, like a viewer with a smaller screen. Frames are only sent when the host's
+screen changes, so keep something moving there when you measure fps.
+
+Both run over loopback, so they test everything except a real network: Wi-Fi jitter and loss,
+the firewall, and macOS's Local Network permission. Check those with a second Mac.
+
 ## Security model
 
 - The app listens on UDP 47800 but only accepts addresses from the local network: RFC 1918,
