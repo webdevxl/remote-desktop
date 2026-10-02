@@ -205,6 +205,10 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
             }
             HostMsg::Rejected { reason } => {
                 conn.close(0u32.into(), b"rejected");
+                // Hosts from protocol 1 said only "protocol version N not supported (host speaks 1)".
+                if reason.starts_with("protocol version ") {
+                    bail!("LanKVM on {addr} is older than this Mac's. Update LanKVM there, then quit and reopen it.");
+                }
                 bail!("{reason}");
             }
             other => bail!("unexpected reply {other:?}"),

@@ -168,7 +168,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>) -> Result<()> {
         bail!("expected Hello");
     };
     if version != PROTOCOL_VERSION {
-        return reject(&conn, &mut send, &format!("protocol version {version} not supported (host speaks {PROTOCOL_VERSION})")).await;
+        return reject(&conn, &mut send, &version_mismatch(version, &system::device_name())).await;
     }
     if !tokio::task::spawn_blocking(can_capture).await? {
         return reject(&conn, &mut send, "That Mac hasn't allowed Screen Recording for LanKVM yet (System Settings → Privacy & Security), or LanKVM needs a restart there after allowing it.").await;
@@ -260,6 +260,15 @@ async fn reject(conn: &Connection, send: &mut SendStream, reason: &str) -> Resul
     let _ = send.finish();
     let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
     bail!("rejected: {reason}")
+}
+
+/// Shown on the viewer, so "this Mac" is the viewer. Names the Mac that needs the update.
+fn version_mismatch(viewer_version: u32, host_name: &str) -> String {
+    let outdated = if viewer_version < PROTOCOL_VERSION { "this Mac" } else { host_name };
+    format!(
+        "LanKVM on {host_name} doesn't match this Mac (protocol {PROTOCOL_VERSION} there, {viewer_version} here). \
+         Update LanKVM on {outdated}, then quit and reopen it."
+    )
 }
 
 /// Largest size with the display's aspect ratio that fits the client's limit (even dimensions,
@@ -498,6 +507,12 @@ mod tests {
         assert_eq!(fit_within(5120, 2880, 2560, 1600), (2560, 1440));
         let (w, h) = fit_within(3024, 1964, 1920, 1080);
         assert!(w <= 1920 && h <= 1080 && w % 2 == 0 && h % 2 == 0);
+    }
+
+    #[test]
+    fn version_mismatch_names_the_outdated_mac() {
+        assert!(version_mismatch(PROTOCOL_VERSION - 1, "Studio").contains("Update LanKVM on this Mac"));
+        assert!(version_mismatch(PROTOCOL_VERSION + 1, "Studio").contains("Update LanKVM on Studio"));
     }
 
     #[test]
