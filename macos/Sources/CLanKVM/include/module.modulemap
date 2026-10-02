@@ -1,0 +1,4 @@
+module CLanKVM {
+    header "lankvm.h"
+    export *
+}

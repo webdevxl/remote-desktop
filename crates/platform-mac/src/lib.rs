@@ -1,0 +1,16 @@
+//! macOS implementations: screen capture, hardware video encode/decode, GPU import,
+//! permissions and clocks. Everything platform-specific lives here so other platforms can
+//! slot in beside it later.
+
+pub mod capture;
+pub mod clock;
+pub mod decoder;
+pub mod encoder;
+pub mod gpu;
+mod nal;
+pub mod system;
+pub mod permissions;
+mod util;
+
+pub use objc2_core_foundation::CFRetained;
+pub use objc2_core_video::CVPixelBuffer;

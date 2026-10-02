@@ -1,0 +1,25 @@
+[package]
+name = "lankvm-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lankvm_core"
+# staticlib: linked into the SwiftUI app. rlib: for `cargo test`.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+protocol.workspace = true
+transport.workspace = true
+platform-mac.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+quinn.workspace = true
+serde.workspace = true
+serde_json = "1"
+wgpu = "30"
+objc2 = "0.6"
+if-addrs = "0.15"
+pollster = "0.4"
