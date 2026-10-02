@@ -18,22 +18,36 @@ Keyboard and mouse control is the next milestone.
 - **Decode → display with zero copies.** The hardware decoder outputs IOSurfaces. Each plane is
   wrapped as a Metal texture and sampled by a wgpu shader, then presented immediately with no
   frame queue.
-- **Measured, not guessed.** The viewer overlay (F1) shows capture→screen latency split into
+- **Measured, not guessed.** The viewer's latency overlay shows capture→screen latency split into
   encode, network, decode and display, using a clock synced to the host.
 
-## Requirements
-
-- Apple Silicon Macs, macOS 14+
-- Rust (stable), Xcode 16+ (for Swift and the macOS SDK)
-
-## Build and run
+## Install
 
 ```bash
-./scripts/bundle.sh
+./install.sh
 ```
 
+The installer:
+
+1. Checks the Mac: Apple Silicon, macOS 14 or later.
+2. Checks **Xcode 16.0 or later**, which provides Swift and the macOS SDK. If Xcode is missing or
+   older, it opens Xcode in the App Store and stops; run it again after updating. If only the
+   Command Line Tools are active, it switches to Xcode, and it accepts the Xcode license if
+   needed. Both of these ask for your password.
+3. Installs **Rust** (rustup, Rust 1.88 or later) if it's missing, using Homebrew when available,
+   and updates it if it's older.
+4. Offers to create a local code-signing certificate (see Signing below).
+5. Builds and signs `LanKVM.app`, installs it into `/Applications` (or `~/Applications`), and
+   opens it.
+
+`./install.sh --check` only reports what's missing. The minimum versions are at the top of
+`install.sh`.
+
+For quick rebuilds while developing, `./scripts/bundle.sh` builds `target/release/LanKVM.app`
+without installing it:
+
 ```bash
-open target/release/LanKVM.app
+./scripts/bundle.sh && open target/release/LanKVM.app
 ```
 
 `bundle.sh` builds the Rust core as a static library, links it into the SwiftUI app with
