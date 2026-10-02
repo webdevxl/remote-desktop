@@ -10,10 +10,10 @@ use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
-use objc2_core_foundation::{CFRetained, CFString};
+use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{CGDisplayCopyDisplayMode, CGDisplayMode, CGMainDisplayID};
 use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
-use objc2_core_video::CVPixelBuffer;
+use objc2_core_video::{CVPixelBuffer, kCVImageBufferYCbCrMatrix_ITU_R_709_2};
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
@@ -210,7 +210,9 @@ impl Capturer {
             // One buffer is held back for keyframe re-encodes; keep slack for the pipeline.
             config.setQueueDepth(5);
             config.setShowsCursor(cfg.show_cursor);
-            config.setColorMatrix(&CFString::from_static_str("ITU_R_709_2"));
+            // `colorMatrix` is an unretained (assign) property, so it needs a CFString that
+            // outlives the config; SCStream copies it later.
+            config.setColorMatrix(kCVImageBufferYCbCrMatrix_ITU_R_709_2);
 
             let stream = SCStream::initWithFilter_configuration_delegate(
                 SCStream::alloc(),
