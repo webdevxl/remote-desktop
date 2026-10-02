@@ -68,6 +68,8 @@ pub struct FrameTiming {
 #[derive(Default)]
 pub struct Stats {
     pub clock: ClockSync,
+    /// Host display → encoder input: ScreenCaptureKit's delivery plus any wait for the encoder.
+    pub capture: Ema,
     pub encode: Ema,
     pub network: Ema,
     pub decode: Ema,
@@ -87,6 +89,7 @@ pub struct StatsView {
     pub fps: f64,
     pub mbps: f64,
     pub total_ms: Option<f64>,
+    pub capture_ms: Option<f64>,
     pub encode_ms: Option<f64>,
     pub network_ms: Option<f64>,
     pub decode_ms: Option<f64>,
@@ -104,6 +107,7 @@ impl Stats {
             fps: self.fps(),
             mbps: self.mbps(),
             total_ms: self.total.ms(),
+            capture_ms: self.capture.ms(),
             encode_ms: self.encode.ms(),
             network_ms: self.network.ms(),
             decode_ms: self.decode.ms(),
@@ -156,7 +160,8 @@ impl RateWindow {
 
     fn mbps(&mut self) -> f64 {
         self.trim();
-        self.events.iter().map(|(_, b)| *b as f64).sum::<f64>() * 8.0 / 1e6
+        // Not `sum()`: an empty f64 sum is -0.0, which shows as "-0.0 Mbit/s".
+        self.events.iter().fold(0.0, |sum, (_, b)| sum + *b as f64) * 8.0 / 1e6
     }
 }
 

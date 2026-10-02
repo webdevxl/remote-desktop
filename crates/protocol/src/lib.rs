@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 47800;
 pub const ALPN: &[u8] = b"lankvm/1";
 /// Upper bound for a single control message; protects against garbage length prefixes.
@@ -68,6 +68,8 @@ pub struct VideoFrame {
     pub height: u32,
     /// Host clock (µs) when the frame was composited on the host display.
     pub capture_time_us: u64,
+    /// Host clock (µs) when the frame went into the encoder.
+    pub encode_start_us: u64,
     /// Host clock (µs) when the encoder emitted the frame.
     pub encoded_time_us: u64,
     /// VPS/SPS/PPS (HEVC) or SPS/PPS (H.264). Present on keyframes only.

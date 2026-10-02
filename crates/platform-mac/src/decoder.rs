@@ -145,9 +145,11 @@ impl Decoder {
         let mut info = VTDecodeInfoFlags::empty();
         check(
             unsafe {
+                // No `1xRealTimePlayback` hint: it allows a low-power mode that decodes no faster
+                // than the frame rate, which adds latency to every frame.
                 self.session.decode_frame(
                     &sample,
-                    VTDecodeFrameFlags::Frame_1xRealTimePlayback,
+                    VTDecodeFrameFlags::empty(),
                     tag as *mut c_void,
                     &mut info,
                 )

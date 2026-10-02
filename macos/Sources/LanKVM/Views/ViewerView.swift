@@ -186,6 +186,7 @@ struct StatsHUD: View {
                     .foregroundStyle(.secondary)
             }
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
+                row("Capture", stats?.captureMs)
                 row("Encode", stats?.encodeMs)
                 row("Network", stats?.networkMs)
                 row("Decode", stats?.decodeMs)

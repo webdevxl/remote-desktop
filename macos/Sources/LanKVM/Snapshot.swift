@@ -24,8 +24,8 @@ enum Snapshot {
                 size: CGSize(width: 640, height: 460), appearance: appearance,
                 to: dir.appendingPathComponent("pin-entry-\(suffix).png"))
             let info = SessionInfo(hostName: "Studio", address: "192.168.1.31:47800", width: 3024, height: 1964, fps: 60, codec: "Hevc")
-            let sample = SessionStats(fps: 60, mbps: 31.4, totalMs: 17.8, encodeMs: 4.1, networkMs: 0.9, decodeMs: 2.3,
-                                      displayMs: 6.2, rttMs: 0.6, framesShown: 1200, framesLost: 0, keyframeRequests: 1)
+            let sample = SessionStats(fps: 60, mbps: 31.4, totalMs: 17.8, captureMs: 4.3, encodeMs: 4.1, networkMs: 0.9, decodeMs: 2.3,
+                                      displayMs: 1.9, rttMs: 0.6, framesShown: 1200, framesLost: 0, keyframeRequests: 1)
             render(
                 ZStack(alignment: .topLeading) {
                     LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)

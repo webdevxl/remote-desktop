@@ -55,7 +55,7 @@ fn hevc_encode_decode_round_trip() {
         let _ = enc_tx.send(f);
     })
     .expect("create encoder");
-    println!("encoder: {:?}, low latency: {}", encoder.codec(), encoder.low_latency());
+    println!("encoder: {:?}, hardware: {}", encoder.codec(), encoder.hardware());
 
     let (dec_tx, dec_rx) = mpsc::channel();
     let mut decoder: Option<Decoder> = None;

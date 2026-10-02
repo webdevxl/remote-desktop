@@ -9,8 +9,9 @@ Keyboard and mouse control is the next milestone.
 ## How it stays fast
 
 - **Capture → encode on the GPU, no CPU copies.** ScreenCaptureKit delivers IOSurface-backed NV12
-  frames straight to the hardware HEVC encoder (VideoToolbox low-latency rate control, no
-  B-frames, keyframes only on request).
+  frames straight to the hardware HEVC encoder, which runs flat out instead of pacing itself to
+  the frame rate (no B-frames, keyframes only on request). It takes one frame at a time, always
+  the newest, so a slow frame costs frame rate, never latency.
 - **UDP, never TCP, for video.** One QUIC connection (quinn) carries TLS 1.3, a reliable control
   stream, and unreliable datagrams for video. A fixed-window congestion controller is used
   because the LAN doesn't need Cubic's backoff. Lost frames are dropped, never retransmitted,
@@ -19,7 +20,9 @@ Keyboard and mouse control is the next milestone.
   wrapped as a Metal texture and sampled by a wgpu shader, then presented immediately with no
   frame queue.
 - **Measured, not guessed.** The viewer's latency overlay shows capture→screen latency split into
-  encode, network, decode and display, using a clock synced to the host.
+  capture, encode, network, decode and display, using a clock synced to the host.
+  `cargo test --release -p platform-mac --test encode_latency -- --ignored --nocapture` measures
+  the encoder alone at common screen sizes.
 
 ## Install
 

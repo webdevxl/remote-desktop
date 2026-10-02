@@ -144,15 +144,16 @@ fn run(core: &Arc<Core>, id: u64, events: &mpsc::Receiver<Event>, args: &Args) -
             break;
         }
         let Some(s) = core.session_stats(id) else { break };
-        let pipeline = match (s.encode_ms, s.network_ms, s.decode_ms) {
-            (Some(e), Some(n), Some(d)) => Some(e + n + d),
+        let pipeline = match (s.capture_ms, s.encode_ms, s.network_ms, s.decode_ms) {
+            (Some(c), Some(e), Some(n), Some(d)) => Some(c + e + n + d),
             _ => None,
         };
         println!(
-            "{second:>3}s  {:>3.0} fps  {:>6.1} Mbps  capture→decoded {:>5} ms (encode {} + network {} + decode {})  rtt {} ms  decoded {}  lost {}  keyframe requests {}",
+            "{second:>3}s  {:>3.0} fps  {:>6.1} Mbps  capture→decoded {:>5} ms (capture {} + encode {} + network {} + decode {})  rtt {} ms  decoded {}  lost {}  keyframe requests {}",
             s.fps,
             s.mbps,
             ms(pipeline),
+            ms(s.capture_ms),
             ms(s.encode_ms),
             ms(s.network_ms),
             ms(s.decode_ms),

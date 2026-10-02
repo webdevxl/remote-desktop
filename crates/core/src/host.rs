@@ -1,8 +1,9 @@
 //! Host role: accept viewers from the local network and stream this Mac's screen to them.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -26,6 +27,8 @@ use crate::{Event, EventSink, Trust};
 const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the PIN stays valid while someone walks over to the other Mac.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
+/// A frame should leave the encoder within milliseconds; past this, move on to the next one.
+const ENCODE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct Viewer {
@@ -277,16 +280,25 @@ fn bitrate_for(width: u32, height: u32, fps: u32) -> u32 {
 struct StreamSession {
     capturer: Option<Capturer>,
     shared: Arc<Shared>,
+    encode_thread: Option<JoinHandle<()>>,
 }
 
+/// Capture runs ahead of the encoder, which takes one frame at a time and always the newest. A
+/// frame that would have to queue behind another is replaced by a newer one instead, so a slow
+/// encode costs frame rate, never latency.
 struct Shared {
     encoder: Encoder,
-    /// The newest captured frame, kept so a keyframe can be produced immediately even when the
-    /// screen is static (ScreenCaptureKit only delivers frames on change). Its lock also
-    /// serializes all encode calls.
-    last_frame: Mutex<Option<CapturedFrame>>,
-    force_keyframe: AtomicBool,
+    state: Mutex<EncodeState>,
+    wake: Condvar,
     last_forced_us: AtomicU64,
+}
+
+#[derive(Default)]
+struct EncodeState {
+    /// Captured and waiting for the encoder; a newer capture replaces it.
+    next: Option<CapturedFrame>,
+    force_keyframe: bool,
+    stop: bool,
 }
 
 impl StreamSession {
@@ -296,13 +308,18 @@ impl StreamSession {
         let encoder = Encoder::new(encoder, move |frame| send_frame(&conn, &packetizer, frame, width, height))?;
         let shared = Arc::new(Shared {
             encoder,
-            last_frame: Mutex::new(None),
-            force_keyframe: AtomicBool::new(false),
+            state: Mutex::new(EncodeState::default()),
+            wake: Condvar::new(),
             last_forced_us: AtomicU64::new(0),
         });
-        let on_frame = shared.clone();
-        let capturer = Capturer::start(capture, move |frame| on_frame.on_captured(frame))?;
-        Ok(Self { capturer: Some(capturer), shared })
+        let encode_thread = std::thread::Builder::new().name("lankvm-encode".into()).spawn({
+            let shared = shared.clone();
+            move || shared.encode_loop()
+        })?;
+        let mut session = Self { capturer: None, shared, encode_thread: Some(encode_thread) };
+        let on_frame = session.shared.clone();
+        session.capturer = Some(Capturer::start(capture, move |frame| on_frame.on_captured(frame))?);
+        Ok(session)
     }
 
     fn codec(&self) -> Codec {
@@ -318,17 +335,18 @@ impl Drop for StreamSession {
     fn drop(&mut self) {
         // Stop capture first so no new frames reach the encoder while it shuts down.
         self.capturer.take();
+        self.shared.state.lock().unwrap().stop = true;
+        self.shared.wake.notify_one();
+        if let Some(thread) = self.encode_thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
 impl Shared {
     fn on_captured(&self, frame: CapturedFrame) {
-        let mut last = self.last_frame.lock().unwrap();
-        let force = self.force_keyframe.swap(false, Ordering::AcqRel);
-        if let Err(e) = self.encoder.encode(&frame.pixel_buffer, frame.capture_time_us, force) {
-            tracing::warn!("encode: {e:#}");
-        }
-        *last = Some(frame);
+        self.state.lock().unwrap().next = Some(frame);
+        self.wake.notify_one();
     }
 
     fn request_keyframe(&self) {
@@ -338,15 +356,42 @@ impl Shared {
             return;
         }
         self.last_forced_us.store(now, Ordering::Release);
-        let last = self.last_frame.lock().unwrap();
-        match last.as_ref() {
-            // Re-encode what's on screen right now as a keyframe.
-            Some(frame) => {
-                if let Err(e) = self.encoder.encode(&frame.pixel_buffer, now, true) {
-                    tracing::warn!("keyframe encode: {e:#}");
+        self.state.lock().unwrap().force_keyframe = true;
+        self.wake.notify_one();
+    }
+
+    fn encode_loop(&self) {
+        // The newest frame handed to the encoder, kept so a keyframe can be produced right away
+        // even when the screen is static (ScreenCaptureKit only delivers frames on change).
+        let mut last: Option<CapturedFrame> = None;
+        loop {
+            let (next, force) = {
+                let mut state = self.state.lock().unwrap();
+                while !state.stop && state.next.is_none() && !(state.force_keyframe && last.is_some()) {
+                    state = self.wake.wait(state).unwrap();
                 }
+                if state.stop {
+                    return;
+                }
+                (state.next.take(), std::mem::take(&mut state.force_keyframe))
+            };
+            let time_us = match next {
+                Some(frame) => {
+                    let time_us = frame.capture_time_us;
+                    last = Some(frame);
+                    time_us
+                }
+                // Nothing new on screen: re-encode what's showing now as a keyframe.
+                None => clock::now_us(),
+            };
+            let Some(frame) = &last else { continue };
+            if let Err(e) = self.encoder.encode(&frame.pixel_buffer, time_us, force) {
+                tracing::warn!("encode: {e:#}");
+                continue;
             }
-            None => self.force_keyframe.store(true, Ordering::Release),
+            if !self.encoder.wait_idle(ENCODE_TIMEOUT) {
+                tracing::warn!("encoder took over {ENCODE_TIMEOUT:?} for a frame");
+            }
         }
     }
 }
@@ -358,6 +403,7 @@ fn send_frame(conn: &Connection, packetizer: &Mutex<Packetizer>, frame: EncodedF
         width,
         height,
         capture_time_us: frame.capture_time_us,
+        encode_start_us: frame.encode_start_us,
         encoded_time_us: clock::now_us(),
         param_sets: frame.param_sets,
         nal_length_size: frame.nal_length_size,

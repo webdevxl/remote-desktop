@@ -60,6 +60,7 @@ struct SessionStats: Decodable, Equatable {
     var fps: Double
     var mbps: Double
     var totalMs: Double?
+    var captureMs: Double?
     var encodeMs: Double?
     var networkMs: Double?
     var decodeMs: Double?

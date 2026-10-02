@@ -349,7 +349,8 @@ async fn receive_video(
 fn record_arrival(shared: &Shared, video: &VideoFrame, bytes: usize, received_us: u64) {
     let mut stats = shared.stats.lock().unwrap();
     stats.on_frame_received(bytes);
-    stats.encode.add(video.encoded_time_us.saturating_sub(video.capture_time_us) as f64);
+    stats.capture.add(video.encode_start_us.saturating_sub(video.capture_time_us) as f64);
+    stats.encode.add(video.encoded_time_us.saturating_sub(video.encode_start_us) as f64);
     if let Some(encoded_local) = stats.clock.to_local(video.encoded_time_us) {
         stats.network.add(received_us.saturating_sub(encoded_local) as f64);
     }
