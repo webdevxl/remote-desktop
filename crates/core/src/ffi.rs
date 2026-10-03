@@ -6,7 +6,7 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, OnceLock};
 
-use protocol::{InputMsg, POS_MAX, ScrollInput};
+use protocol::{DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction};
 use serde::Serialize;
 
 use crate::{Core, Event};
@@ -284,6 +284,62 @@ pub unsafe extern "C" fn lk_input_scroll(session: u64, scroll: *const LkScroll) 
     );
 }
 
+/// A three- or four-finger swipe or pinch the Dock acts on, as this Mac's trackpad reported it
+/// (gesture event fields): `axis` 1 horizontal, 2 vertical, 3 pinch (field 123); `phase`
+/// 1 began, 2 changed, 4 ended, 8 cancelled (field 132); `progress` since it began (124); exit
+/// velocities (129, 130); `inverted` (136). Anything else is ignored.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_input_dock_swipe(session: u64, axis: u8, phase: u8, progress: f64, velocity_x: f64, velocity_y: f64, inverted: bool) {
+    let (Some(axis), Some(phase)) = (DockAxis::from_motion(axis), GesturePhase::from_bits(phase)) else { return };
+    // To the wire's direction convention (see `GestureInput::DockSwipe`).
+    let direction = platform_mac::gesture::dock_direction(axis);
+    send(
+        session,
+        InputMsg::Gesture(GestureInput::DockSwipe {
+            axis,
+            phase,
+            progress: (progress * direction) as f32,
+            velocity_x: (velocity_x * direction) as f32,
+            velocity_y: (velocity_y * direction) as f32,
+            inverted,
+        }),
+    );
+}
+
+/// Pinch to zoom at `x`, `y`: `delta` as `NSEvent.magnification`. `phase` as for
+/// `lk_input_dock_swipe` (map from `NSEvent.Phase` first).
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_input_magnify(session: u64, x: f64, y: f64, phase: u8, delta: f64) {
+    let Some(phase) = GesturePhase::from_bits(phase) else { return };
+    send(session, InputMsg::Gesture(GestureInput::Magnify { x: pos(x), y: pos(y), phase, delta: delta as f32 }));
+}
+
+/// Two-finger rotation at `x`, `y`: `degrees` as `NSEvent.rotation`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_input_rotate(session: u64, x: f64, y: f64, phase: u8, degrees: f64) {
+    let Some(phase) = GesturePhase::from_bits(phase) else { return };
+    send(session, InputMsg::Gesture(GestureInput::Rotate { x: pos(x), y: pos(y), phase, degrees: degrees as f32 }));
+}
+
+/// Two-finger double tap (smart zoom) at `x`, `y`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_input_smart_magnify(session: u64, x: f64, y: f64) {
+    send(session, InputMsg::Gesture(GestureInput::SmartMagnify { x: pos(x), y: pos(y) }));
+}
+
+/// Swipe between pages at `x`, `y`: a swipe event's `deltaX`, `deltaY` (-1, 0 or 1).
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_input_navigation_swipe(session: u64, x: f64, y: f64, dx: i8, dy: i8) {
+    send(session, InputMsg::Gesture(GestureInput::NavigationSwipe { x: pos(x), y: pos(y), dx: dx.signum(), dy: dy.signum() }));
+}
+
+/// Mission Control, Show Desktop, a Space left or right... on the remote Mac (`LK_SYSTEM_*` in
+/// lankvm.h). A host that doesn't know the action ignores it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_input_system_action(session: u64, action: u16) {
+    send(session, InputMsg::System(SystemAction(action)));
+}
+
 /// A non-modifier key by macOS virtual key code. Modifiers go through `lk_input_modifiers`.
 #[unsafe(no_mangle)]
 pub extern "C" fn lk_input_key(session: u64, code: u16, down: bool, repeat: bool) {
@@ -302,8 +358,8 @@ pub extern "C" fn lk_input_release_all(session: u64) {
     send(session, InputMsg::ReleaseAll);
 }
 
-/// "Still here": call from the UI thread every 250 ms while anything is held, so the host can
-/// let go if this app hangs or disappears.
+/// "Still here": call from the UI thread every 250 ms while anything is held or a gesture is in
+/// progress, so the host can let go if this app hangs or disappears.
 #[unsafe(no_mangle)]
 pub extern "C" fn lk_input_heartbeat(session: u64) {
     send(session, InputMsg::Heartbeat);

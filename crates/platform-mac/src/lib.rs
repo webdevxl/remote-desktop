@@ -7,6 +7,7 @@ pub mod clock;
 pub mod cursor;
 pub mod decoder;
 pub mod encoder;
+pub mod gesture;
 pub mod gpu;
 pub mod inject;
 pub mod keys;

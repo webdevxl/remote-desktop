@@ -53,11 +53,42 @@ typedef struct {
 } lk_scroll;
 
 void lk_input_scroll(uint64_t session, const lk_scroll *scroll);
+
+// Trackpad gestures. Phases are IOHIDEventPhaseBits (the numbers of CGScrollPhase, not of
+// NSEvent.Phase); a gesture in progress counts as held for heartbeats.
+#define LK_PHASE_BEGAN 1
+#define LK_PHASE_CHANGED 2
+#define LK_PHASE_ENDED 4
+#define LK_PHASE_CANCELLED 8
+// Dock swipe axes: the Dock gesture's motion field (123).
+#define LK_DOCK_HORIZONTAL 1
+#define LK_DOCK_VERTICAL 2
+#define LK_DOCK_PINCH 3
+// A swipe or pinch the Dock acts on (Spaces, Mission Control...), exactly as this Mac's trackpad
+// reported it: progress since it began (field 124), exit velocities (129, 130), inverted (136).
+void lk_input_dock_swipe(uint64_t session, uint8_t axis, uint8_t phase, double progress,
+                         double velocity_x, double velocity_y, bool inverted);
+// App gestures at a position on the remote screen: NSEvent's magnification, rotation (degrees),
+// and a swipe event's deltaX/deltaY.
+void lk_input_magnify(uint64_t session, double x, double y, uint8_t phase, double delta);
+void lk_input_rotate(uint64_t session, double x, double y, uint8_t phase, double degrees);
+void lk_input_smart_magnify(uint64_t session, double x, double y);
+void lk_input_navigation_swipe(uint64_t session, double x, double y, int8_t dx, int8_t dy);
+
+// Things to do on the remote Mac as a whole (menu items).
+#define LK_SYSTEM_MISSION_CONTROL 1
+#define LK_SYSTEM_APP_EXPOSE 2
+#define LK_SYSTEM_SHOW_DESKTOP 3
+#define LK_SYSTEM_LAUNCHPAD 4
+#define LK_SYSTEM_PREVIOUS_SPACE 5
+#define LK_SYSTEM_NEXT_SPACE 6
+void lk_input_system_action(uint64_t session, uint16_t action);
 // A non-modifier key by virtual key code; modifiers are sent as state with lk_input_modifiers.
 void lk_input_key(uint64_t session, uint16_t code, bool down, bool repeat);
 void lk_input_modifiers(uint64_t session, uint64_t flags);
 void lk_input_release_all(uint64_t session);
-// Every 250 ms from the UI thread while anything is held, so the host releases it if we hang.
+// Every 250 ms from the UI thread while anything is held or a gesture is in progress, so the
+// host releases it if we hang.
 void lk_input_heartbeat(uint64_t session);
 // How many LanKVM hosts the input sent next has passed through (0: made on this Mac); send it
 // when it changes.

@@ -174,6 +174,8 @@ pub fn apply(state: &mut InputState, msg: InputMsg, bounds: &Bounds, host_caps_l
         InputMsg::ReleaseAll => state.release_all(host_caps_lock(), out),
         // The worker keeps the depth (see `Worker::inject`).
         InputMsg::Heartbeat | InputMsg::Relayed { .. } => {}
+        // PLACEHOLDER (contract only): gestures and system actions aren't injected yet.
+        InputMsg::Gesture(_) | InputMsg::System(_) => {}
     }
 }
 
