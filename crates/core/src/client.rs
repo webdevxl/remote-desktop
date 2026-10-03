@@ -1458,6 +1458,7 @@ fn new_decoder(
             stream: meta.stream,
             update: meta.update,
             update_mask: meta.update_mask,
+            cover: Vec::new(),
             timing,
         });
         flush_display(&shared, &events, Some(meta.stream));
@@ -1880,6 +1881,7 @@ mod tests {
             param_sets: Vec::new(),
             nal_length_size: 4,
             data: Vec::new(),
+            cover: Vec::new(),
         };
         assert!(tile_fits(&video, 15));
         assert!(!tile_fits(&video, 14), "datagrams said another tile");

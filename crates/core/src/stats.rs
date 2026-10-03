@@ -57,6 +57,55 @@ impl Ema {
     }
 }
 
+/// The samples of the last [`Samples::SPAN`], for percentiles: the overlay's moving averages
+/// hide the tail (a Wi-Fi stall, a full-screen change) that percentiles show.
+#[derive(Default, Clone)]
+pub struct Samples {
+    samples: VecDeque<(Instant, f64)>,
+}
+
+impl Samples {
+    const SPAN: Duration = Duration::from_secs(2);
+    /// At most this many kept (about 2 s at 1000 samples/s).
+    const MAX: usize = 2048;
+
+    pub fn add(&mut self, sample_us: f64) {
+        self.add_at(Instant::now(), sample_us);
+    }
+
+    fn add_at(&mut self, now: Instant, sample_us: f64) {
+        if self.samples.len() == Self::MAX {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((now, sample_us));
+        self.trim(now);
+    }
+
+    fn trim(&mut self, now: Instant) {
+        while self.samples.front().is_some_and(|(t, _)| now.duration_since(*t) > Self::SPAN) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The `q` quantile (0-1) of the recent samples, in milliseconds.
+    pub fn quantile_ms(&mut self, q: f64) -> Option<f64> {
+        self.trim(Instant::now());
+        if self.samples.is_empty() {
+            return None;
+        }
+        let mut v: Vec<f64> = self.samples.iter().map(|(_, s)| *s).collect();
+        v.sort_by(f64::total_cmp);
+        let i = ((v.len() - 1) as f64 * q.clamp(0.0, 1.0)).round() as usize;
+        Some(v[i] / 1000.0)
+    }
+
+    /// Samples kept now.
+    pub fn len(&mut self) -> usize {
+        self.trim(Instant::now());
+        self.samples.len()
+    }
+}
+
 /// Per-frame timing carried from reception to presentation (all on our clock, µs).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameTiming {
@@ -89,6 +138,28 @@ pub struct Stats {
     /// Of that: received → posted on the host (decoding, `CGEventPost`).
     pub input_inject: Ema,
     pub inputs_sent: u64,
+    /// Percentiles of the same stages, per update where the averages are per tile frame:
+    /// captured → on screen, decoded (an update's last tile) → on screen, and per tile frame
+    /// encoded → received.
+    pub total_samples: Samples,
+    pub display_samples: Samples,
+    pub network_samples: Samples,
+    /// The display stage split up, per shown update: decoded → the render thread at it, → the
+    /// command buffer committed, → the GPU done, → on screen (the compositor and the display).
+    pub display_wake: Samples,
+    pub display_cpu: Samples,
+    pub display_gpu: Samples,
+    pub display_compositor: Samples,
+    /// Updates (not tiles) presented on screen over the last second.
+    shown: RateWindow,
+    /// Presents with nothing new, which keep the display and GPU awake after an update.
+    pub warm_presents: u64,
+    /// Presents that never reached the screen (presentedTime 0).
+    pub dropped_presents: u64,
+    /// Gaps of at least [`Stats::STALL`] in what the host sends (it sends something at least every
+    /// 20 ms): the network, usually the Wi-Fi radio, went silent. Count, and the gaps' lengths.
+    pub stalls: u64,
+    pub stall_samples: Samples,
     window: RateWindow,
     /// Send times of recent input writes: (last sequence number in the write, our clock µs).
     input_sent: VecDeque<(u64, u64)>,
@@ -119,10 +190,36 @@ pub struct StatsView {
     pub input_network_ms: Option<f64>,
     pub input_inject_ms: Option<f64>,
     pub inputs_sent: u64,
+    /// Updates presented on screen over the last second ("fps" counts updates received).
+    pub shown_fps: f64,
+    /// Percentiles (p50, p95) over the last 2 s; see [`Stats::total_samples`].
+    pub total_p50_ms: Option<f64>,
+    pub total_p95_ms: Option<f64>,
+    pub display_p50_ms: Option<f64>,
+    pub display_p95_ms: Option<f64>,
+    pub network_p95_ms: Option<f64>,
+    /// The display stage's parts, p50 (see [`Stats::display_wake`]).
+    pub display_wake_ms: Option<f64>,
+    pub display_cpu_ms: Option<f64>,
+    pub display_gpu_ms: Option<f64>,
+    pub display_compositor_ms: Option<f64>,
+    pub warm_presents: u64,
+    pub dropped_presents: u64,
+    /// Network stalls so far, and the longest of the last 2 s.
+    pub stalls: u64,
+    pub max_stall_ms: Option<f64>,
 }
 
 impl Stats {
     const INPUT_LOG: usize = 512;
+    /// A gap in what the host sends at least this long is a stall (see [`Stats::stalls`]).
+    pub const STALL: Duration = Duration::from_millis(30);
+
+    /// An update reached the screen.
+    pub fn on_shown(&mut self) {
+        self.frames_shown += 1;
+        self.shown.add(0);
+    }
 
     /// Input messages up to `last_seq` (counted from 1) were written at `sent_us`.
     pub fn on_input_sent(&mut self, last_seq: u64, sent_us: u64) {
@@ -163,6 +260,20 @@ impl Stats {
             input_network_ms: self.input_network.ms(),
             input_inject_ms: self.input_inject.ms(),
             inputs_sent: self.inputs_sent,
+            shown_fps: self.shown.fps(),
+            total_p50_ms: self.total_samples.quantile_ms(0.5),
+            total_p95_ms: self.total_samples.quantile_ms(0.95),
+            display_p50_ms: self.display_samples.quantile_ms(0.5),
+            display_p95_ms: self.display_samples.quantile_ms(0.95),
+            network_p95_ms: self.network_samples.quantile_ms(0.95),
+            display_wake_ms: self.display_wake.quantile_ms(0.5),
+            display_cpu_ms: self.display_cpu.quantile_ms(0.5),
+            display_gpu_ms: self.display_gpu.quantile_ms(0.5),
+            display_compositor_ms: self.display_compositor.quantile_ms(0.5),
+            warm_presents: self.warm_presents,
+            dropped_presents: self.dropped_presents,
+            stalls: self.stalls,
+            max_stall_ms: self.stall_samples.quantile_ms(1.0),
         }
     }
 
@@ -214,6 +325,23 @@ impl RateWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn samples_give_percentiles_of_the_recent_ones() {
+        let mut s = Samples::default();
+        assert_eq!(s.quantile_ms(0.5), None);
+        let t0 = Instant::now();
+        // Half 8.33 ms, half 16.67 ms; then old ones age out.
+        for i in 0..100 {
+            s.add_at(t0, if i % 2 == 0 { 8_330.0 } else { 16_670.0 });
+        }
+        assert_eq!(s.quantile_ms(0.0), Some(8.33));
+        assert_eq!(s.quantile_ms(0.95), Some(16.67));
+        assert_eq!(s.quantile_ms(1.0), Some(16.67));
+        let later = t0 + Samples::SPAN + Duration::from_millis(1);
+        s.add_at(later, 1_000.0);
+        assert_eq!(s.samples.len(), 1);
+    }
 
     #[test]
     fn clock_sync_prefers_low_rtt() {

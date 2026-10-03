@@ -53,6 +53,9 @@ pub struct TileImage {
     pub update: u32,
     /// [`protocol::VideoFrame::update_mask`]: the tiles that update has.
     pub update_mask: u64,
+    /// [`protocol::VideoFrame::cover`]: for a whole-picture image, the tiles it paints (empty:
+    /// all of it).
+    pub cover: Vec<TileRect>,
     pub timing: FrameTiming,
 }
 
@@ -1059,6 +1062,7 @@ mod tests {
             stream: (64, 32),
             update,
             update_mask,
+            cover: Vec::new(),
             timing: FrameTiming::default(),
         }
     }

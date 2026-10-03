@@ -6,6 +6,7 @@
 //   swiftc -O scripts/frame-source.swift -o target/frame-source
 //   target/frame-source [--screen main|virtual|N] [--fullscreen | --frame X,Y,W,H] [--hz 120]
 //                       [--change tiny|small|band|scroll|full] [--log FILE] [--seconds S] [--click]
+//                       [--drawables 2|3] [--no-sync]
 //
 // --screen picks the screen (virtual: a LanKVM virtual display); --frame places the window in
 // that screen's points, top-left origin; --fullscreen covers the whole screen with a borderless
@@ -35,6 +36,20 @@ struct Options {
     var log: String? = nil
     var seconds: Double? = nil
     var click = false
+    var drawables = 2
+    /// Draw from a thread at random times averaging this rate, like frames arriving off a
+    /// network, instead of in step with the display.
+    var timerHz: Double? = nil
+    /// Something over the Metal layer: none, tab (a small opaque view), glass (a small
+    /// translucent material view), hud (a larger translucent panel).
+    var overlay = "none"
+    /// With --timer: also run an idle display link asking for this rate, to see whether it
+    /// keeps the compositor at full rate.
+    var paceHz: Float? = nil
+    /// With --timer: re-present the same picture every this many ms for a second after each
+    /// new frame (logged as "warm" frames, not counted as frames).
+    var warmMs: Double? = nil
+    var displaySync = true
 
     init() {
         var args = CommandLine.arguments.dropFirst().makeIterator()
@@ -50,6 +65,12 @@ struct Options {
             case "--log": log = args.next()
             case "--seconds": seconds = Double(args.next() ?? "")
             case "--click": click = true
+            case "--drawables": drawables = Int(args.next() ?? "") ?? drawables
+            case "--no-sync": displaySync = false
+            case "--timer": timerHz = Double(args.next() ?? "")
+            case "--overlay": overlay = args.next() ?? overlay
+            case "--pace": paceHz = Float(args.next() ?? "")
+            case "--warm": warmMs = Double(args.next() ?? "")
             case "-h", "--help":
                 print("usage: frame-source [--screen main|virtual|N] [--fullscreen | --frame X,Y,W,H] [--hz N] [--change tiny|small|band|scroll|full] [--log FILE] [--seconds S] [--click]")
                 exit(0)
@@ -154,19 +175,65 @@ final class SourceView: NSView {
         metalLayer.pixelFormat = .bgra8Unorm
         metalLayer.framebufferOnly = true
         metalLayer.isOpaque = true
-        metalLayer.maximumDrawableCount = 3
+        metalLayer.maximumDrawableCount = options.drawables
+        metalLayer.displaySyncEnabled = options.displaySync
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     override func makeBackingLayer() -> CALayer { metalLayer }
     override var acceptsFirstResponder: Bool { true }
+    /// Read on the drawing thread, kept up to date from the main thread.
+    var visible = true
+    var occlusionObserver: Any?
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
         metalLayer.contentsScale = window.backingScaleFactor
         updateSize()
+        occlusionObserver = NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main) { [weak self] _ in
+            self?.visible = window.occlusionState.contains(.visible)
+        }
+        if let hz = options.timerHz {
+            Thread.detachNewThread { [weak self] in
+                while let self {
+                    // Uniform between half and one and a half periods.
+                    let wait = (0.5 + Double.random(in: 0..<1)) / hz
+                    if let warm = options.warmMs {
+                        // Re-present every `warm` ms meanwhile, for at most a second.
+                        let due = CACurrentMediaTime() + wait
+                        let start = CACurrentMediaTime()
+                        while true {
+                            let left = due - CACurrentMediaTime()
+                            if left <= 0 { break }
+                            if CACurrentMediaTime() - start > 1 {
+                                usleep(useconds_t(left * 1_000_000))
+                                break
+                            }
+                            usleep(useconds_t(min(left, warm / 1000) * 1_000_000))
+                            if due - CACurrentMediaTime() > 0.001 { autoreleasepool { self.draw(target: 0, warm: true) } }
+                        }
+                    } else {
+                        usleep(useconds_t(wait * 1_000_000))
+                    }
+                    if let seconds = options.seconds, CACurrentMediaTime() - self.started > seconds {
+                        log.write("summary", ["drawn": self.n, "skipped": self.skipped])
+                        log.flush()
+                        exit(0)
+                    }
+                    autoreleasepool { self.draw(target: 0) }
+                }
+            }
+            if let pace = options.paceHz {
+                let idle = displayLink(target: self, selector: #selector(idleTick(_:)))
+                idle.preferredFrameRateRange = CAFrameRateRange(minimum: pace, maximum: pace, preferred: pace)
+                idle.add(to: .main, forMode: .common)
+                self.link = idle
+            }
+            describe()
+            return
+        }
         let link = displayLink(target: self, selector: #selector(tick(_:)))
         let hz = Float(options.hz)
         link.preferredFrameRateRange = CAFrameRateRange(minimum: hz, maximum: hz, preferred: hz)
@@ -211,6 +278,8 @@ final class SourceView: NSView {
         clickWhite.toggle()
         pendingClick = ["event_us": Int(event.timestamp * 1_000_000), "handled_us": nowUs(), "white": clickWhite]
     }
+
+    @objc func idleTick(_ link: CADisplayLink) {}
 
     @objc func tick(_ link: CADisplayLink) {
         ticks += 1
@@ -274,14 +343,16 @@ final class SourceView: NSView {
         return out
     }
 
-    func draw(target: CFTimeInterval) {
-        guard window?.occlusionState.contains(.visible) == true, let drawable = metalLayer.nextDrawable() else {
+    func draw(target: CFTimeInterval, warm: Bool = false) {
+        guard visible, let drawable = metalLayer.nextDrawable() else {
             skipped += 1
             return
         }
         let scale = window?.backingScaleFactor ?? 2
         let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        if warm { n -= 1 }
         var list = rects(size: size, scale: scale)
+        if warm { n += 1 }
         var viewport = SIMD2<Float>(Float(size.width), Float(size.height))
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = drawable.texture
@@ -298,12 +369,21 @@ final class SourceView: NSView {
         enc.endEncoding()
         let frame = n
         let targetUs = Int(target * 1_000_000)
+        let commitUs = nowUs()
         var click = pendingClick
         pendingClick = nil
         click?["n"] = frame
+        if warm {
+            drawable.addPresentedHandler { d in
+                log.write("warm", ["commit_us": commitUs, "presented_us": d.presentedTime > 0 ? Int(d.presentedTime * 1_000_000) : 0])
+            }
+            cb.present(drawable)
+            cb.commit()
+            return
+        }
         drawable.addPresentedHandler { d in
             let presented = d.presentedTime > 0 ? Int(d.presentedTime * 1_000_000) : 0
-            log.write("frame", ["n": frame, "target_us": targetUs, "commit_us": nowUs(), "presented_us": presented])
+            log.write("frame", ["n": frame, "target_us": targetUs, "commit_us": commitUs, "presented_us": presented])
             if var click {
                 click["presented_us"] = presented
                 log.write("click", click)
@@ -350,9 +430,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false, screen: screen)
             window.title = "LanKVM Frame Source"
         }
+        // Shown on whatever Space is active, even over another app's full-screen Space, so the
+        // test never depends on which Space was in front.
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        if !options.fullscreen { window.level = .floating }
         window.setFrame(frame, display: false)
         window.isReleasedWhenClosed = false
-        window.contentView = SourceView(frame: NSRect(origin: .zero, size: frame.size))
+        let view = SourceView(frame: NSRect(origin: .zero, size: frame.size))
+        window.contentView = view
+        switch options.overlay {
+        case "tab":
+            let tab = NSView(frame: NSRect(x: frame.width / 2 - 40, y: frame.height - 14, width: 80, height: 10))
+            tab.wantsLayer = true
+            tab.layer?.backgroundColor = NSColor.darkGray.cgColor
+            tab.layer?.cornerRadius = 5
+            view.addSubview(tab)
+        case "pill":
+            // Like the session control: a dark translucent capsule with a shadow.
+            let pill = NSView(frame: NSRect(x: frame.width / 2 - 120, y: frame.height - 50, width: 240, height: 36))
+            pill.wantsLayer = true
+            pill.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+            pill.layer?.cornerRadius = 18
+            pill.layer?.shadowColor = NSColor.black.cgColor
+            pill.layer?.shadowOpacity = 0.35
+            pill.layer?.shadowRadius = 8
+            pill.layer?.shadowOffset = CGSize(width: 0, height: -2)
+            view.addSubview(pill)
+        case "alpha", "alphatext":
+            let panel = NSView(frame: NSRect(x: frame.width / 2 - 150, y: frame.height - 94, width: 300, height: 90))
+            panel.wantsLayer = true
+            panel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+            panel.layer?.cornerRadius = 12
+            if options.overlay == "alphatext" {
+                let label = NSTextField(labelWithString: "118 fps · 12.3 Mbit/s · RTT 0.3 ms")
+                label.textColor = .white
+                label.frame = NSRect(x: 12, y: 30, width: 280, height: 20)
+                panel.addSubview(label)
+                // Changes twice a second, like the stats overlay.
+                Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in label.stringValue = "\(Int.random(in: 100...120)) fps · 12.3 Mbit/s · RTT 0.3 ms" }
+            }
+            view.addSubview(panel)
+        case "glass", "hud":
+            let size = options.overlay == "glass" ? NSSize(width: 80, height: 10) : NSSize(width: 300, height: 90)
+            let glass = NSVisualEffectView(frame: NSRect(x: frame.width / 2 - size.width / 2, y: frame.height - size.height - 4, width: size.width, height: size.height))
+            glass.material = .hudWindow
+            glass.blendingMode = .withinWindow
+            glass.state = .active
+            glass.wantsLayer = true
+            glass.layer?.cornerRadius = 5
+            view.addSubview(glass)
+        default: break
+        }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }

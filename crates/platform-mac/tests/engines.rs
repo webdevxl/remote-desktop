@@ -587,3 +587,91 @@ fn neon_scale() {
         }
     }
 }
+
+/// The host's tile grid at once (16 tiles of 3072x320 at 6144x2560), all changed, 1 in flight:
+/// with `LANKVM_ENCODER_PROPS` to compare encoder properties.
+#[test]
+#[ignore = "benchmark"]
+fn tiles() {
+    let (w, h) = size();
+    let layout = protocol::tile_layout(w as u32, h as u32, None);
+    let (tx, rx) = mpsc::channel::<(usize, u64, Instant)>();
+    let total = budget(w, h);
+    let encoders: Vec<Encoder> = layout
+        .iter()
+        .map(|t| {
+            let tx = tx.clone();
+            let share = (total * (t.width * t.height) as f64 / (w * h) as f64).max(1e6) as u32;
+            let cfg = EncoderConfig { width: t.width, height: t.height, fps: 120, bitrate_bps: share, codec: Codec::Hevc };
+            Encoder::new(&cfg, move |f| {
+                let _ = tx.send((f.data.len(), f.tag, Instant::now()));
+            })
+            .expect("encoder")
+        })
+        .collect();
+    let inputs: Vec<Vec<_>> = layout.iter().map(|t| (0..4).map(|s| frame(t.width as usize, t.height as usize, s * 3 + t.index as u32)).collect()).collect();
+    for n in [1usize, 4, 16] {
+        let (mut first, mut all, mut bytes) = (Vec::new(), Vec::new(), 0usize);
+        for i in 0..60 {
+            let t0 = Instant::now();
+            for k in 0..n {
+                encoders[k].encode(&inputs[k][i % 4], platform_mac::clock::now_us(), false, i as u64).unwrap();
+            }
+            let mut f = None;
+            let mut last = t0;
+            for _ in 0..n {
+                let (len, _, at) = rx.recv_timeout(Duration::from_secs(5)).expect("tile");
+                f.get_or_insert(at);
+                last = at;
+                if i >= 10 {
+                    bytes += len;
+                }
+            }
+            if i >= 10 {
+                first.push((f.unwrap() - t0).as_secs_f64() * 1000.0);
+                all.push((last - t0).as_secs_f64() * 1000.0);
+            }
+        }
+        println!(
+            "{n} of {} tiles changed: first out {:.2} ms, all out {:.2} ms (p90 {:.2}), {:.0} KB/update  [{}]",
+            layout.len(),
+            median(first),
+            median(all.clone()),
+            p90(all),
+            bytes as f64 / 50.0 / 1024.0,
+            std::env::var("LANKVM_ENCODER_PROPS").unwrap_or_default()
+        );
+    }
+}
+
+/// The host's motion scaler: a 6K frame to 2/3 and 1/2, then encoded at that size.
+#[test]
+#[ignore = "benchmark"]
+fn motion_scaler() {
+    use platform_mac::scaler::{Ratio, Scaler};
+    let (w, h) = size();
+    let inputs: Vec<_> = (0..4).map(|s| frame(w, h, s)).collect();
+    for ratio in [Ratio::TwoThirds, Ratio::Half] {
+        let scaler = Scaler::new(w as u32, h as u32, ratio).unwrap();
+        let (ow, oh) = scaler.output_size();
+        let (tx, rx) = mpsc::channel::<Instant>();
+        let cfg = EncoderConfig { width: ow, height: oh, fps: 120, bitrate_bps: budget(ow as usize, oh as usize) as u32, codec: Codec::Hevc };
+        let enc = Encoder::new(&cfg, move |_| {
+            let _ = tx.send(Instant::now());
+        })
+        .unwrap();
+        let (mut scale_ms, mut total_ms) = (Vec::new(), Vec::new());
+        for i in 0..70 {
+            let t0 = Instant::now();
+            let small = scaler.scale(&inputs[i % 4]).unwrap();
+            let scaled = t0.elapsed();
+            enc.encode(&small, platform_mac::clock::now_us(), false, i as u64).unwrap();
+            let at = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if i >= 10 {
+                scale_ms.push(scaled.as_secs_f64() * 1000.0);
+                total_ms.push((at - t0).as_secs_f64() * 1000.0);
+            }
+        }
+        println!("{w}x{h} -> {ow}x{oh} ({ratio:?}): scale {:.2} ms (p90 {:.2}), scale + encode {:.1} ms (p90 {:.1})  [{}]", median(scale_ms.clone()), p90(scale_ms), median(total_ms.clone()), p90(total_ms), std::env::var("LANKVM_ENCODER_PROPS").unwrap_or_default());
+    }
+}

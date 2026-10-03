@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const DEFAULT_PORT: u16 = 47800;
 pub const ALPN: &[u8] = b"lankvm/1";
 /// Upper bound for a single control message; protects against garbage length prefixes.
@@ -654,6 +654,23 @@ pub const MAX_TILES: usize = 64;
 /// that covers it. [`tile_layout`] never uses this index.
 pub const FULL_FRAME_TILE: u8 = (MAX_TILES - 1) as u8;
 
+/// The index of the stream that carries the whole picture at a lower resolution, while big
+/// changes go on frame after frame (scrolling, a moving window): a big picture takes the hardware
+/// encoder longer than a frame lasts at 120 Hz, a smaller one doesn't. Its [`TileRect`] is the
+/// whole stream, but its pictures are smaller: the client scales them up to fill it. Like
+/// [`FULL_FRAME_TILE`] it covers every tile, and the host sends the picture at full resolution
+/// again once the motion stops. [`tile_layout`] never uses this index.
+pub const MOTION_FRAME_TILE: u8 = (MAX_TILES - 2) as u8;
+
+/// Whether `index` is one of the streams that carry the whole picture ([`FULL_FRAME_TILE`],
+/// [`MOTION_FRAME_TILE`]) rather than a tile of it.
+pub fn covers_all(index: u8) -> bool {
+    index == FULL_FRAME_TILE || index == MOTION_FRAME_TILE
+}
+
+/// Tiles [`tile_layout`] makes at most: the last indexes are the whole-picture streams'.
+pub const MAX_LAYOUT_TILES: usize = MAX_TILES - 2;
+
 /// One tile of the picture: a rectangle of the stream, in pixels, encoded as its own video stream
 /// (its own encoder on the host, its own decoder on the client).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -685,16 +702,16 @@ pub const TILE_MAX_WIDTH: u32 = 4096;
 /// Splits a `width`×`height` stream into tiles: rows about [`TILE_TARGET_HEIGHT`] tall and
 /// columns at most [`TILE_MAX_WIDTH`] wide, edges on [`TILE_ALIGN`]. Row-major, top-left first.
 /// `grid` forces `(columns, rows)` instead (clamped so tiles stay at least [`TILE_ALIGN`] and
-/// there are fewer than [`MAX_TILES`]: the last index is [`FULL_FRAME_TILE`]); `(1, 1)` is one
-/// tile for the whole picture.
+/// there are at most [`MAX_LAYOUT_TILES`]: the last indexes are [`MOTION_FRAME_TILE`] and
+/// [`FULL_FRAME_TILE`]); `(1, 1)` is one tile for the whole picture.
 pub fn tile_layout(width: u32, height: u32, grid: Option<(u32, u32)>) -> Vec<TileRect> {
     let (width, height) = (width.max(2), height.max(2));
     let (cols, rows) = grid.unwrap_or_else(|| {
         (width.div_ceil(TILE_MAX_WIDTH), ((height + TILE_TARGET_HEIGHT / 2) / TILE_TARGET_HEIGHT).max(1))
     });
     // Each tile at least one alignment unit each way, and not more tiles than a mask holds.
-    let cols = cols.clamp(1, (width / TILE_ALIGN).clamp(1, MAX_TILES as u32 - 1));
-    let rows = rows.clamp(1, (height / TILE_ALIGN).max(1)).min(((MAX_TILES as u32 - 1) / cols).max(1));
+    let cols = cols.clamp(1, (width / TILE_ALIGN).clamp(1, MAX_LAYOUT_TILES as u32));
+    let rows = rows.clamp(1, (height / TILE_ALIGN).max(1)).min((MAX_LAYOUT_TILES as u32 / cols).max(1));
     let xs = edges(width, cols);
     let ys = edges(height, rows);
     let mut tiles = Vec::with_capacity(xs.len() * ys.len());
@@ -754,6 +771,10 @@ pub struct VideoFrame {
     pub nal_length_size: u8,
     /// Length-prefixed (AVCC/HVCC style) NAL units.
     pub data: Vec<u8>,
+    /// For a stream that carries the whole picture ([`covers_all`]): the tiles it paints (where
+    /// the picture changed); the others keep what they show. Empty: all of it. Always empty for
+    /// tiles.
+    pub cover: Vec<TileRect>,
 }
 
 /// Header in front of every video datagram.
@@ -871,7 +892,7 @@ mod tests {
             }
         }
         assert_eq!(area, u64::from(width) * u64::from(height));
-        assert!(tiles.len() < MAX_TILES, "{} tiles: the last index is the full frame's", tiles.len());
+        assert!(tiles.len() <= MAX_LAYOUT_TILES, "{} tiles: the last indexes are the whole picture's", tiles.len());
     }
 
     #[test]

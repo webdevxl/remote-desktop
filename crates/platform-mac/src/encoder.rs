@@ -302,6 +302,20 @@ fn create_session(cfg: &EncoderConfig, codec: Codec, require_hardware: bool, ctx
         set(kVTCompressionPropertyKey_DataRateLimits, data_rate_limits(cfg.bitrate_bps).as_ref(), false)?;
         // Keyframes only on request (in practice; this is ten minutes).
         set(kVTCompressionPropertyKey_MaxKeyFrameInterval, CFNumber::new_i32((cfg.fps * 600) as i32).as_ref(), false)?;
+        // Benchmarks only: `LANKVM_ENCODER_PROPS=Name=value,...` sets more (optional) properties,
+        // numbers or true/false, e.g. undocumented ones the hardware encoder lists.
+        if let Ok(extra) = std::env::var("LANKVM_ENCODER_PROPS") {
+            for (key, value) in extra.split(',').filter_map(|kv| kv.split_once('=')) {
+                let key = CFString::from_str(key.trim());
+                match value.trim() {
+                    "true" | "false" => set(&key, CFBoolean::new(value.trim() == "true").as_ref(), false)?,
+                    v => match v.parse::<i32>() {
+                        Ok(n) => set(&key, CFNumber::new_i32(n).as_ref(), false)?,
+                        Err(_) => tracing::warn!("LANKVM_ENCODER_PROPS: {key} = {v:?} is not a number or true/false"),
+                    },
+                }
+            }
+        }
         check(session.prepare_to_encode_frames(), "VTCompressionSessionPrepareToEncodeFrames")?;
     }
     Ok(session)

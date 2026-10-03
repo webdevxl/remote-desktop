@@ -1385,6 +1385,7 @@ impl VideoOut {
             param_sets: frame.param_sets,
             nal_length_size: frame.nal_length_size,
             data: frame.data,
+            cover: Vec::new(),
         };
         let Some(max) = self.conn.max_datagram_size() else { return false };
         let Some(packetizer) = self.packetizers.get(usize::from(tile.index)) else { return false };

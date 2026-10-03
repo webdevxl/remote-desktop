@@ -12,6 +12,7 @@ pub mod gpu;
 pub mod inject;
 pub mod keys;
 mod nal;
+pub mod scaler;
 pub mod system;
 pub mod tiler;
 pub mod permissions;
