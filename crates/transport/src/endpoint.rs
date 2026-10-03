@@ -24,6 +24,11 @@ use crate::identity::{DeviceIdentity, Fingerprint, fingerprint};
 /// Kernel socket buffers. Keyframes arrive as bursts of hundreds of datagrams; the macOS default
 /// (~768 KiB) can overflow before the receive task drains it.
 const SOCKET_BUFFER: usize = 7 * 1024 * 1024;
+/// When nothing has arrived for this long, send a tiny PING (the peer answers it), so each side's
+/// Wi-Fi radio hears or sends something every few tens of milliseconds even while the screen is
+/// still. A radio left idle may doze, and the next click or frame waits for it to wake. About
+/// 50 packets a second each way, a few kbit/s.
+const KEEP_ALIVE: Duration = Duration::from_millis(20);
 
 pub fn make_endpoint(bind: SocketAddr, identity: &DeviceIdentity) -> Result<Endpoint> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -97,7 +102,7 @@ fn client_transport_config() -> Arc<TransportConfig> {
 fn base_transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
     t.max_idle_timeout(Some(Duration::from_secs(8).try_into().expect("valid idle timeout")));
-    t.keep_alive_interval(Some(Duration::from_secs(1)));
+    t.keep_alive_interval(Some(KEEP_ALIVE));
     t.datagram_receive_buffer_size(Some(32 * 1024 * 1024));
     t.datagram_send_buffer_size(16 * 1024 * 1024);
     t.congestion_controller_factory(Arc::new(LanControllerFactory));

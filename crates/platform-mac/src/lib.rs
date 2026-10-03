@@ -13,6 +13,7 @@ pub mod inject;
 pub mod keys;
 mod nal;
 pub mod system;
+pub mod tiler;
 pub mod permissions;
 mod util;
 pub mod virtual_display;

@@ -53,15 +53,18 @@
 //! decoded video shows the change: input → host → app redraw → capture → encode → network →
 //! decode. Display (≈1 frame) is not included.
 
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use lankvm_core::{Core, Event};
-use platform_mac::clock;
+use lankvm_core::{Core, Event, ProbeFrame};
+use objc2_core_foundation::Type;
+use platform_mac::{CFRetained, CVPixelBuffer, clock};
 use protocol::{
-    Arrangement, DisplayChoice, DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction, VirtualDisplaySpec,
+    Arrangement, DisplayChoice, DockAxis, FULL_FRAME_TILE, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction, TileRect,
+    VirtualDisplaySpec,
 };
 use serde_json::Value;
 
@@ -199,7 +202,7 @@ fn main() -> ExitCode {
         }
     };
     let id = core.connect(&args.target, args.max, args.fps);
-    let mut probe = Probe { core: core.clone(), id, events, pending: Vec::new(), lab: Default::default() };
+    let mut probe = Probe { core: core.clone(), id, events, pending: Vec::new(), lab: Default::default(), updates: Arc::default() };
     let code = probe.run(&args);
     core.disconnect(id);
     // Skip tearing down the runtime and capture threads; the OS cleans up.
@@ -242,11 +245,58 @@ struct Probe {
     /// Events that arrived while waiting for another kind.
     pending: Vec<Event>,
     /// Named rectangles (points, top-left origin) from Input Lab.
-    lab: std::collections::HashMap<String, (f64, f64, f64, f64)>,
+    lab: HashMap<String, (f64, f64, f64, f64)>,
+    /// Whole updates' latency, fed by every frame probe this installs.
+    updates: Arc<Mutex<UpdateTimes>>,
+}
+
+/// Times whole updates: from the host showing a frame to the last of its tiles decoded here (the
+/// viewer shows an update once all its tiles are in, so per-tile averages flatter big changes).
+#[derive(Default)]
+struct UpdateTimes {
+    /// By update: the tiles it sent, those decoded, its capture time (our clock), and the newest
+    /// decode time.
+    pending: HashMap<u32, (u64, u64, Option<u64>, u64)>,
+    /// Finished updates' latency, ms.
+    samples: Vec<f64>,
+    /// Newest update seen.
+    newest: Option<u32>,
+}
+
+/// Wrapping-aware "update a comes after b".
+fn is_newer(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+impl UpdateTimes {
+    fn tile(&mut self, f: &ProbeFrame<'_>) {
+        let entry = self.pending.entry(f.update).or_insert((0, 0, f.timing.capture_local_us, 0));
+        entry.0 |= f.update_mask;
+        entry.1 |= f.tile.bit();
+        entry.3 = entry.3.max(f.timing.decoded_us);
+        if entry.1 & entry.0 == entry.0 {
+            let (_, _, captured, decoded) = self.pending.remove(&f.update).expect("just seen");
+            if let Some(captured) = captured {
+                self.samples.push(decoded.saturating_sub(captured) as f64 / 1000.0);
+            }
+        }
+        // Updates that lost a tile never finish (decoders finish in any order: go by the newest).
+        if self.newest.is_none_or(|n| is_newer(f.update, n)) {
+            self.newest = Some(f.update);
+        }
+        if self.pending.len() > 64 {
+            let newest = self.newest.unwrap_or(f.update);
+            self.pending.retain(|&u, _| newest.wrapping_sub(u) < 32);
+        }
+    }
+
+    fn take(&mut self) -> Vec<f64> {
+        std::mem::take(&mut self.samples)
+    }
 }
 
 /// The latest window layout Input Lab logged: its named parts, as (x, y, w, h) in points.
-fn lab_layout(path: &str) -> Result<std::collections::HashMap<String, (f64, f64, f64, f64)>, String> {
+fn lab_layout(path: &str) -> Result<HashMap<String, (f64, f64, f64, f64)>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     let window = text
         .lines()
@@ -254,7 +304,7 @@ fn lab_layout(path: &str) -> Result<std::collections::HashMap<String, (f64, f64,
         .filter(|v| v["type"] == "window")
         .last()
         .ok_or(format!("no window line in {path}"))?;
-    let mut out = std::collections::HashMap::new();
+    let mut out = HashMap::new();
     for name in ["frame", "content", "patch", "text", "scroll"] {
         if let Some(r) = window[name].as_array().filter(|r| r.len() == 4) {
             let v: Vec<f64> = r.iter().filter_map(Value::as_f64).collect();
@@ -271,8 +321,16 @@ impl Probe {
         }
         if !args.virtual_displays.is_empty() {
             let size = Arc::new(Mutex::new(None));
-            let sink = size.clone();
-            self.core.set_frame_probe(self.id, Some(Box::new(move |pb, _| *sink.lock().unwrap() = Some(platform_mac::gpu::frame_size(pb)))));
+            let (sink, updates) = (size.clone(), self.updates.clone());
+            self.core.set_frame_probe(
+                self.id,
+                Some(Box::new(move |f| {
+                    // The stream's size, as long as the tile decoded to its own size.
+                    let decoded = platform_mac::gpu::frame_size(f.pixel_buffer);
+                    *sink.lock().unwrap() = Some(if decoded == (f.tile.width, f.tile.height) { f.stream } else { decoded });
+                    updates.lock().unwrap().tile(f);
+                })),
+            );
             let steps = args.virtual_displays.iter().map(|spec| DisplayChoice::Virtual(*spec));
             for choice in steps.chain(args.then_main.then_some(DisplayChoice::Main)) {
                 if let Err(code) = self.show(choice, args, &size) {
@@ -664,18 +722,21 @@ impl Probe {
     }
 
     /// Clicks the middle of `rect` (points) `n` times and times each click until the decoded
-    /// video shows the region change brightness.
+    /// video shows the region change brightness. Clicks before the region was ever decoded are
+    /// warm-ups: they only establish what it looks like.
     fn input_latency(&mut self, n: usize, rect: (f64, f64, f64, f64), display: (f64, f64)) -> i32 {
         let (x, y, w, h) = rect;
         // Look at the middle of the region, away from its edges.
         let region = ((x + w * 0.25) / display.0, (y + h * 0.25) / display.1, (x + w * 0.75) / display.0, (y + h * 0.75) / display.1);
         let samples: Arc<Mutex<Vec<(u64, f64, Option<u64>)>>> = Arc::default();
         let sink = samples.clone();
+        let parts = Mutex::new(RegionParts::default());
         self.core.set_frame_probe(
             self.id,
-            Some(Box::new(move |pb, timing| {
-                if let Some(luma) = platform_mac::gpu::mean_luma(pb, region.0, region.1, region.2, region.3) {
-                    sink.lock().unwrap().push((timing.decoded_us, luma, timing.capture_local_us));
+            Some(Box::new(move |f| {
+                let mut parts = parts.lock().unwrap();
+                if let Some(luma) = parts.update(f, region) {
+                    sink.lock().unwrap().push((f.timing.decoded_us, luma, f.timing.capture_local_us));
                 }
             })),
         );
@@ -685,7 +746,10 @@ impl Probe {
         std::thread::sleep(Duration::from_millis(500));
         let mut totals = Vec::new();
         let mut to_capture = Vec::new();
-        for i in 0..n {
+        let (mut clicks, mut warm_ups) = (0, 0);
+        while clicks < n && warm_ups < MAX_WARM_UPS {
+            // Without a picture of the region from before the click, any frame after it would look
+            // like the change: such a click only gets one, and isn't counted.
             let before = samples.lock().unwrap().last().map(|s| s.1);
             let t0 = clock::now_us();
             // Distinct clicks, not a double click: the app sees each as clickCount 1.
@@ -698,22 +762,31 @@ impl Probe {
                 let s = samples.lock().unwrap();
                 seen = s.iter().rev().take_while(|f| f.0 > t0).find(|f| before.is_none_or(|b| (f.1 - b).abs() > 60.0)).copied();
             }
-            match seen {
-                Some((decoded_us, luma, captured)) => {
+            match (before, seen) {
+                (None, seen) => {
+                    warm_ups += 1;
+                    match seen {
+                        Some((_, luma, _)) => println!("warm-up: the region's luma is {luma:.0} (no picture of it before this click: not counted)"),
+                        None => println!("warm-up: no picture of the region within 1 s"),
+                    }
+                }
+                (Some(before), Some((decoded_us, luma, captured))) => {
+                    clicks += 1;
                     let total = decoded_us.saturating_sub(t0) as f64 / 1000.0;
                     let capture = captured.map(|c| c.saturating_sub(t0) as f64 / 1000.0);
                     println!(
-                        "{:>3}: {total:>6.1} ms click → decoded   (captured after {} ms, luma {:.0} → {luma:.0})",
-                        i + 1,
+                        "{clicks:>3}: {total:>6.1} ms click → decoded   (captured after {} ms, luma {before:.0} → {luma:.0})",
                         capture.map_or("-".into(), |c| format!("{c:.1}")),
-                        before.unwrap_or(f64::NAN)
                     );
                     totals.push(total);
                     if let Some(c) = capture {
                         to_capture.push(c);
                     }
                 }
-                None => println!("{:>3}: no change seen within 1 s", i + 1),
+                (Some(_), None) => {
+                    clicks += 1;
+                    println!("{clicks:>3}: no change seen within 1 s");
+                }
             }
             std::thread::sleep(Duration::from_millis(350));
         }
@@ -739,6 +812,10 @@ impl Probe {
 
     fn watch_video(&mut self, args: &Args) -> i32 {
         let ms = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.1}"));
+        if args.virtual_displays.is_empty() {
+            let updates = self.updates.clone();
+            self.core.set_frame_probe(self.id, Some(Box::new(move |f| updates.lock().unwrap().tile(f))));
+        }
         let streaming = Instant::now();
         let mut ended = None;
         for second in 1..=args.seconds {
@@ -761,8 +838,14 @@ impl Probe {
                 (Some(c), Some(e), Some(n), Some(d)) => Some(c + e + n + d),
                 _ => None,
             };
+            let mut whole = self.updates.lock().unwrap().take();
+            let whole = if whole.is_empty() {
+                "-".to_string()
+            } else {
+                format!("{:.1}/{:.1}", percentile(&mut whole, 0.5), percentile(&mut whole, 0.9))
+            };
             println!(
-                "{second:>3}s  {:>3.0} fps  {:>6.1} Mbps  capture→decoded {:>5} ms (capture {} + encode {} + network {} + decode {})  rtt {} ms  decoded {}  lost {}  keyframe requests {}",
+                "{second:>3}s  {:>3.0} fps  {:>6.1} Mbps  update capture→decoded p50/p90 {whole} ms  per tile {:>5} ms (capture {} + encode {} + network {} + decode {})  rtt {} ms  decoded {}  lost {}  keyframe requests {}",
                 s.fps,
                 s.mbps,
                 ms(pipeline),
@@ -794,6 +877,115 @@ impl Probe {
         }
     }
 }
+
+/// The mean luma of a region of the stream, which may span several tiles: each tile's part is
+/// measured when that tile is decoded, and the region's mean is the area-weighted mean of the
+/// latest part from every tile it covers. A full frame ([`FULL_FRAME_TILE`]) covers the whole
+/// region: it is kept, and each tile decoded after it replaces its part of it.
+#[derive(Default)]
+struct RegionParts {
+    stream: (u32, u32),
+    /// The newest full frame, where it is (the whole stream), its mean over the region, and its
+    /// update.
+    full: Option<(Picture, TileRect, f64, u32)>,
+    /// Tile index → its latest part, since the full frame if there is one.
+    parts: HashMap<u8, Part>,
+}
+
+/// A decoded picture kept for later (the probe runs on the decoders' threads).
+struct Picture(CFRetained<CVPixelBuffer>);
+
+// SAFETY: CVPixelBuffer is a thread-safe, reference-counted CoreFoundation object.
+unsafe impl Send for Picture {}
+
+struct Part {
+    /// Its update: decoders finish in any order, so newer ones win, not later ones.
+    update: u32,
+    /// The tile it came from.
+    tile: protocol::TileRect,
+    /// Where it is (x0, y0, x1, y1 in stream pixels).
+    rect: (f64, f64, f64, f64),
+    luma: f64,
+    /// Pixels.
+    area: f64,
+    /// The full frame's mean over the same pixels (0 without one).
+    under: f64,
+}
+
+/// Mean luma of `pixel_buffer`, a picture of `tile`, over `part` (x0, y0, x1, y1 in stream pixels).
+fn part_luma(pixel_buffer: &CVPixelBuffer, tile: &TileRect, part: (f64, f64, f64, f64)) -> Option<f64> {
+    let (tx, ty, tw, th) = (f64::from(tile.x), f64::from(tile.y), f64::from(tile.width), f64::from(tile.height));
+    platform_mac::gpu::mean_luma(pixel_buffer, (part.0 - tx) / tw, (part.1 - ty) / th, (part.2 - tx) / tw, (part.3 - ty) / th)
+}
+
+impl RegionParts {
+    /// Takes in a decoded tile; returns the region's mean once every part of it has been seen
+    /// and this tile is one of them. `region` is (x0, y0, x1, y1), normalized to the stream.
+    fn update(&mut self, f: &ProbeFrame<'_>, region: (f64, f64, f64, f64)) -> Option<f64> {
+        if f.stream != self.stream {
+            self.stream = f.stream;
+            self.full = None;
+            self.parts.clear();
+        }
+        let (sw, sh) = (f64::from(f.stream.0), f64::from(f.stream.1));
+        let (tx, ty, tw, th) = (f64::from(f.tile.x), f64::from(f.tile.y), f64::from(f.tile.width), f64::from(f.tile.height));
+        let clamp = |v: f64, n: f64| v.clamp(0.0, 1.0) * n;
+        let (x0, y0, x1, y1) = (clamp(region.0, sw), clamp(region.1, sh), clamp(region.2, sw), clamp(region.3, sh));
+        // The part of the region in this tile, in stream pixels.
+        let part = (x0.max(tx), y0.max(ty), x1.min(tx + tw), y1.min(ty + th));
+        if part.0 >= part.2 || part.1 >= part.3 {
+            return None;
+        }
+        let luma = part_luma(f.pixel_buffer, &f.tile, part)?;
+        let area = (part.2 - part.0) * (part.3 - part.1);
+        let whole = (x1 - x0) * (y1 - y0);
+        if f.tile.index == FULL_FRAME_TILE {
+            if self.full.as_ref().is_some_and(|full| !is_newer(f.update, full.3)) {
+                return None; // a newer full frame decoded first
+            }
+            // Parts of older updates show what it shows now; newer ones stay over it, in place of
+            // what it has there.
+            self.parts.retain(|_, p| is_newer(p.update, f.update));
+            for p in self.parts.values_mut() {
+                p.under = part_luma(f.pixel_buffer, &f.tile, p.rect)?;
+            }
+            self.full = Some((Picture(f.pixel_buffer.retain()), f.tile, luma, f.update));
+            return self.mean(whole);
+        }
+        if self.parts.get(&f.tile.index).is_some_and(|p| p.tile != f.tile) {
+            // The host laid the tiles out anew (same size, fewer tiles): the old parts are gone.
+            self.parts.clear();
+        }
+        if self.full.as_ref().is_some_and(|full| !is_newer(f.update, full.3))
+            || self.parts.get(&f.tile.index).is_some_and(|p| !is_newer(f.update, p.update))
+        {
+            return None; // something newer already shows there
+        }
+        let under = match &self.full {
+            Some((full, rect, _, _)) => part_luma(&full.0, rect, part)?,
+            None => 0.0,
+        };
+        self.parts.insert(f.tile.index, Part { update: f.update, tile: f.tile, rect: part, luma, area, under });
+        self.mean(whole)
+    }
+
+    /// The region's mean: the full frame with the newer parts in place of what it had there; or,
+    /// without one, the parts once they cover the region.
+    fn mean(&self, whole: f64) -> Option<f64> {
+        if let Some((_, _, full_luma, _)) = self.full {
+            // The full frame, with the parts decoded since then in place of what it had there.
+            return Some((full_luma * whole + self.parts.values().map(|p| (p.luma - p.under) * p.area).sum::<f64>()) / whole);
+        }
+        let area: f64 = self.parts.values().map(|p| p.area).sum();
+        if area < whole * 0.999 {
+            return None; // some tile of the region hasn't been decoded yet
+        }
+        Some(self.parts.values().map(|p| p.luma * p.area).sum::<f64>() / area)
+    }
+}
+
+/// Clicks at most to get a first picture of the input-latency region.
+const MAX_WARM_UPS: usize = 3;
 
 /// Between a gesture's updates, as from a trackpad.
 const GESTURE_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
@@ -1022,6 +1214,95 @@ mod tests {
         assert_eq!(gesture(r#"{"system":"next_space"}"#).unwrap().unwrap(), [InputMsg::System(SystemAction::NEXT_SPACE)]);
         assert!(gesture(r#"{"system":"reboot"}"#).is_err());
         assert_eq!(gesture(r#"{"key":"a"}"#).unwrap(), None);
+    }
+
+    /// A `width`×`height` NV12 picture of one luma value.
+    fn flat_frame(width: usize, height: usize, luma: u8) -> platform_mac::CFRetained<platform_mac::CVPixelBuffer> {
+        use objc2_core_video::{
+            CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane,
+            CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+        };
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe { CVPixelBufferCreate(None, width, height, u32::from_be_bytes(*b"420f"), None, std::ptr::NonNull::from(&mut raw)) };
+        assert_eq!(status, 0);
+        let pb = unsafe { platform_mac::CFRetained::from_raw(std::ptr::NonNull::new(raw).unwrap()) };
+        unsafe {
+            CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags::empty());
+            for plane in 0..2 {
+                let base = CVPixelBufferGetBaseAddressOfPlane(&pb, plane) as *mut u8;
+                let len = CVPixelBufferGetBytesPerRowOfPlane(&pb, plane) * CVPixelBufferGetHeightOfPlane(&pb, plane);
+                std::ptr::write_bytes(base, if plane == 0 { luma } else { 128 }, len);
+            }
+            CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::empty());
+        }
+        pb
+    }
+
+    #[test]
+    fn region_luma_combines_the_tiles_it_spans() {
+        let tile = |index: u8, y: u32| protocol::TileRect { index, x: 0, y, width: 200, height: 100 };
+        let mut parts = RegionParts::default();
+        let mut update = 0;
+        let mut luma = |pb: &platform_mac::CVPixelBuffer, tile, stream, region| {
+            update += 1;
+            parts.update(&ProbeFrame { pixel_buffer: pb, tile, stream, update, update_mask: 0, timing: Default::default() }, region)
+        };
+        let near = |got: Option<f64>, want: f64| got.is_some_and(|v| (v - want).abs() < 1e-9);
+        // Rows 75..225 of 300: 25 in tile 0, 100 in tile 1, 25 in tile 2.
+        let (stream, region) = ((200, 300), (0.25, 0.25, 0.75, 0.75));
+        let (black, white, grey) = (flat_frame(200, 100, 0), flat_frame(200, 100, 200), flat_frame(200, 100, 100));
+        assert_eq!(luma(&black, tile(0, 0), stream, region), None, "tiles 1 and 2 not seen yet");
+        assert_eq!(luma(&white, tile(1, 100), stream, region), None);
+        assert!(near(luma(&black, tile(2, 200), stream, region), 200.0 * 100.0 / 150.0));
+        assert!(near(luma(&grey, tile(0, 0), stream, region), (100.0 * 25.0 + 200.0 * 100.0) / 150.0), "the newest part of each tile counts");
+        let elsewhere = protocol::TileRect { index: 3, x: 0, y: 0, width: 40, height: 40 };
+        assert_eq!(luma(&black, elsewhere, stream, region), None, "a tile outside the region");
+        // A stream of another size starts over: rows 100..200 of 400 are all in tile 1.
+        assert!(near(luma(&white, tile(1, 100), (200, 400), (0.0, 0.25, 1.0, 0.5)), 200.0));
+    }
+
+    #[test]
+    fn region_luma_takes_tiles_over_a_full_frame() {
+        let tile = |index: u8, y: u32| protocol::TileRect { index, x: 0, y, width: 200, height: 100 };
+        let full = protocol::TileRect { index: FULL_FRAME_TILE, x: 0, y: 0, width: 200, height: 300 };
+        let mut parts = RegionParts::default();
+        let mut update = 0;
+        let mut luma = |pb: &platform_mac::CVPixelBuffer, tile, region| {
+            update += 1;
+            parts.update(&ProbeFrame { pixel_buffer: pb, tile, stream: (200, 300), update, update_mask: 0, timing: Default::default() }, region)
+        };
+        let near = |got: Option<f64>, want: f64| got.is_some_and(|v| (v - want).abs() < 1e-9);
+        // Rows 75..225 of 300: 25 in tile 0, 100 in tile 1, 25 in tile 2.
+        let region = (0.25, 0.25, 0.75, 0.75);
+        let (black, white) = (flat_frame(200, 100, 0), flat_frame(200, 100, 200));
+        assert_eq!(luma(&black, tile(0, 0), region), None);
+        // A full frame covers the whole region at once.
+        assert!(near(luma(&flat_frame(200, 300, 100), full, region), 100.0));
+        // A tile decoded after it shows its part instead.
+        assert!(near(luma(&white, tile(1, 100), region), (100.0 * 50.0 + 200.0 * 100.0) / 150.0));
+        assert!(near(luma(&black, tile(2, 200), region), (100.0 * 25.0 + 200.0 * 100.0) / 150.0));
+        // A newer full frame replaces them all.
+        assert!(near(luma(&flat_frame(200, 300, 50), full, region), 50.0));
+        assert!(near(luma(&black, tile(0, 0), region), 50.0 * 125.0 / 150.0));
+    }
+
+    /// Decoders finish in any order: a full frame of an older update decoded after a newer tile
+    /// leaves that tile's part in place.
+    #[test]
+    fn region_luma_follows_updates_not_decode_order() {
+        let tile = protocol::TileRect { index: 1, x: 0, y: 100, width: 200, height: 100 };
+        let full = protocol::TileRect { index: FULL_FRAME_TILE, x: 0, y: 0, width: 200, height: 300 };
+        let mut parts = RegionParts::default();
+        let mut luma = |pb: &platform_mac::CVPixelBuffer, tile, update| {
+            parts.update(&ProbeFrame { pixel_buffer: pb, tile, stream: (200, 300), update, update_mask: 0, timing: Default::default() }, (0.0, 0.0, 1.0, 1.0))
+        };
+        let near = |got: Option<f64>, want: f64| got.is_some_and(|v| (v - want).abs() < 1e-9);
+        assert!(near(luma(&flat_frame(200, 300, 60), full, 1), 60.0));
+        // Update 3's tile decodes before update 2's full frame.
+        assert!(near(luma(&flat_frame(200, 100, 240), tile, 3), (60.0 * 200.0 + 240.0 * 100.0) / 300.0));
+        assert!(near(luma(&flat_frame(200, 300, 0), full, 2), 240.0 / 3.0), "the full frame under the newer tile");
+        // An older tile than what's shown there changes nothing.
+        assert_eq!(luma(&flat_frame(200, 100, 9), tile, 2), None);
     }
 
     #[test]

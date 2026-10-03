@@ -9,35 +9,49 @@ mouse as if they were plugged into it.
 
 ## How it stays fast
 
-- **Capture → encode on the GPU, no CPU copies.** ScreenCaptureKit delivers IOSurface-backed NV12
-  frames straight to the hardware HEVC encoder, which runs flat out instead of pacing itself to
-  the frame rate (no B-frames, keyframes only on request). It takes one frame at a time, always
-  the newest, so a slow frame costs frame rate, never latency.
+- **Only what changed is encoded, in tiles, all at once.** The picture is split into tiles (a
+  6144×2560 screen into 16 of 3072×320), and each tile is its own video stream with its own
+  hardware HEVC encoder. Each captured frame is compared with what every tile last sent
+  (ScreenCaptureKit's dirty rectangles say which tiles to look at; every tile is compared four
+  times a second anyway), and only tiles that changed are encoded: typing or a menu re-encodes a
+  sliver of the screen in 2-5 ms instead of the whole picture in 17 ms. The changed tiles are
+  encoded together and each goes on the wire the moment it's done. When most of the screen
+  changes (scrolling, a new window), one more encoder sends the whole picture instead, which the
+  media engine does faster than many tiles. The encoders run flat out (no B-frames, keyframes
+  only on request) and take one frame at a time, always the newest, so a slow frame costs frame
+  rate, never latency.
 - **UDP, never TCP, for video.** One QUIC connection (quinn) carries TLS 1.3, a reliable control
   stream, and unreliable datagrams for video. A fixed-window congestion controller is used
-  because the LAN doesn't need Cubic's backoff. Lost frames are dropped, never retransmitted,
-  and the viewer requests a fresh keyframe.
-- **Decode → display with zero copies.** The hardware decoder outputs IOSurfaces. Each plane is
-  wrapped as a Metal texture and sampled by a wgpu shader, then presented immediately with no
-  frame queue.
+  because the LAN doesn't need Cubic's backoff. Lost frames are dropped, never retransmitted:
+  the viewer asks for a keyframe of just the tile that lost one (1/16 of a whole keyframe), and
+  knows from every frame which tiles its update had, so even a tile lost whole on a still screen
+  is asked for again. Each side sends a tiny packet every 20 ms when idle, so a Wi-Fi radio never
+  dozes off between clicks.
+- **Decode → display with zero copies.** Each tile has its own hardware decoder, decoding as soon
+  as the tile arrives, in parallel with the others. The render thread copies decoded tiles into a
+  picture on the GPU with Metal and draws it as soon as every tile of a frame is in, so a frame
+  is never shown half old, half new. No frame queue anywhere.
 - **The pointer never waits for the video.** While controlling, the remote cursor is drawn
   locally, in the remote Mac's current shape (arrow, I-beam, hand...), and left out of the video,
   so moving the mouse has no lag at all. Clicks and keys travel on their own reliable QUIC stream,
   sent the moment they happen (a backlog of moves is merged, never reordered past a click or a
   key); the viewer asks the host to acknowledge at once, so even a lost packet is resent within a
   few milliseconds. The host injects them from a dedicated high-priority thread.
-- **Frames as often as your screen shows them.** The viewer asks for its display's refresh rate:
-  120 fps on ProMotion when the stream is small enough to encode that fast (≤ ~5.6 Mpx), 60 fps
-  above that, where the encoder sets the pace anyway.
+- **Frames as often as your screen shows them.** The viewer asks for its display's refresh rate,
+  up to 120 fps at any size: only changed tiles are encoded, so even a 6K display keeps up with
+  typing and moving windows at 120 Hz. The bit budget stays at 60 fps worth, spread over more,
+  smaller frames.
 - **Measured, not guessed.** The viewer's latency overlay shows capture→screen latency split into
-  capture, encode, network, decode and display, using a clock synced to the host, plus the time
-  from your input to its injection on the other Mac.
-  `cargo test --release -p platform-mac --test encode_latency -- --ignored --nocapture` measures
-  the encoder alone at common screen sizes.
+  capture, encode, network, decode and display, using a clock synced to the host and the moment
+  Metal reports the frame on screen, plus the time from your input to its injection on the other
+  Mac. Benchmarks (`cargo test --release -p platform-mac --test <name> -- --ignored --nocapture`):
+  `encode_latency` (one encoder at common screen sizes), `stripe_encode` (tiles against one
+  encoder, and the full frame), `tiler` (comparing and copying tiles).
 
-Measured on one M3 Max Mac over loopback: input reaches the host in about 0.3 ms, and posting
-it there takes about 2.5 ms. From a click to the changed pixels decoded on the viewer takes, at
-the median, 36 ms for a 4112×2658 stream at 60 fps and 25 ms for 2558×1654 at 120 fps.
+Measured on one M3 Max Mac (6144×2560, nothing else encoding): one changed tile is out of the
+encoder 3.6-5.4 ms after the frame is taken, against 17 ms when every frame was encoded whole; a
+whole-screen change takes 19 ms as one full frame (27 ms as 16 tiles, which is why big changes go
+whole). Input reaches the host in about 0.3 ms, and posting it there takes about 2.5 ms.
 
 ## Install
 
@@ -175,12 +189,16 @@ Screen** goes back.
   removes them too, and none can be added until you're back.
 - Keep a MacBook's lid open: a Mac whose only other display is virtual sleeps when the lid closes.
   Turn its brightness down instead.
-- 6144 × 2560 encodes in about 16 ms on an M3 Max, so it streams at up to 60 fps, at about
+- 6144 × 2560 streams at up to 120 fps: a change to part of it encodes in a few milliseconds, a
+  change of the whole screen in about 17 ms on an M3 Max. Big changes take up to about
   113 Mbit/s: use Ethernet. A Mac makes at most two virtual displays at once.
 - Both Macs need this version of LanKVM. Virtual displays use a private macOS interface (as
   BetterDisplay and DeskPad do); LanKVM checks it's there, exactly as expected, before using it.
 
-Set `LANKVM_PORT` to change the UDP port (default 47800).
+Set `LANKVM_PORT` to change the UDP port (default 47800). On the viewed Mac, `LANKVM_TILES=COLSxROWS`
+forces the tile grid (`1x1` encodes the whole picture as one stream, as older versions did), and
+`LANKVM_FULL_FRAME_AT` (default 0.6) is the share of the picture that has to change for it to go
+as one full frame (above 1: never).
 
 ## Testing a connection on one Mac
 
@@ -284,7 +302,11 @@ real QUIC on loopback while the host records what it would inject (`crates/core/
   Accessibility on the Mac you control *from* too (Privacy & Security → Accessibility). Pinch,
   rotate and page swipes work without it.
 - **Reset a permission:** `tccutil reset ScreenCapture dev.lankvm.LanKVM` (or `Accessibility`)
-- **Wi-Fi** adds jitter. For the lowest latency, put the viewed Macs on Ethernet.
+- **Wi-Fi** adds jitter. For the lowest latency, put the viewed Macs on Ethernet, or connect the two
+  Macs with a Thunderbolt cable (Thunderbolt Bridge). On Wi-Fi, a Mac whose radio regularly leaves
+  the channel for AirDrop, Universal Control or Sidecar (AWDL) stalls every packet for tens of
+  milliseconds a couple of times a second: `ping -i 0.01 <other Mac>` shows it as a run of
+  replies 70 ms late. `sudo ifconfig awdl0 down` on that Mac turns AWDL off until it restarts.
 - **A virtual display looks soft:** go full screen (⌃⌘F) on the screen whose size it matches; in a
   window the picture is scaled.
 - **Windows are on a display you can't see** (on the Mac that made a virtual display): click
@@ -298,8 +320,8 @@ real QUIC on loopback while the host records what it would inject (`crates/core/
 |---|---|
 | `crates/protocol` | Wire messages, video packet header |
 | `crates/transport` | QUIC endpoint, LAN congestion control, identity, pairing, packetizer/reassembler |
-| `crates/platform-mac` | ScreenCaptureKit capture, VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), virtual displays (`virtual_display.rs`) |
-| `crates/core` | Host service, viewer sessions, remote control (`control.rs`), virtual displays for viewers (`displays.rs`), render thread, C ABI (`ffi.rs`) for the app |
+| `crates/platform-mac` | ScreenCaptureKit capture, finding the tiles that changed (`tiler.rs`), VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), virtual displays (`virtual_display.rs`) |
+| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), virtual displays for viewers (`displays.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
 | `macos/` | SwiftUI app (SwiftPM). `Sources/CLanKVM/include/lankvm.h` is the C interface |
 | `scripts/bundle.sh` | Builds and signs `LanKVM.app` |
 | `scripts/make-icon.swift` | Regenerates `macos/Resources/AppIcon.icns` |

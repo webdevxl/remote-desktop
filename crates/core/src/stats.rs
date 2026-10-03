@@ -73,9 +73,12 @@ pub struct Stats {
     pub encode: Ema,
     pub network: Ema,
     pub decode: Ema,
+    /// Last tile of an update decoded → the update on screen (the display's presentation time).
     pub present: Ema,
+    /// Captured on the host → on screen here.
     pub total: Ema,
     pub frames_decoded: u64,
+    /// Updates that reached the screen.
     pub frames_shown: u64,
     pub keyframe_requests: u64,
     pub frames_lost: u64,
@@ -97,14 +100,17 @@ pub struct Stats {
 pub struct StatsView {
     pub fps: f64,
     pub mbps: f64,
+    /// Host capture → on screen here.
     pub total_ms: Option<f64>,
     pub capture_ms: Option<f64>,
     pub encode_ms: Option<f64>,
     pub network_ms: Option<f64>,
     pub decode_ms: Option<f64>,
+    /// Decoded → on screen.
     pub display_ms: Option<f64>,
     pub rtt_ms: Option<f64>,
     pub frames_decoded: u64,
+    /// Updates that reached the screen.
     pub frames_shown: u64,
     pub frames_lost: u64,
     pub keyframe_requests: u64,

@@ -24,7 +24,10 @@ enum SidebarItem: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
     @EnvironmentObject private var core: CoreModel
+    @Environment(\.openWindow) private var openWindow
     @State private var selection: SidebarItem?
+    /// LANKVM_CONNECT is used once per launch.
+    @MainActor private static var autoConnected = false
 
     init(selection: SidebarItem = .connect) {
         _selection = State(initialValue: selection)
@@ -51,6 +54,15 @@ struct ContentView: View {
         .tint(.lkAccent)
         .sheet(item: Binding(get: { core.host.pairing.first }, set: { _ in })) { request in
             PairingRequestSheet(request: request)
+        }
+        .onAppear {
+            // Test runs (scripts/e2e-control.sh viewer): connect at once, as if typed in Connect.
+            if !Self.autoConnected, let address = ProcessInfo.processInfo.environment["LANKVM_CONNECT"], !address.isEmpty {
+                Self.autoConnected = true
+                // This window may appear before the app finished launching: the core first.
+                core.start()
+                openWindow(id: "viewer", value: core.connect(to: address))
+            }
         }
     }
 }

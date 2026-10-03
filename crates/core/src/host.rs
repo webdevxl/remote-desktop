@@ -12,10 +12,11 @@ use anyhow::{Context, Result, bail};
 use platform_mac::capture::{CaptureConfig, CapturedFrame, Capturer, DisplayInfo, main_display};
 use platform_mac::cursor::{CursorMonitor, CursorUpdate};
 use platform_mac::encoder::{EncodedFrame, Encoder, EncoderConfig};
-use platform_mac::{clock, permissions, system, virtual_display};
+use platform_mac::tiler::{TileCopy, Tiler, tiles_touched};
+use platform_mac::{CVPixelBuffer, clock, permissions, system, virtual_display};
 use protocol::{
     Arrangement, ClientMsg, Codec, ControlReason, ControlState, CursorState, DisplayChoice, DisplayReason, DisplayState, HostMsg,
-    PROTOCOL_VERSION, VideoFrame, VirtualDisplaySpec,
+    FULL_FRAME_TILE, MAX_TILES, PROTOCOL_VERSION, TILE_MAX_WIDTH, TileRect, VideoFrame, VirtualDisplaySpec, tile_layout,
 };
 use quinn::{Connection, ConnectionError, Endpoint, Incoming, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -31,13 +32,32 @@ use crate::control::{Backend, HostSettings, InputCmdSender, InputConfig, InputFa
 use crate::displays::{Acquired, DisplayNotice, Displays, VirtualDisplayView};
 use crate::{Event, EventSink, Trust};
 
-/// Minimum spacing between keyframes produced on request; a client that keeps losing packets
-/// shouldn't turn the stream into all-keyframes.
-const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(100);
+/// Minimum spacing between keyframes (and re-sent tiles) produced on request or after a loss; a
+/// client that keeps losing packets shouldn't turn the stream into all-keyframes. Short, as a
+/// keyframe is only of the tiles that need one.
+const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(50);
+/// Each tile's encoder gets at least this much of the stream's bitrate.
+const MIN_TILE_BITRATE: u32 = 1_000_000;
+/// A tile counts as moving, for its bitrate, this long after it last changed (see [`Motion`]).
+const MOTION_WINDOW: Duration = Duration::from_secs(1);
+/// How often the tiles' bitrates follow the motion.
+const RETARGET_INTERVAL: Duration = Duration::from_millis(250);
+/// A tile's encoder is told a new bitrate only when it is off by more than this fraction.
+const RETARGET_MIN_CHANGE: f64 = 0.25;
 /// How long the PIN stays valid while someone walks over to the other Mac.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
-/// A frame should leave the encoder within milliseconds; past this, move on to the next one.
+/// A frame should leave the encoders within milliseconds; past this, move on to the next one.
 const ENCODE_TIMEOUT: Duration = Duration::from_millis(500);
+/// The screen counts as still this long after an update: the viewer is then told which update
+/// was the last ([`HostMsg::VideoIdle`]), in case it lost all of it. Longer than
+/// [`KEYFRAME_MIN_INTERVAL`], so a tile resent after its encoder dropped it goes out first (the
+/// viewer would otherwise ask for a keyframe it doesn't need).
+const IDLE_NOTE_AFTER: Duration = Duration::from_millis(60);
+/// Even with ScreenCaptureKit's dirty rectangles to go by, every tile is compared this often, in
+/// case they missed a change.
+const FULL_COMPARE_INTERVAL: Duration = Duration::from_millis(250);
+/// After the dirty rectangles missed a change, they aren't used for this long.
+const DIRTY_RECTS_DISTRUST: Duration = Duration::from_secs(10);
 /// QUIC handshakes in progress at once, in all and from one address. Honest ones take a round
 /// trip on a LAN; a peer that starts handshakes and never finishes them can't pile them up.
 const MAX_HANDSHAKES: usize = 64;
@@ -401,7 +421,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
         viewer_fps: fps,
         video: ctx.video,
         stream: Arc::default(),
-        packetizer: Arc::default(),
+        video_out: Arc::new(VideoOut::new(conn.clone())),
         input: Arc::new(InputShared::default()),
         cursor: CursorWish::default(),
         generation: Arc::default(),
@@ -428,6 +448,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
     // From here on several parties talk to the viewer (pongs, control state, cursor shapes,
     // input acks), so one task owns the send side of the control stream.
     let (out, mut out_rx) = mpsc::channel::<HostMsg>(OUT_QUEUE);
+    streamer.video_out.set_notices(out.clone());
     let _writer = AbortOnDrop(tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if write_msg(&mut send, &msg).await.is_err() {
@@ -535,7 +556,14 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
             bail!("more than {MAX_DISPLAY_REQUESTS_PER_SEC} display requests a second");
         }
         match evt {
-            SessionEvt::Client(ClientMsg::RequestKeyframe) => control.stream.request_keyframe(),
+            SessionEvt::Client(ClientMsg::RequestKeyframe) => control.stream.request_keyframes(u64::MAX),
+            SessionEvt::Client(ClientMsg::RequestKeyframes { tiles }) => control.stream.request_keyframes(tiles),
+            SessionEvt::Client(ClientMsg::NoFullFrame) => {
+                // For good, and first: streams started from now on (a switch may be under way)
+                // make no full-frame encoder; then the one running stops using its own.
+                screen.streamer.video_out.no_full_frame.store(true, Ordering::Release);
+                control.stream.no_full_frame();
+            }
             SessionEvt::Client(ClientMsg::Ping { client_time_us }) => {
                 let now = clock::now_us();
                 control.shared.last_ping_us.store(now, Ordering::Release);
@@ -1133,13 +1161,12 @@ fn fit_within(width: u32, height: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     (even(width as f64 * scale), even(height as f64 * scale))
 }
 
-/// Up to the viewer's refresh rate, but 120 fps only for streams the encoder can keep up with:
-/// encoding takes about 1.1 ms per megapixel on Apple silicon, so above ~5.6 Mpx a frame takes
-/// longer than 1/120 s and the extra frames only cost power (measured: no latency gain at
-/// 4112×2658; 4 ms less click-to-photon at 2560×1654).
-fn choose_fps(requested: u32, width: u32, height: u32) -> u32 {
-    let max = if u64::from(width) * u64::from(height) <= 5_600_000 { 120 } else { 60 };
-    requested.clamp(15, max)
+/// Up to the viewer's refresh rate, whatever the size: only the tiles that changed are encoded,
+/// all at once, so typing or a moving window on a 6K display keeps up with 120 Hz. A change of
+/// the whole screen still costs about a whole-frame encode (~16 ms at 6144×2560); newest-frame-wins
+/// then lowers the frame rate, never adds latency.
+fn choose_fps(requested: u32) -> u32 {
+    requested.clamp(15, 120)
 }
 
 /// Generous LAN bitrate: about 0.12 bits per pixel per frame, so text stays sharp.
@@ -1148,76 +1175,635 @@ fn bitrate_for(width: u32, height: u32, fps: u32) -> u32 {
     bps.clamp(8e6, 150e6) as u32
 }
 
-/// Captures the display and streams encoded frames to one viewer.
+/// Each tile's bitrate. Tiles that moved lately (`active`) share the stream's budget by area, so
+/// a video playing in one tile may get all of it; the others keep their area's share, enough for
+/// a sharp keyframe if one is asked for. Still tiles send nothing, so the stream as a whole stays
+/// near its budget. Every tile gets at least [`MIN_TILE_BITRATE`].
+fn tile_bitrates(stream_bps: u32, tiles: &[TileRect], active: u64) -> Vec<u32> {
+    let area = |t: &TileRect| u64::from(t.width) * u64::from(t.height);
+    let total: u64 = tiles.iter().map(area).sum();
+    let moving: u64 = tiles.iter().enumerate().filter(|&(i, _)| active & tile_bit(i) != 0).map(|(_, t)| area(t)).sum();
+    tiles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let among = if active & tile_bit(i) != 0 { moving } else { total };
+            let share = u64::from(stream_bps) * area(t) / among.max(1);
+            (share.min(u64::from(u32::MAX)) as u32).max(MIN_TILE_BITRATE)
+        })
+        .collect()
+}
+
+/// Where the picture moved lately, and the bitrates the tile encoders were given for it.
+struct Motion {
+    stream_bps: u32,
+    tiles: Vec<TileRect>,
+    changed_at: Vec<Option<Instant>>,
+    /// As the encoders have them.
+    bitrates: Vec<u32>,
+    next_check: Instant,
+}
+
+impl Motion {
+    fn new(stream_bps: u32, tiles: Vec<TileRect>, now: Instant) -> Self {
+        let bitrates = tile_bitrates(stream_bps, &tiles, 0);
+        Self { stream_bps, changed_at: vec![None; tiles.len()], tiles, bitrates, next_check: now + RETARGET_INTERVAL }
+    }
+
+    fn changed(&mut self, tiles: u64, now: Instant) {
+        for (i, at) in self.changed_at.iter_mut().enumerate() {
+            if tiles & tile_bit(i) != 0 {
+                *at = Some(now);
+            }
+        }
+    }
+
+    /// Every [`RETARGET_INTERVAL`]: the tiles whose encoders should get another bitrate, and
+    /// which. Small corrections aren't worth telling an encoder about.
+    fn retarget(&mut self, now: Instant) -> Vec<(usize, u32)> {
+        if now < self.next_check {
+            return Vec::new();
+        }
+        self.next_check = now + RETARGET_INTERVAL;
+        let active = self
+            .changed_at
+            .iter()
+            .enumerate()
+            .filter(|(_, at)| at.is_some_and(|at| now.saturating_duration_since(at) < MOTION_WINDOW))
+            .fold(0, |mask, (i, _)| mask | tile_bit(i));
+        let mut changes = Vec::new();
+        for (i, target) in tile_bitrates(self.stream_bps, &self.tiles, active).into_iter().enumerate() {
+            let current = self.bitrates[i];
+            if (f64::from(target) - f64::from(current)).abs() > RETARGET_MIN_CHANGE * f64::from(current) {
+                self.bitrates[i] = target;
+                changes.push((i, target));
+            }
+        }
+        changes
+    }
+}
+
+/// `LANKVM_TILES=COLSxROWS` forces the tile grid, e.g. `1x1` for one encoder for the whole picture.
+fn tile_grid() -> Option<(u32, u32)> {
+    let value = std::env::var("LANKVM_TILES").ok()?;
+    let grid = parse_grid(&value);
+    if grid.is_none() {
+        tracing::warn!("ignoring LANKVM_TILES={value:?}: expected COLSxROWS, e.g. 2x8");
+    }
+    grid
+}
+
+fn parse_grid(value: &str) -> Option<(u32, u32)> {
+    let (cols, rows) = value.trim().split_once(['x', 'X'])?;
+    let (cols, rows): (u32, u32) = (cols.trim().parse().ok()?, rows.trim().parse().ok()?);
+    (cols >= 1 && rows >= 1).then_some((cols, rows))
+}
+
+/// Bit `index` of a tile mask.
+fn tile_bit(index: usize) -> u64 {
+    1u64 << index
+}
+
+/// The full-frame stream's bit in a tile mask.
+const FULL_FRAME_BIT: u64 = 1u64 << FULL_FRAME_TILE;
+
+/// Updates whose numbers and tile masks [`VideoOut`] remembers. One update is encoded at a time,
+/// so its tiles are out long before its slot comes round again.
+const UPDATE_MASKS: usize = 8;
+
+/// One update as [`VideoOut`] remembers it.
+#[derive(Clone, Copy, Default)]
+struct UpdateSlot {
+    /// Its encoders' tag.
+    tag: u64,
+    /// Its number on the wire, once one of its frames went out.
+    update: Option<u32>,
+    /// Its tiles: those it encodes until it is done, then those that went out.
+    mask: u64,
+    /// It is done: a frame of it its encoder puts out only now isn't sent (see
+    /// [`VideoOut::send`]).
+    closed: bool,
+}
+
+/// What a connection's video keeps from one stream to the next (a display switch replaces the
+/// stream): each tile's frame ids and the update numbers keep counting up, or the viewer would
+/// drop the new stream's frames as late.
+struct VideoOut {
+    conn: Connection,
+    /// By tile index: each tile is reassembled on its own.
+    packetizers: Vec<Mutex<Packetizer>>,
+    /// Numbers updates on the wire ([`VideoFrame::update`]); wraps. Only updates that send
+    /// something take one, so to the viewer a gap is always a loss on the way.
+    next_update: AtomicU32,
+    /// Tags the updates being encoded (the encoders' tags).
+    next_tag: AtomicU64,
+    /// Update tagged `t` is in slot `t % UPDATE_MASKS`, set before it is encoded.
+    slots: Mutex<[UpdateSlot; UPDATE_MASKS]>,
+    /// The control stream, once the viewer has been welcomed: for [`HostMsg::VideoIdle`].
+    notices: Mutex<Option<mpsc::Sender<HostMsg>>>,
+    /// The viewer can't decode the full-frame stream ([`ClientMsg::NoFullFrame`]): every stream
+    /// of this connection sends changes as tiles only.
+    no_full_frame: AtomicBool,
+}
+
+impl VideoOut {
+    fn new(conn: Connection) -> Self {
+        let packetizers = (0..MAX_TILES).map(|i| Mutex::new(Packetizer::for_tile(i as u8))).collect();
+        Self {
+            conn,
+            packetizers,
+            next_update: AtomicU32::new(0),
+            next_tag: AtomicU64::new(0),
+            slots: Mutex::new([UpdateSlot { tag: NOT_SENT, ..UpdateSlot::default() }; UPDATE_MASKS]),
+            notices: Mutex::default(),
+            no_full_frame: AtomicBool::new(false),
+        }
+    }
+
+    fn set_notices(&self, out: mpsc::Sender<HostMsg>) {
+        *self.notices.lock().unwrap() = Some(out);
+    }
+
+    /// Tells the viewer the screen went still after `update`, which sent the tiles in `mask`.
+    fn idle(&self, update: u32, mask: u64) {
+        if let Some(out) = self.notices.lock().unwrap().as_ref() {
+            // A safety net only: skipped if the viewer isn't reading its control stream.
+            let _ = out.try_send(HostMsg::VideoIdle { update, mask });
+        }
+    }
+
+    /// Starts an update encoding the tiles of `mask`; returns its encoders' tag.
+    fn start_update(&self, mask: u64) -> u64 {
+        let tag = self.next_tag.fetch_add(1, Ordering::Relaxed);
+        self.slots.lock().unwrap()[tag as usize % UPDATE_MASKS] = UpdateSlot { tag, update: None, mask, closed: false };
+        tag
+    }
+
+    /// The update tagged `tag` is done: only the tiles in `sent` went out. Returns its number,
+    /// if it has one (something went out). The viewer hears of the others no more: the next
+    /// update's `previous_mask` and [`HostMsg::VideoIdle`] name only what was sent.
+    fn finish_update(&self, tag: u64, sent: u64) -> Option<u32> {
+        let mut slots = self.slots.lock().unwrap();
+        let slot = &mut slots[tag as usize % UPDATE_MASKS];
+        if slot.tag != tag {
+            return None;
+        }
+        slot.mask = sent;
+        slot.closed = true;
+        slot.update
+    }
+
+    /// Sends one encoded tile of a `stream`-sized picture, right away. False if it didn't go out,
+    /// also when it is a frame of an update already done: the encoder took too long, the update
+    /// counted it as lost, and newer pictures may have gone out since (a number now would make
+    /// this older one look newer).
+    fn send(&self, frame: EncodedFrame, tile: TileRect, stream: (u32, u32)) -> bool {
+        let (update, update_mask, previous_mask) = {
+            let mut slots = self.slots.lock().unwrap();
+            let at = frame.tag as usize % UPDATE_MASKS;
+            if slots[at].tag != frame.tag || slots[at].closed {
+                return false;
+            }
+            let next = &self.next_update;
+            let update = *slots[at].update.get_or_insert_with(|| next.fetch_add(1, Ordering::Relaxed));
+            let mask = slots[at].mask;
+            let previous = slots.iter().find(|s| s.update == Some(update.wrapping_sub(1))).map_or(0, |s| s.mask);
+            (update, mask, previous)
+        };
+        let video = VideoFrame {
+            codec: frame.codec,
+            keyframe: frame.keyframe,
+            width: stream.0,
+            height: stream.1,
+            tile,
+            update,
+            update_mask,
+            previous_mask,
+            capture_time_us: frame.capture_time_us,
+            encode_start_us: frame.encode_start_us,
+            encoded_time_us: clock::now_us(),
+            param_sets: frame.param_sets,
+            nal_length_size: frame.nal_length_size,
+            data: frame.data,
+        };
+        let Some(max) = self.conn.max_datagram_size() else { return false };
+        let Some(packetizer) = self.packetizers.get(usize::from(tile.index)) else { return false };
+        let packets = protocol::encode(&video)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| packetizer.lock().unwrap().packetize(&bytes, max));
+        match packets {
+            Ok(packets) => packets.into_iter().all(|packet| self.conn.send_datagram(packet).is_ok()), // false: closing
+            Err(e) => {
+                tracing::warn!(tile = tile.index, "packetize: {e:#}");
+                false
+            }
+        }
+    }
+}
+
+/// Never a real tag: tags count up from 0 and would take ages to get there.
+const NOT_SENT: u64 = u64::MAX;
+
+/// What became of one encoder's frames: written by its output callback, read once the encoder
+/// is idle.
+struct Track {
+    /// Tag of the newest frame the encoder put out, whether it went out or not.
+    emitted: AtomicU64,
+    /// Tag of the newest frame that went out, and of the newest keyframe that did.
+    sent: AtomicU64,
+    sent_keyframe: AtomicU64,
+    /// A frame came out that never went out: the encoder's references moved on, the viewer's
+    /// didn't, so its next frame must be a keyframe.
+    repair: AtomicBool,
+}
+
+impl Default for Track {
+    fn default() -> Self {
+        Self {
+            emitted: AtomicU64::new(NOT_SENT),
+            sent: AtomicU64::new(NOT_SENT),
+            sent_keyframe: AtomicU64::new(NOT_SENT),
+            repair: AtomicBool::new(false),
+        }
+    }
+}
+
+/// What became of a frame submitted to an encoder.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Fate {
+    Sent { keyframe: bool },
+    /// Encoded, but it never reached the network: the encoder's references moved on, the
+    /// viewer's didn't, so that stream needs a keyframe.
+    Unsent,
+    /// The encoder put nothing out (dropped, failed or late): the viewer's decoder is where the
+    /// encoder's is, and only the picture is missing.
+    Lost,
+}
+
+impl Track {
+    /// The encoder's output callback: sends the frame.
+    fn deliver(&self, video: &VideoOut, frame: EncodedFrame, tile: TileRect, stream: (u32, u32)) {
+        let (tag, keyframe) = (frame.tag, frame.keyframe);
+        self.emitted.store(tag, Ordering::Release);
+        if video.send(frame, tile, stream) {
+            if keyframe {
+                self.sent_keyframe.store(tag, Ordering::Release);
+            }
+            self.sent.store(tag, Ordering::Release);
+        } else {
+            self.repair.store(true, Ordering::Release);
+        }
+    }
+
+    /// The frame tagged `tag`, once its encoder is idle.
+    fn fate(&self, tag: u64) -> Fate {
+        if self.sent.load(Ordering::Acquire) == tag {
+            Fate::Sent { keyframe: self.sent_keyframe.load(Ordering::Acquire) == tag }
+        } else if self.emitted.load(Ordering::Acquire) == tag {
+            Fate::Unsent
+        } else {
+            Fate::Lost
+        }
+    }
+}
+
+/// A stream's encoders, one per tile and one for the full frame, each sending its frames the
+/// moment they're done.
+struct TileEncoders {
+    stream: (u32, u32),
+    /// The whole stream's.
+    bitrate_bps: u32,
+    tiles: Vec<TileRect>,
+    encoders: Vec<Encoder>,
+    tracks: Vec<Arc<Track>>,
+    /// The whole picture's ([`FULL_FRAME_TILE`]), when there are several tiles.
+    full: Option<(Encoder, Arc<Track>)>,
+    /// Changed tiles covering at least this fraction of the picture go out as one full frame.
+    full_frame_at: f64,
+    /// To make a tile's encoder again (see [`TileEncoders::rebuild`]).
+    video: Arc<VideoOut>,
+    cfg: EncoderConfig,
+}
+
+impl TileEncoders {
+    /// `cfg` is the whole stream's; each tile gets its share of the bitrate.
+    fn new(video: &Arc<VideoOut>, cfg: &EncoderConfig, tiles: Vec<TileRect>, full_frame_at: f64) -> Result<Self> {
+        let stream = (cfg.width, cfg.height);
+        let whole = TileRect { index: FULL_FRAME_TILE, x: 0, y: 0, width: cfg.width, height: cfg.height };
+        let with_full = tiles.len() > 1 && !video.no_full_frame.load(Ordering::Acquire);
+        let mut rects = tiles.clone();
+        if with_full {
+            rects.push(whole);
+        }
+        let bitrates = tile_bitrates(cfg.bitrate_bps, &tiles, 0);
+        let mut tracks: Vec<Arc<Track>> = rects.iter().map(|_| Arc::default()).collect();
+        // Making a session takes some 20 ms, mostly waiting for the media server: together, a
+        // display switch waits for the slowest instead of all of them in turn.
+        let mut made: Vec<Result<Encoder>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = rects
+                .iter()
+                .zip(&tracks)
+                .enumerate()
+                .map(|(i, (&rect, track))| {
+                    let bitrate_bps = bitrates.get(i).copied().unwrap_or(cfg.bitrate_bps);
+                    let tile_cfg = EncoderConfig { width: rect.width, height: rect.height, bitrate_bps, ..*cfg };
+                    let (video, track) = (video.clone(), track.clone());
+                    scope.spawn(move || Encoder::new(&tile_cfg, move |frame| track.deliver(&video, frame, rect, stream)))
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap_or_else(|_| Err(anyhow::anyhow!("encoder setup panicked")))).collect()
+        });
+        let full = if with_full { Some((made.pop().expect("full-frame encoder"), tracks.pop().expect("its track"))) } else { None };
+        let mut encoders = Vec::with_capacity(tiles.len());
+        for (i, (encoder, tile)) in made.into_iter().zip(&tiles).enumerate() {
+            let encoder = encoder.with_context(|| format!("encoder for tile {i} ({}×{})", tile.width, tile.height))?;
+            // A software encoder per tile would be far too slow; one for the whole picture is the
+            // lesser evil.
+            if tiles.len() > 1 && !encoder.hardware() {
+                bail!("no hardware encoder for tile {i}");
+            }
+            encoders.push(encoder);
+        }
+        let full = match full {
+            Some((Ok(encoder), track)) if encoder.hardware() && encoder.codec() == encoders[0].codec() => Some((encoder, track)),
+            Some((Ok(_), _)) => {
+                tracing::warn!("no hardware encoder like the tiles' for the full frame: big changes go out as tiles");
+                None
+            }
+            Some((Err(e), _)) => {
+                tracing::warn!("full-frame encoder: {e:#}; big changes go out as tiles");
+                None
+            }
+            None => None,
+        };
+        Ok(Self { stream, bitrate_bps: cfg.bitrate_bps, tiles, encoders, tracks, full, full_frame_at, video: video.clone(), cfg: *cfg })
+    }
+
+    /// Makes tile `i`'s encoder again (its session broke): its first frame is a keyframe.
+    fn rebuild(&mut self, i: usize, bitrate_bps: u32) -> Result<()> {
+        let rect = self.tiles[i];
+        let (video, track, stream) = (self.video.clone(), self.tracks[i].clone(), self.stream);
+        let cfg = EncoderConfig { width: rect.width, height: rect.height, bitrate_bps, ..self.cfg };
+        self.encoders[i] = Encoder::new(&cfg, move |frame| track.deliver(&video, frame, rect, stream))?;
+        Ok(())
+    }
+
+    fn codec(&self) -> Codec {
+        self.encoders[0].codec()
+    }
+
+    /// Mask of every tile.
+    fn mask(&self) -> u64 {
+        u64::MAX >> (64 - self.tiles.len())
+    }
+
+    /// Whether changed tiles `changed` cover enough of the picture to go out as one full frame.
+    fn full_frame(&self, changed: u64) -> bool {
+        if self.full.is_none() || changed == 0 {
+            return false;
+        }
+        let area = |t: &TileRect| t.width as f64 * t.height as f64;
+        let covered: f64 = self.tiles.iter().enumerate().filter(|&(i, _)| changed & tile_bit(i) != 0).map(|(_, t)| area(t)).sum();
+        covered >= self.full_frame_at * self.stream.0 as f64 * self.stream.1 as f64
+    }
+}
+
+/// Changed tiles covering this fraction of the picture go out as one full frame
+/// ([`FULL_FRAME_TILE`]); `LANKVM_FULL_FRAME_AT` overrides it (above 1: never). Measured at
+/// 6144×2560 on an M3 Max with nothing else encoding: one tile out after ~3.5 ms, and each more
+/// ~1.5 ms (the media engine takes the sessions one after another), one full frame ~17 ms; they
+/// break even at about 10 of 16 tiles.
+const FULL_FRAME_AT: f64 = 0.6;
+
+fn full_frame_at() -> f64 {
+    let Ok(value) = std::env::var("LANKVM_FULL_FRAME_AT") else { return FULL_FRAME_AT };
+    match value.trim().parse::<f64>() {
+        Ok(at) if at.is_finite() && at >= 0.0 => at,
+        _ => {
+            tracing::warn!("ignoring LANKVM_FULL_FRAME_AT={value:?}: expected a fraction of the picture, e.g. 0.75");
+            FULL_FRAME_AT
+        }
+    }
+}
+
+/// Captures the display and streams encoded tiles to one viewer.
 struct StreamSession {
     capturer: Option<Arc<Capturer>>,
     shared: Arc<Shared>,
     encode_thread: Option<JoinHandle<()>>,
+    codec: Codec,
 }
 
-/// Capture runs ahead of the encoder, which takes one frame at a time and always the newest. A
+/// Capture runs ahead of the encoders, which take one frame at a time and always the newest. A
 /// frame that would have to queue behind another is replaced by a newer one instead, so a slow
 /// encode costs frame rate, never latency.
 struct Shared {
-    encoder: Encoder,
     state: Mutex<EncodeState>,
     wake: Condvar,
-    last_forced_us: AtomicU64,
+    /// The tiles, and a mask of them all.
+    layout: Vec<TileRect>,
+    tiles: u64,
+    /// Whether the stream has a full-frame encoder (until the viewer says it can't decode it).
+    full: AtomicBool,
+    /// Whether frames come at the display's own size, where ScreenCaptureKit's dirty
+    /// rectangles are in the frame's pixels. (Scaled, they might not be: then they aren't used.)
+    hints: bool,
 }
 
 #[derive(Default)]
 struct EncodeState {
-    /// Captured and waiting for the encoder; a newer capture replaces it.
+    /// Captured and waiting for the encoders; a newer capture replaces it.
     next: Option<CapturedFrame>,
-    force_keyframe: bool,
+    /// `next` waits until then: the tiler failed on a frame lately (see [`TilerRetry`]).
+    retry_at: Option<Instant>,
+    /// Tiles the frames since the one the tiler last took changed, by their dirty rectangles
+    /// (all, when one didn't say): frames the encoders skip still changed what they changed.
+    touched: u64,
+    requests: Requests,
     stop: bool,
 }
 
+/// What an update sends besides the tiles that changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct Work {
+    /// Tiles to encode as keyframes (from their last content, unless they changed).
+    keyframes: u64,
+    /// Tiles to encode again from their last content, as ordinary frames: the viewer never got
+    /// their newest picture, though its decoders are fine.
+    resends: u64,
+    /// The full-frame stream's next frame must be a keyframe.
+    full_keyframe: bool,
+    /// The viewer can't decode the full-frame stream: stop using it.
+    drop_full: bool,
+}
+
+/// Keyframes and resends asked for, by the viewer or after a lost frame: they merge into masks
+/// (nothing is ever dropped), served together at most every [`KEYFRAME_MIN_INTERVAL`], so a viewer
+/// that keeps losing packets can't turn the stream into all-keyframes.
+#[derive(Default)]
+struct Requests {
+    keyframes: u64,
+    resends: u64,
+    full_keyframe: bool,
+    drop_full: bool,
+    /// Every tile was sent again for a lost full frame, and no full frame went out since: a viewer
+    /// asking again meanwhile misses the same picture, which those tiles already carry.
+    full_resent: bool,
+    served: Option<Instant>,
+    /// Keyframes still waiting when the update in progress started.
+    held: u64,
+}
+
+impl Requests {
+    /// What a viewer asks for: tile `i` of `layout` as a keyframe for bit `i`. Bit
+    /// [`FULL_FRAME_TILE`] (if the stream has a full-frame encoder) is the full-frame stream:
+    /// a frame of it was lost, so its next frame is a keyframe, and the viewer lacks whatever
+    /// that frame showed, so every tile is sent again (their own streams are intact).
+    fn ask(&mut self, tiles: u64, layout: u64, full: bool) {
+        self.keyframes |= tiles & layout;
+        if full && tiles & FULL_FRAME_BIT != 0 {
+            self.full_keyframe = true;
+            if !self.full_resent {
+                self.full_resent = true;
+                self.resends |= layout;
+            }
+        }
+    }
+
+    /// The viewer can't decode full frames: stop sending them, and send every tile again (what
+    /// the full frames it dropped showed is missing from its picture).
+    fn no_full_frame(&mut self, layout: u64) {
+        self.drop_full = true;
+        self.resends |= layout;
+    }
+
+    /// How long until the pending tiles may be served; None if there are none.
+    fn wait(&self, now: Instant) -> Option<Duration> {
+        (self.keyframes | self.resends != 0)
+            .then(|| self.served.map_or(Duration::ZERO, |t| (t + KEYFRAME_MIN_INTERVAL).saturating_duration_since(now)))
+    }
+
+    /// The work for the update starting now: the tiles only when it's their turn.
+    fn take(&mut self, now: Instant) -> Work {
+        let mut work = Work {
+            full_keyframe: std::mem::take(&mut self.full_keyframe),
+            drop_full: std::mem::take(&mut self.drop_full),
+            ..Work::default()
+        };
+        if self.wait(now) == Some(Duration::ZERO) {
+            self.served = Some(now);
+            work.keyframes = std::mem::take(&mut self.keyframes);
+            work.resends = std::mem::take(&mut self.resends) & !work.keyframes;
+        }
+        self.held = self.keyframes;
+        work
+    }
+
+    /// The update is out. A tile it sent needs no resend any more (it showed the newest picture),
+    /// and one it sent as a keyframe no keyframe asked for before it started. (One asked for
+    /// since may be about that very keyframe.)
+    fn done(&mut self, outcome: &Outcome) {
+        if outcome.full_sent {
+            self.full_resent = false;
+        }
+        self.resends = (self.resends & !outcome.sent) | outcome.resends;
+        self.keyframes = (self.keyframes & !(outcome.sent_keyframes & self.held)) | outcome.keyframes;
+    }
+}
+
+/// How an update went.
+#[derive(Default)]
+struct Outcome {
+    /// Tiles that went out, and those of them that went as keyframes.
+    sent: u64,
+    sent_keyframes: u64,
+    /// Tiles to send again ([`Fate::Lost`], or covered by a full frame that didn't go out).
+    resends: u64,
+    /// Tiles whose stream needs a keyframe ([`Fate::Unsent`], or a keyframe asked for that never
+    /// came out).
+    keyframes: u64,
+    /// A full frame went out.
+    full_sent: bool,
+    /// The update's number and tile mask, if it sent anything.
+    update: Option<(u32, u64)>,
+    /// The captured frame, if the tiler failed on it: it's tried again.
+    retry: Option<(CapturedFrame, anyhow::Error)>,
+}
+
 impl StreamSession {
-    /// Frames go out through `packetizer`, the connection's one: frame ids keep counting up when
-    /// a new stream replaces an old one, or the viewer would drop the new frames as late.
+    /// Frames go out through `video`, the connection's: frame ids and update numbers keep
+    /// counting up when a new stream replaces an old one. `encoder` is the whole stream's.
     /// `on_stopped` is told if ScreenCaptureKit stops the capture by itself.
     fn start(
-        conn: Connection,
-        packetizer: Arc<Mutex<Packetizer>>,
+        video: Arc<VideoOut>,
         capture: &CaptureConfig,
         encoder: &EncoderConfig,
         on_stopped: impl Fn(String) + Send + Sync + 'static,
     ) -> Result<Self> {
+        let on_stopped: Arc<dyn Fn(String) + Send + Sync> = Arc::new(on_stopped);
         let (width, height) = (encoder.width, encoder.height);
-        let encoder = Encoder::new(encoder, move |frame| send_frame(&conn, &packetizer, frame, width, height))?;
+        let layout = tile_layout(width, height, tile_grid());
+        let at = full_frame_at();
+        let started = Instant::now();
+        // The media engine runs 32 hardware sessions at once, for every app: when another viewer
+        // (or app) holds many, fewer, bigger tiles still beat one encoder for the whole picture.
+        // (Columns stay at most TILE_MAX_WIDTH wide: some decoders take no wider.)
+        let cols = width.div_ceil(TILE_MAX_WIDTH);
+        let mut encoders = TileEncoders::new(&video, encoder, layout.clone(), at);
+        for fewer in [Some((cols, 4)), Some((cols, 1)), Some((1, 1))] {
+            let Err(e) = &encoders else { break };
+            let fallback = tile_layout(width, height, fewer);
+            if fallback.len() >= layout.len() {
+                continue;
+            }
+            tracing::warn!("{} tiles: {e:#}; trying {}", layout.len(), fallback.len());
+            encoders = TileEncoders::new(&video, encoder, fallback, at);
+        }
+        let encoders = encoders?;
+        let tiler = Tiler::new(width, height, &encoders.tiles).context("tiler")?;
+        let full = encoders.full.is_some();
+        let hints = platform_mac::capture::native_pixel_size(capture.display_id) == Some((width, height));
+        tracing::info!(width, height, tiles = encoders.tiles.len(), full_frame = full, full_frame_at = at, setup_ms = started.elapsed().as_millis() as u64, "tiled stream");
+        let codec = encoders.codec();
         let shared = Arc::new(Shared {
-            encoder,
             state: Mutex::new(EncodeState::default()),
             wake: Condvar::new(),
-            last_forced_us: AtomicU64::new(0),
+            layout: encoders.tiles.clone(),
+            tiles: encoders.mask(),
+            full: AtomicBool::new(full),
+            hints,
         });
+        let pipeline = Pipeline::new(tiler, encoders, on_stopped.clone());
         let encode_thread = std::thread::Builder::new().name("lankvm-encode".into()).spawn({
             let shared = shared.clone();
-            move || shared.encode_loop()
+            move || encode_loop(&shared, pipeline, &video)
         })?;
-        let mut session = Self { capturer: None, shared, encode_thread: Some(encode_thread) };
+        let mut session = Self { capturer: None, shared, encode_thread: Some(encode_thread), codec };
         let on_frame = session.shared.clone();
-        session.capturer = Some(Arc::new(Capturer::start(capture, move |frame| on_frame.on_captured(frame), on_stopped)?));
+        session.capturer = Some(Arc::new(Capturer::start(capture, move |frame| on_frame.on_captured(frame), move |why| on_stopped(why))?));
         Ok(session)
     }
 
     fn codec(&self) -> Codec {
-        self.shared.encoder.codec()
+        self.codec
     }
 
     fn capturer(&self) -> Option<Arc<Capturer>> {
         self.capturer.clone()
     }
 
-    fn request_keyframe(&self) {
-        self.shared.request_keyframe();
+    fn request_keyframes(&self, tiles: u64) {
+        self.shared.request_keyframes(tiles);
+    }
+
+    fn no_full_frame(&self) {
+        self.shared.no_full_frame();
     }
 }
 
 impl Drop for StreamSession {
     fn drop(&mut self) {
-        // Stop capture first so no new frames reach the encoder while it shuts down.
+        // Stop capture first so no new frames reach the encoders while they shut down.
         self.capturer.take();
         self.shared.state.lock().unwrap().stop = true;
         self.shared.wake.notify_one();
@@ -1229,83 +1815,484 @@ impl Drop for StreamSession {
 
 impl Shared {
     fn on_captured(&self, frame: CapturedFrame) {
-        self.state.lock().unwrap().next = Some(frame);
+        let touched = match (&frame.dirty, self.hints) {
+            (Some(rects), true) => tiles_touched(&self.layout, rects),
+            _ => u64::MAX,
+        };
+        let mut state = self.state.lock().unwrap();
+        state.touched |= touched;
+        state.next = Some(frame);
+        drop(state);
         self.wake.notify_one();
     }
 
-    fn request_keyframe(&self) {
-        let now = clock::now_us();
-        let prev = self.last_forced_us.load(Ordering::Acquire);
-        if now.saturating_sub(prev) < KEYFRAME_MIN_INTERVAL.as_micros() as u64 {
-            return;
+    /// Bits beyond the layout (and the full-frame stream's, without one) are ignored.
+    fn request_keyframes(&self, tiles: u64) {
+        let full = self.full.load(Ordering::Relaxed);
+        if tiles & self.tiles != 0 || (full && tiles & FULL_FRAME_BIT != 0) {
+            self.state.lock().unwrap().requests.ask(tiles, self.tiles, full);
+            self.wake.notify_one();
         }
-        self.last_forced_us.store(now, Ordering::Release);
-        self.state.lock().unwrap().force_keyframe = true;
-        self.wake.notify_one();
     }
 
-    fn encode_loop(&self) {
-        // The newest frame handed to the encoder, kept so a keyframe can be produced right away
-        // even when the screen is static (ScreenCaptureKit only delivers frames on change).
-        let mut last: Option<CapturedFrame> = None;
-        loop {
-            let (next, force) = {
-                let mut state = self.state.lock().unwrap();
-                while !state.stop && state.next.is_none() && !(state.force_keyframe && last.is_some()) {
-                    state = self.wake.wait(state).unwrap();
-                }
-                if state.stop {
-                    return;
-                }
-                (state.next.take(), std::mem::take(&mut state.force_keyframe))
-            };
-            let time_us = match next {
-                Some(frame) => {
-                    let time_us = frame.capture_time_us;
-                    last = Some(frame);
-                    time_us
-                }
-                // Nothing new on screen: re-encode what's showing now as a keyframe.
-                None => clock::now_us(),
-            };
-            let Some(frame) = &last else { continue };
-            if let Err(e) = self.encoder.encode(&frame.pixel_buffer, time_us, force) {
-                tracing::warn!("encode: {e:#}");
-                continue;
-            }
-            if !self.encoder.wait_idle(ENCODE_TIMEOUT) {
-                tracing::warn!("encoder took over {ENCODE_TIMEOUT:?} for a frame");
-            }
+    fn no_full_frame(&self) {
+        if self.full.swap(false, Ordering::Relaxed) {
+            self.state.lock().unwrap().requests.no_full_frame(self.tiles);
+            self.wake.notify_one();
         }
     }
 }
 
-fn send_frame(conn: &Connection, packetizer: &Mutex<Packetizer>, frame: EncodedFrame, width: u32, height: u32) {
-    let video = VideoFrame {
-        codec: frame.codec,
-        keyframe: frame.keyframe,
-        width,
-        height,
-        capture_time_us: frame.capture_time_us,
-        encode_start_us: frame.encode_start_us,
-        encoded_time_us: clock::now_us(),
-        param_sets: frame.param_sets,
-        nal_length_size: frame.nal_length_size,
-        data: frame.data,
-    };
-    let Some(max) = conn.max_datagram_size() else { return };
-    let packets = protocol::encode(&video)
-        .map_err(anyhow::Error::from)
-        .and_then(|bytes| packetizer.lock().unwrap().packetize(&bytes, max));
-    match packets {
-        Ok(packets) => {
-            for packet in packets {
-                if conn.send_datagram(packet).is_err() {
-                    break; // connection closing
+/// First wait before a frame the tiler failed on is tried again; it doubles while the tiler
+/// keeps failing, up to [`MAX_TILER_RETRY`].
+const TILER_RETRY: Duration = Duration::from_millis(5);
+const MAX_TILER_RETRY: Duration = Duration::from_millis(500);
+/// A tiler that keeps failing says so at most this often.
+const TILER_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Paces the retries of frames the tiler failed on, and the warnings about it.
+#[derive(Default)]
+struct TilerRetry {
+    delay: Duration,
+    /// Failures not reported yet.
+    failures: u32,
+    warned: Option<Instant>,
+}
+
+impl TilerRetry {
+    /// The tiler failed: when to try again, and the failures to report now (if it's time).
+    fn failed(&mut self, now: Instant) -> (Instant, Option<u32>) {
+        self.delay = (self.delay * 2).clamp(TILER_RETRY, MAX_TILER_RETRY);
+        self.failures += 1;
+        let report = self.warned.is_none_or(|t| now >= t + TILER_WARN_INTERVAL).then(|| {
+            self.warned = Some(now);
+            std::mem::take(&mut self.failures)
+        });
+        (now + self.delay, report)
+    }
+
+    fn succeeded(&mut self) {
+        self.delay = Duration::ZERO;
+    }
+}
+
+fn encode_loop(shared: &Shared, mut pipeline: Pipeline, video: &VideoOut) {
+    // On the input-to-photon path: woken promptly and kept on a performance core.
+    system::set_thread_interactive();
+    let mut retry = TilerRetry::default();
+    // When the screen will have been still long enough: the newest frame is then compared whole
+    // if it wasn't, and the viewer told which update was the last (if not told yet).
+    let mut quiet_at: Option<Instant> = None;
+    let mut note: Option<(u32, u64)> = None;
+    loop {
+        // A frame or requests to send; or None: the screen has been still a while.
+        let step = {
+            let mut state = shared.state.lock().unwrap();
+            loop {
+                if state.stop {
+                    return;
+                }
+                let now = Instant::now();
+                let frame_wait = state.next.as_ref().map(|_| state.retry_at.map_or(Duration::ZERO, |t| t.saturating_duration_since(now)));
+                let work_wait = [frame_wait, state.requests.wait(now)].into_iter().flatten().min();
+                if work_wait == Some(Duration::ZERO) {
+                    let frame = if state.retry_at.is_none_or(|t| t <= now) { state.next.take() } else { None };
+                    let touched = if frame.is_some() { std::mem::take(&mut state.touched) } else { 0 };
+                    break Some((frame, touched, state.requests.take(now)));
+                }
+                if quiet_at.is_some_and(|at| at <= now) {
+                    break None;
+                }
+                let quiet_wait = quiet_at.map(|at| at.saturating_duration_since(now));
+                state = match [work_wait, quiet_wait].into_iter().flatten().min() {
+                    Some(wait) => shared.wake.wait_timeout(state, wait).unwrap().0,
+                    None => shared.wake.wait(state).unwrap(),
+                };
+            }
+        };
+        let Some((frame, touched, work)) = step else {
+            // Before saying the screen is still, make sure nothing of the last frame went unsent.
+            let outcome = pipeline.settle(video);
+            match outcome.update {
+                Some(sent) => {
+                    note = Some(sent);
+                    quiet_at = Some(Instant::now() + IDLE_NOTE_AFTER);
+                }
+                None => {
+                    if let Some((update, mask)) = note.take() {
+                        video.idle(update, mask);
+                    }
+                    quiet_at = None;
+                }
+            }
+            shared.state.lock().unwrap().requests.done(&outcome);
+            continue;
+        };
+        let tiled = frame.is_some();
+        let mut outcome = pipeline.update(video, frame, touched, work);
+        if let Some(sent) = outcome.update {
+            note = Some(sent);
+        }
+        if outcome.update.is_some() || pipeline.has_unchecked() {
+            quiet_at = Some(Instant::now() + IDLE_NOTE_AFTER);
+        }
+        let mut state = shared.state.lock().unwrap();
+        match outcome.retry.take() {
+            Some((frame, e)) => {
+                let (at, report) = retry.failed(Instant::now());
+                if let Some(failures) = report {
+                    tracing::warn!(failures, "split frame into tiles: {e:#}; trying again");
+                }
+                state.retry_at = Some(at);
+                state.touched |= touched;
+                // Unless a newer frame came meanwhile: that one has everything this one had.
+                state.next.get_or_insert(frame);
+            }
+            None if tiled => {
+                retry.succeeded();
+                state.retry_at = None;
+            }
+            None => {}
+        }
+        state.requests.done(&outcome);
+    }
+}
+
+/// How the tiles and the full frame are kept right, update after update.
+///
+/// Every stream (each tile, and the full frame) keeps its own chain of references, and each
+/// encoder/decoder pair sees exactly the same frames, so each decodes correctly; the viewer shows,
+/// for every part of the picture, the newest image covering it. A tile's frame after a full frame
+/// references that tile's older picture: bigger, still correct. The tiler's last content of every
+/// tile is what the viewer shows there once the update is in, whichever stream carried it, so a
+/// tile the viewer missed is sent again from it.
+struct Pipeline {
+    tiler: Tiler,
+    encoders: TileEncoders,
+    motion: Motion,
+    /// The full-frame stream's next frame must be a keyframe: one of its frames never reached
+    /// the viewer.
+    full_keyframe: bool,
+    /// When every tile was last compared (see [`Pipeline::compare`]).
+    compared_all: Option<Instant>,
+    /// The dirty rectangles missed a change lately: compare every tile until then.
+    distrust: Option<Instant>,
+    /// The newest captured frame, while only the tiles its dirty rectangles named (the mask) were
+    /// compared: before the screen counts as still, every tile of it is (see [`Pipeline::settle`]).
+    unchecked: Option<(CapturedFrame, u64)>,
+    /// Compare every tile of the next frame, whatever the time (set by [`Pipeline::settle`]).
+    check_all: bool,
+    /// Submits in a row that each encoder (by tile, then the full frame's) refused.
+    failures: Vec<u32>,
+    /// Times in a row a tile's encoder couldn't be made again.
+    rebuilds_failed: Vec<u32>,
+    /// Tells the session the stream is broken (it starts it again, as when capture stops).
+    on_broken: Arc<dyn Fn(String) + Send + Sync>,
+}
+
+/// A tile encoder that can't be made again this many times in a row breaks the stream.
+const MAX_FAILED_REBUILDS: u32 = 3;
+
+/// An encoder refusing this many frames in a row is broken: it is made again (the full frame's is
+/// dropped: big changes go out as tiles).
+const MAX_ENCODE_FAILURES: u32 = 3;
+
+/// Where a submitted frame went.
+#[derive(Clone, Copy)]
+enum Route {
+    Tile(usize),
+    Full,
+}
+
+impl Pipeline {
+    fn new(tiler: Tiler, encoders: TileEncoders, on_broken: Arc<dyn Fn(String) + Send + Sync>) -> Self {
+        let motion = Motion::new(encoders.bitrate_bps, encoders.tiles.clone(), Instant::now());
+        let failures = vec![0; encoders.tiles.len() + 1];
+        let rebuilds_failed = vec![0; encoders.tiles.len()];
+        Self {
+            tiler,
+            encoders,
+            motion,
+            full_keyframe: false,
+            compared_all: None,
+            distrust: None,
+            unchecked: None,
+            check_all: false,
+            failures,
+            rebuilds_failed,
+            on_broken,
+        }
+    }
+
+    /// Whether the newest frame still waits for a comparison of every tile (see `settle`).
+    fn has_unchecked(&self) -> bool {
+        self.unchecked.is_some()
+    }
+
+    /// Compares every tile of the newest frame if only some of them were: ScreenCaptureKit sends
+    /// nothing more while the screen is still, so a change its dirty rectangles missed would
+    /// otherwise stay unsent. Sends what it finds as an update.
+    fn settle(&mut self, video: &VideoOut) -> Outcome {
+        match self.unchecked.take() {
+            Some((frame, touched)) => {
+                self.check_all = true;
+                let mut outcome = self.update(video, Some(frame), touched, Work::default());
+                self.check_all = false;
+                outcome.retry = None; // a newer frame, or the next check, will do
+                outcome
+            }
+            None => Outcome::default(),
+        }
+    }
+
+    /// The tiles of `frame` that changed. Only those `touched` names are read (ScreenCaptureKit's
+    /// dirty rectangles), except every [`FULL_COMPARE_INTERVAL`], when all are, in case it
+    /// missed a change; if it did, its rectangles aren't used for [`DIRTY_RECTS_DISTRUST`].
+    /// Returns the copies and the tiles it compared.
+    fn compare(&mut self, frame: &CVPixelBuffer, touched: u64) -> Result<(Vec<TileCopy>, u64)> {
+        let now = Instant::now();
+        let trusted = self.distrust.is_none_or(|until| now >= until);
+        let check = self.check_all || self.compared_all.is_none_or(|at| now >= at + FULL_COMPARE_INTERVAL);
+        if trusted && !check && touched != u64::MAX {
+            return Ok((self.tiler.changed_in(frame, touched)?, touched));
+        }
+        // Tiles with nothing to compare against yet count as changed whatever the rectangles say.
+        let fresh = (0..self.encoders.tiles.len()).filter(|&i| self.tiler.last(i).is_none()).fold(0, |m, i| m | tile_bit(i));
+        let copies = self.tiler.changed(frame)?;
+        self.compared_all = Some(now);
+        let missed = copies.iter().fold(0, |m, c| m | tile_bit(c.index)) & !touched & !fresh;
+        if trusted && touched != u64::MAX && missed != 0 {
+            self.missed(missed, now);
+        }
+        Ok((copies, u64::MAX))
+    }
+
+    /// The dirty rectangles missed changes to `tiles`: don't go by them for a while.
+    fn missed(&mut self, tiles: u64, now: Instant) {
+        tracing::warn!(missed = format!("{tiles:#x}"), "ScreenCaptureKit's dirty rectangles missed a change; comparing every tile for a while");
+        self.distrust = Some(now + DIRTY_RECTS_DISTRUST);
+    }
+
+    /// Sends one update and waits until every frame of it is out (or isn't coming): the tiles of
+    /// `frame` that changed, as tiles or, when they cover most of the picture, as one full frame
+    /// (the captured frame itself); and `work`'s tiles, always as tiles. Each tile is encoded at
+    /// most once, as a keyframe if asked for.
+    ///
+    /// `touched` are the tiles ScreenCaptureKit says changed since the last frame the tiler saw.
+    fn update(&mut self, video: &VideoOut, frame: Option<CapturedFrame>, touched: u64, work: Work) -> Outcome {
+        let mut outcome = Outcome::default();
+        if work.drop_full && self.encoders.full.take().is_some() {
+            video.no_full_frame.store(true, Ordering::Release);
+            tracing::info!("the viewer can't decode full frames: big changes go out as tiles");
+        }
+        self.full_keyframe |= work.full_keyframe;
+        let (frame, mut copies, compared, time_us) = match frame {
+            Some(frame) => match self.compare(&frame.pixel_buffer, touched) {
+                Ok((copies, compared)) => {
+                    let time_us = frame.capture_time_us;
+                    self.unchecked = (compared & self.encoders.mask() != self.encoders.mask())
+                        .then(|| (CapturedFrame { pixel_buffer: frame.pixel_buffer.clone(), capture_time_us: time_us, dirty: None }, touched));
+                    (Some(frame), copies, compared, time_us)
+                }
+                Err(e) => {
+                    outcome.retry = Some((frame, e));
+                    (None, Vec::new(), u64::MAX, clock::now_us())
+                }
+            },
+            None => (None, Vec::new(), u64::MAX, clock::now_us()),
+        };
+        let now = Instant::now();
+        let forced = (work.keyframes | work.resends) & self.encoders.mask();
+        let mut changed = copies.iter().fold(0, |mask, c| mask | tile_bit(c.index));
+        if let Some(frame) = &frame
+            && self.encoders.full_frame(changed & !forced)
+            && compared & self.encoders.mask() != self.encoders.mask()
+        {
+            // The full frame carries every tile's pixels, so every tile's last content must be
+            // what it carries: compare the ones the dirty rectangles left out too.
+            let rest = self.encoders.mask() & !compared;
+            match self.tiler.changed_in(&frame.pixel_buffer, rest) {
+                Ok(more) => {
+                    let found = more.iter().fold(0, |mask, c| mask | tile_bit(c.index));
+                    if found & rest != 0 {
+                        self.missed(found & rest, now);
+                    }
+                    changed |= found;
+                    copies.extend(more);
+                    self.unchecked = None;
+                }
+                Err(e) => {
+                    // They'll count as changed next time, whatever the hints say.
+                    tracing::debug!("compare the tiles a full frame carries: {e:#}");
+                    for i in (0..self.encoders.tiles.len()).filter(|&i| rest & tile_bit(i) != 0) {
+                        self.tiler.invalidate(i);
+                    }
                 }
             }
         }
-        Err(e) => tracing::warn!("packetize: {e:#}"),
+        self.motion.changed(changed, now);
+
+        let mut jobs = Vec::new();
+        // Changed tiles the full frame carries (forced ones still go as tiles).
+        let mut covered = 0;
+        match frame {
+            // Decided on what the full frame would carry: forced tiles go as tiles anyway.
+            Some(frame) if self.encoders.full_frame(changed & !forced) => {
+                covered = changed & !forced;
+                jobs.push((Route::Full, frame.pixel_buffer, self.full_keyframe));
+            }
+            // Back to ScreenCaptureKit: the tiles are copies.
+            frame => drop(frame),
+        }
+        for copy in copies {
+            if covered & tile_bit(copy.index) == 0 {
+                jobs.push((Route::Tile(copy.index), copy.pixel_buffer, work.keyframes & tile_bit(copy.index) != 0));
+            }
+        }
+        // Unchanged tiles asked for: what they show now. (A tile with no last content has never
+        // been encoded, so its first frame will be a keyframe anyway.)
+        for i in (0..self.encoders.tiles.len()).filter(|&i| forced & !changed & tile_bit(i) != 0) {
+            if let Some(pixel_buffer) = self.tiler.last(i) {
+                jobs.push((Route::Tile(i), pixel_buffer, work.keyframes & tile_bit(i) != 0));
+            }
+        }
+        if jobs.is_empty() {
+            return outcome;
+        }
+
+        for (i, bitrate_bps) in self.motion.retarget(now) {
+            if let Err(e) = self.encoders.encoders[i].set_bitrate(bitrate_bps) {
+                tracing::debug!(tile = i, bitrate_bps, "set bitrate: {e:#}");
+            }
+        }
+        let mask = jobs.iter().fold(0, |mask, (route, ..)| {
+            mask | match route {
+                Route::Tile(i) => tile_bit(*i),
+                Route::Full => FULL_FRAME_BIT,
+            }
+        });
+        let tag = video.start_update(mask);
+        let mut submitted = Vec::with_capacity(jobs.len());
+        for (route, pixel_buffer, keyframe) in jobs {
+            let (encoder, track, failures) = match route {
+                Route::Tile(i) => (&self.encoders.encoders[i], &self.encoders.tracks[i], i),
+                Route::Full => {
+                    let (encoder, track) = self.encoders.full.as_ref().expect("full-frame route");
+                    (encoder, track, self.encoders.tiles.len())
+                }
+            };
+            let keyframe = keyframe || track.repair.swap(false, Ordering::AcqRel);
+            // Submitted or not, the encoder holds what it needs of the buffer.
+            match encoder.encode(&pixel_buffer, time_us, keyframe, tag) {
+                Ok(()) => submitted.push((route, keyframe)),
+                Err(e) => {
+                    self.failures[failures] += 1;
+                    if self.failures[failures] == 1 {
+                        tracing::warn!(full = matches!(route, Route::Full), "encode: {e:#}");
+                    }
+                    self.record(route, Fate::Lost, covered, keyframe, &mut outcome);
+                }
+            }
+        }
+        let deadline = Instant::now() + ENCODE_TIMEOUT;
+        for (route, keyframe) in submitted {
+            let (encoder, track) = match route {
+                Route::Tile(i) => (&self.encoders.encoders[i], &self.encoders.tracks[i]),
+                Route::Full => {
+                    let (encoder, track) = self.encoders.full.as_ref().expect("full-frame route");
+                    (encoder, track)
+                }
+            };
+            let on_time = encoder.wait_idle(deadline.saturating_duration_since(Instant::now()));
+            let mut fate = track.fate(tag);
+            if !on_time {
+                tracing::warn!(full = matches!(route, Route::Full), "encoder took over {ENCODE_TIMEOUT:?} for a frame");
+                // It may still come out, and won't be sent then (its update is done): the
+                // encoder's references would move past the viewer's, as for a frame that never
+                // went out.
+                if fate == Fate::Lost {
+                    fate = Fate::Unsent;
+                }
+            }
+            if let Fate::Sent { .. } = fate {
+                let i = match route {
+                    Route::Tile(i) => i,
+                    Route::Full => self.encoders.tiles.len(),
+                };
+                self.failures[i] = 0;
+            } else {
+                tracing::debug!(tag, ?fate, full = matches!(route, Route::Full), "frame never reached the viewer");
+            }
+            self.record(route, fate, covered, keyframe, &mut outcome);
+        }
+        let sent = outcome.sent | if outcome.full_sent { FULL_FRAME_BIT } else { 0 };
+        outcome.update = video.finish_update(tag, sent).map(|update| (update, sent));
+        self.repair(&mut outcome);
+        outcome
+    }
+
+    /// Makes encoders that keep refusing frames again (the full frame's goes: big changes then
+    /// go out as tiles).
+    fn repair(&mut self, outcome: &mut Outcome) {
+        let tiles = self.encoders.tiles.len();
+        for i in 0..=tiles {
+            if self.failures[i] < MAX_ENCODE_FAILURES {
+                continue;
+            }
+            self.failures[i] = 0;
+            if i == tiles {
+                tracing::warn!("the full-frame encoder keeps failing; big changes go out as tiles");
+                self.encoders.full = None;
+                continue;
+            }
+            // What the motion tracking last gave it, so a later retarget starts from the truth.
+            let bitrate_bps = self.motion.bitrates[i];
+            match self.encoders.rebuild(i, bitrate_bps) {
+                Ok(()) => {
+                    tracing::warn!(tile = i, "tile encoder kept failing: made it again");
+                    self.rebuilds_failed[i] = 0;
+                    // Its first frame is a keyframe anyway.
+                    outcome.keyframes |= tile_bit(i);
+                    outcome.resends &= !tile_bit(i);
+                }
+                Err(e) => {
+                    self.rebuilds_failed[i] += 1;
+                    if self.rebuilds_failed[i] == MAX_FAILED_REBUILDS {
+                        // Start the stream over: it may get fewer tiles, or the media server is
+                        // back by then.
+                        (self.on_broken)(format!("tile {i}'s encoder can't be made again: {e:#}"));
+                    } else if self.rebuilds_failed[i] == 1 {
+                        tracing::warn!(tile = i, "make tile encoder again: {e:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Notes what became of a frame of this update; `covered` are the tiles a full frame carried,
+    /// `asked_keyframe` whether this frame was to be a keyframe.
+    fn record(&mut self, route: Route, fate: Fate, covered: u64, asked_keyframe: bool, outcome: &mut Outcome) {
+        match (route, fate) {
+            (Route::Tile(i), Fate::Sent { keyframe }) => {
+                outcome.sent |= tile_bit(i);
+                if keyframe {
+                    outcome.sent_keyframes |= tile_bit(i);
+                }
+            }
+            (Route::Tile(i), Fate::Unsent) => outcome.keyframes |= tile_bit(i),
+            // A keyframe that never came out is still owed: the viewer's decoder waits for it.
+            (Route::Tile(i), Fate::Lost) if asked_keyframe => outcome.keyframes |= tile_bit(i),
+            (Route::Tile(i), Fate::Lost) => outcome.resends |= tile_bit(i),
+            (Route::Full, Fate::Sent { keyframe }) => {
+                outcome.full_sent = true;
+                self.full_keyframe &= !keyframe;
+            }
+            (Route::Full, Fate::Unsent) => {
+                self.full_keyframe = true;
+                outcome.resends |= covered;
+            }
+            (Route::Full, Fate::Lost) => outcome.resends |= covered,
+        }
     }
 }
 
@@ -1315,14 +2302,23 @@ fn send_frame(conn: &Connection, packetizer: &Mutex<Packetizer>, frame: EncodedF
 struct StreamSlot(Mutex<Option<StreamSession>>);
 
 impl StreamSlot {
-    fn request_keyframe(&self) {
+    /// Bit `i` is tile `i`; bits beyond the stream's tiles are ignored.
+    fn request_keyframes(&self, tiles: u64) {
         if let Some(stream) = self.0.lock().unwrap().as_ref() {
-            stream.request_keyframe();
+            stream.request_keyframes(tiles);
         }
     }
 
     fn capturer(&self) -> Option<Arc<Capturer>> {
         self.0.lock().unwrap().as_ref().and_then(|s| s.capturer())
+    }
+
+    /// The viewer can't decode full frames: this stream stops sending them (and the connection's
+    /// next streams never start).
+    fn no_full_frame(&self) {
+        if let Some(stream) = self.0.lock().unwrap().as_ref() {
+            stream.no_full_frame();
+        }
     }
 
     fn codec(&self) -> Option<Codec> {
@@ -1366,7 +2362,7 @@ struct Streamer {
     viewer_fps: u32,
     video: bool,
     stream: Arc<StreamSlot>,
-    packetizer: Arc<Mutex<Packetizer>>,
+    video_out: Arc<VideoOut>,
     input: Arc<InputShared>,
     cursor: CursorWish,
     /// Counts streams, so a stop reported by an old one is ignored.
@@ -1386,7 +2382,7 @@ impl Streamer {
         })
         .await??;
         let (width, height) = fit_within(display.width, display.height, self.viewer_max.0, self.viewer_max.1);
-        let fps = choose_fps(self.viewer_fps, width, height);
+        let fps = choose_fps(self.viewer_fps);
         self.swap(display.id, width, height, fps).await?;
         Ok(Showing { display: DisplayChoice::Main, display_id: display.id, width, height, fps })
     }
@@ -1400,7 +2396,7 @@ impl Streamer {
         if (width, height) != (spec.width, spec.height) {
             tracing::warn!(display = display_id, width, height, ?spec, "the virtual display isn't the size asked for");
         }
-        let fps = choose_fps(spec.refresh_hz, width, height);
+        let fps = choose_fps(spec.refresh_hz);
         self.swap(display_id, width, height, fps).await?;
         Ok(Showing { display: DisplayChoice::Virtual(spec), display_id, width, height, fps })
     }
@@ -1424,11 +2420,19 @@ impl Streamer {
             // The bit budget stays at 60 fps worth, so bandwidth doesn't double at 120.
             let encoder = EncoderConfig { width, height, fps, bitrate_bps: bitrate_for(width, height, fps.min(60)), codec: Codec::Hevc };
             let events = self.events.clone();
-            let stream = StreamSession::start(self.conn.clone(), self.packetizer.clone(), &capture, &encoder, move |why| {
+            let stream = StreamSession::start(self.video_out.clone(), &capture, &encoder, move |why| {
                 tracing::warn!(display = display_id, "capture stopped: {why}");
                 let _ = events.send(SessionEvt::CaptureStopped(generation));
             })?;
-            *self.stream.0.lock().unwrap() = Some(stream);
+            {
+                // The viewer may have said it can't decode full frames while this one started:
+                // the session stores that before it looks for the stream, so one of them sees it.
+                let mut slot = self.stream.0.lock().unwrap();
+                if self.video_out.no_full_frame.load(Ordering::Acquire) {
+                    stream.no_full_frame();
+                }
+                *slot = Some(stream);
+            }
             // The wish may have changed while the stream started.
             let wanted = self.cursor.wanted.load(Ordering::Acquire);
             if wanted != show_cursor
@@ -1481,15 +2485,15 @@ impl Streamer {
     }
 
     async fn main(&self, request: u32, reason: DisplayReason, message: String) -> Switched {
-        match self.show_main().await {
+        match retrying(|| self.show_main()).await {
             Ok(showing) => Switched { request, showing, reason, message, fatal: None, seq: 0 },
             Err(e) => Switched { request, showing: Showing::NONE, reason, message, fatal: Some(format!("{e:#}")), seq: 0 },
         }
     }
 
-    /// Shows the virtual display, or, if that fails, the main display again.
+    /// Shows the virtual display, or, if that keeps failing, the main display again.
     async fn virtual_or_main(&self, request: u32, acquired: Acquired, message: String, host: &str) -> Switched {
-        match self.show_virtual(acquired).await {
+        match retrying(|| self.show_virtual(acquired)).await {
             Ok(showing) => Switched { request, showing, reason: DisplayReason::NONE, message, fatal: None, seq: acquired.seq },
             Err(e) => {
                 tracing::warn!("show the virtual display: {e:#}");
@@ -1497,6 +2501,29 @@ impl Streamer {
                 let message = format!("{host} couldn't show the virtual display ({e:#}), so it shows its own screen.");
                 self.main(request, DisplayReason::FAILED, message).await
             }
+        }
+    }
+}
+
+/// Waits between tries to start a stream (see [`retrying`]).
+const STREAM_RETRIES: [Duration; 3] = [Duration::from_millis(500), Duration::from_secs(2), Duration::from_secs(5)];
+
+/// Starts a stream, trying again a few times if it fails. While the Mac's displays are being
+/// rearranged (a virtual display made, resized, mirrored or removed), ScreenCaptureKit can stop
+/// answering for several seconds; giving up then would cost the viewer its display (or its
+/// connection) over a hiccup.
+async fn retrying<F: std::future::Future<Output = Result<Showing>>>(mut start: impl FnMut() -> F) -> Result<Showing> {
+    let mut waits = STREAM_RETRIES.iter();
+    loop {
+        match start().await {
+            Ok(showing) => return Ok(showing),
+            Err(e) => match waits.next() {
+                Some(wait) => {
+                    tracing::warn!("start the stream: {e:#}; trying again in {} ms", wait.as_millis());
+                    tokio::time::sleep(*wait).await;
+                }
+                None => return Err(e),
+            },
         }
     }
 }
@@ -1928,12 +2955,697 @@ mod tests {
     }
 
     #[test]
-    fn fps_follows_the_viewer_within_what_encodes_in_time() {
-        assert_eq!(choose_fps(120, 2560, 1654), 120);
-        assert_eq!(choose_fps(120, 4112, 2658), 60);
-        assert_eq!(choose_fps(60, 2560, 1654), 60);
-        assert_eq!(choose_fps(1000, 1920, 1080), 120);
-        assert_eq!(choose_fps(0, 1920, 1080), 15);
+    fn fps_follows_the_viewer() {
+        assert_eq!(choose_fps(120), 120);
+        assert_eq!(choose_fps(60), 60);
+        assert_eq!(choose_fps(1000), 120);
+        assert_eq!(choose_fps(0), 15);
+    }
+
+    #[test]
+    fn tiles_share_the_bitrate_by_area() {
+        let (w, h) = (6144, 2560);
+        let total = bitrate_for(w, h, 60);
+        let tiles = tile_layout(w, h, None);
+        let shares = tile_bitrates(total, &tiles, 0);
+        assert!(shares.iter().all(|&s| s == total / 16), "{shares:?}");
+        let sum: u64 = shares.iter().map(|&s| u64::from(s)).sum();
+        assert!(sum <= u64::from(total) && sum + 16 >= u64::from(total));
+        // A small stream's tiles still get a usable bitrate each.
+        let tiles = tile_layout(640, 480, Some((8, 7)));
+        assert!(tile_bitrates(bitrate_for(640, 480, 60), &tiles, 0).iter().all(|&s| s == MIN_TILE_BITRATE));
+        let whole = TileRect { index: 0, x: 0, y: 0, width: w, height: h };
+        assert_eq!(tile_bitrates(total, &[whole], 0), [total]);
+        assert_eq!(tile_bitrates(total, &[whole], 1), [total]);
+    }
+
+    #[test]
+    fn moving_tiles_share_the_whole_budget() {
+        let (w, h) = (6144, 2560);
+        let total = bitrate_for(w, h, 60);
+        let tiles = tile_layout(w, h, None);
+        // One tile moves: it may use the whole budget, the still ones keep their share.
+        let one = tile_bitrates(total, &tiles, 1 << 5);
+        assert_eq!(one[5], total);
+        assert!(one.iter().enumerate().all(|(i, &s)| i == 5 || s == total / 16), "{one:?}");
+        // Four move: a quarter each.
+        let four = tile_bitrates(total, &tiles, 0b1111 << 4);
+        assert!((4..8).all(|i| four[i] == total / 4) && four[0] == total / 16, "{four:?}");
+        // All move: by area, as when all are still.
+        assert_eq!(tile_bitrates(total, &tiles, u64::MAX >> 48), tile_bitrates(total, &tiles, 0));
+        // Uneven tiles: by area among the moving ones.
+        let tiles = tile_layout(1000, 640, Some((2, 1)));
+        let (a, b) = (u64::from(tiles[0].width) * 640, u64::from(tiles[1].width) * 640);
+        let both = tile_bitrates(40_000_000, &tiles, 0b11);
+        assert_eq!(both, [(40_000_000 * a / (a + b)) as u32, (40_000_000 * b / (a + b)) as u32]);
+    }
+
+    #[test]
+    fn bitrates_follow_the_motion_now_and_then() {
+        let (w, h) = (6144, 2560);
+        let total = bitrate_for(w, h, 60);
+        let tiles = tile_layout(w, h, None);
+        let t0 = Instant::now();
+        let mut motion = Motion::new(total, tiles.clone(), t0);
+        assert!(motion.bitrates.iter().all(|&s| s == total / 16));
+        motion.changed(1 << 3, t0);
+        // Not before the interval is up.
+        assert!(motion.retarget(t0 + RETARGET_INTERVAL / 2).is_empty());
+        let t1 = t0 + RETARGET_INTERVAL;
+        assert_eq!(motion.retarget(t1), [(3, total)]);
+        // Then again only after another interval, and only real changes.
+        motion.changed(1 << 3, t1);
+        assert!(motion.retarget(t1 + RETARGET_INTERVAL / 2).is_empty());
+        assert!(motion.retarget(t1 + RETARGET_INTERVAL).is_empty());
+        // A second tile moving too: each gets half (a change above 25% for both).
+        let t2 = t1 + RETARGET_INTERVAL * 2;
+        motion.changed(1 << 3 | 1 << 9, t2);
+        assert_eq!(motion.retarget(t2), [(3, total / 2), (9, total / 2)]);
+        // Tile 9 goes on, tile 3 stops: it falls back to its share once its second is up.
+        let t3 = t2 + MOTION_WINDOW;
+        motion.changed(1 << 9, t3 - RETARGET_INTERVAL);
+        assert_eq!(motion.retarget(t3), [(3, total / 16), (9, total)]);
+        // Below the threshold: left alone.
+        let mut motion = Motion::new(total, tile_layout(1000, 640, Some((2, 1))), t0);
+        motion.changed(0b11, t0);
+        let before = motion.bitrates.clone();
+        assert!(motion.retarget(t1).is_empty(), "{before:?}");
+    }
+
+    #[test]
+    fn tile_grid_from_the_environment() {
+        assert_eq!(parse_grid("2x8"), Some((2, 8)));
+        assert_eq!(parse_grid(" 1X1 "), Some((1, 1)));
+        for bad in ["", "2", "x8", "2x", "0x4", "4x0", "-1x2", "2x8x1", "axb"] {
+            assert_eq!(parse_grid(bad), None, "{bad:?}");
+        }
+    }
+
+    /// Updates take numbers only when something of them goes out, so a gap the viewer sees is a
+    /// loss; and what the next update says the one before sent is what really went out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_updates_that_send_something_are_numbered() {
+        let (host_conn, _conn) = loopback("numbers").await;
+        let video = VideoOut::new(host_conn);
+        let first = video.start_update(0b11);
+        assert_eq!(video.finish_update(first, 0), None, "nothing went out: no number");
+        let second = video.start_update(0b110);
+        assert_ne!(second, first);
+        assert_eq!(video.next_update.load(Ordering::Relaxed), 0);
+        // Its first frame takes number 0; it ends with only tile 1 out.
+        {
+            let mut slots = video.slots.lock().unwrap();
+            let slot = &mut slots[second as usize % UPDATE_MASKS];
+            slot.update = Some(video.next_update.fetch_add(1, Ordering::Relaxed));
+        }
+        assert_eq!(video.finish_update(second, 0b010), Some(0));
+        assert_eq!(video.slots.lock().unwrap()[second as usize % UPDATE_MASKS].mask, 0b010);
+    }
+
+    #[test]
+    fn frames_that_never_went_out_are_told_apart() {
+        let track = Track::default();
+        assert_eq!(track.fate(0), Fate::Lost);
+        // Put out but not sent: the encoder's references moved on.
+        track.emitted.store(1, Ordering::Release);
+        assert_eq!(track.fate(1), Fate::Unsent);
+        track.sent.store(1, Ordering::Release);
+        assert_eq!(track.fate(1), Fate::Sent { keyframe: false });
+        track.emitted.store(2, Ordering::Release);
+        track.sent.store(2, Ordering::Release);
+        track.sent_keyframe.store(2, Ordering::Release);
+        assert_eq!(track.fate(2), Fate::Sent { keyframe: true });
+        // Nothing came out for update 3 (dropped, failed or late).
+        assert_eq!(track.fate(3), Fate::Lost);
+    }
+
+    #[test]
+    fn tiler_failures_back_off_and_warn_now_and_then() {
+        let t0 = Instant::now();
+        let mut retry = TilerRetry::default();
+        assert_eq!(retry.failed(t0), (t0 + TILER_RETRY, Some(1)));
+        assert_eq!(retry.failed(t0), (t0 + TILER_RETRY * 2, None));
+        let mut at = t0;
+        for _ in 0..20 {
+            at = retry.failed(t0).0;
+        }
+        assert_eq!(at, t0 + MAX_TILER_RETRY);
+        // The next warning counts the failures since the last one.
+        assert_eq!(retry.failed(t0 + TILER_WARN_INTERVAL).1, Some(22));
+        retry.succeeded();
+        assert_eq!(retry.failed(t0 + TILER_WARN_INTERVAL).0, t0 + TILER_WARN_INTERVAL + TILER_RETRY);
+    }
+
+    /// A full-range NV12 frame, every byte from `value(plane, x_byte, y)`.
+    fn nv12(w: usize, h: usize, value: impl Fn(usize, usize, usize) -> u8) -> CapturedFrame {
+        use objc2_core_foundation::{CFDictionary, CFRetained, CFString, CFType};
+        use objc2_core_video::{
+            CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
+            CVPixelBufferGetHeightOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+            kCVPixelBufferIOSurfacePropertiesKey,
+        };
+        let empty: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(&[], &[]);
+        let attrs: CFRetained<CFDictionary<CFString, CFType>> =
+            CFDictionary::from_slices(&[unsafe { kCVPixelBufferIOSurfacePropertiesKey }], &[empty.as_ref()]);
+        let mut raw: *mut CVPixelBuffer = std::ptr::null_mut();
+        let status = unsafe {
+            CVPixelBufferCreate(None, w, h, u32::from_be_bytes(*b"420f"), Some(attrs.as_opaque()), std::ptr::NonNull::from(&mut raw))
+        };
+        assert_eq!(status, 0);
+        let pixel_buffer = unsafe { CFRetained::from_raw(std::ptr::NonNull::new(raw).unwrap()) };
+        unsafe {
+            CVPixelBufferLockBaseAddress(&pixel_buffer, CVPixelBufferLockFlags::empty());
+            for plane in 0..2 {
+                let base = CVPixelBufferGetBaseAddressOfPlane(&pixel_buffer, plane) as *mut u8;
+                let stride = CVPixelBufferGetBytesPerRowOfPlane(&pixel_buffer, plane);
+                for y in 0..CVPixelBufferGetHeightOfPlane(&pixel_buffer, plane) {
+                    let row = std::slice::from_raw_parts_mut(base.add(y * stride), stride);
+                    for (x, px) in row.iter_mut().enumerate() {
+                        *px = value(plane, x, y);
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(&pixel_buffer, CVPixelBufferLockFlags::empty());
+        }
+        CapturedFrame { pixel_buffer, capture_time_us: clock::now_us(), dirty: None }
+    }
+
+    /// Receives tile frames until `count` came in (and checks nothing else arrives).
+    async fn receive(conn: &Connection, reassemblers: &mut [transport::video::Reassembler], count: usize) -> Vec<VideoFrame> {
+        let mut frames = Vec::new();
+        while frames.len() < count {
+            let datagram = tokio::time::timeout(Duration::from_secs(3), conn.read_datagram()).await.expect("tile frame in time").unwrap();
+            let tile = transport::video::tile_of(&datagram).expect("video datagram");
+            if let Some(assembled) = reassemblers[usize::from(tile)].push(&datagram) {
+                let frame: VideoFrame = protocol::decode(&assembled.data).unwrap();
+                assert_eq!(frame.tile.index, tile);
+                frames.push(frame);
+            }
+        }
+        frames.sort_by_key(|f| f.tile.index);
+        frames
+    }
+
+    /// A host connection and the viewer's end of it, over loopback QUIC.
+    async fn loopback(name: &str) -> (Connection, Connection) {
+        use transport::endpoint::make_endpoint;
+        use transport::identity::DeviceIdentity;
+        let identity = |side: &str| {
+            let dir = std::env::temp_dir().join(format!("lankvm-test-{name}-{side}-{}", std::process::id()));
+            DeviceIdentity::load_or_create(&dir).unwrap()
+        };
+        let (host_id, client_id) = (identity("host"), identity("client"));
+        let host = make_endpoint("127.0.0.1:0".parse().unwrap(), &host_id).unwrap();
+        let client = make_endpoint("127.0.0.1:0".parse().unwrap(), &client_id).unwrap();
+        let host_addr = host.local_addr().unwrap();
+        let accept = tokio::spawn(async move { host.accept().await.unwrap().await.unwrap() });
+        let conn = client.connect(host_addr, "lankvm").unwrap().await.unwrap();
+        (accept.await.unwrap(), conn)
+    }
+
+    /// The host's video path for a `w`×`h` stream in `grid` tiles, without screen capture.
+    /// Tests that make hardware encoders take turns: the media engine runs 32 sessions at once.
+    static ENCODERS: Mutex<()> = Mutex::new(());
+
+    fn encoders_turn() -> std::sync::MutexGuard<'static, ()> {
+        ENCODERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn pipeline(video: &Arc<VideoOut>, w: u32, h: u32, grid: (u32, u32), full_frame_at: f64) -> Pipeline {
+        let cfg = EncoderConfig { width: w, height: h, fps: 60, bitrate_bps: bitrate_for(w, h, 60), codec: Codec::Hevc };
+        let encoders = TileEncoders::new(video, &cfg, tile_layout(w, h, Some(grid)), full_frame_at).unwrap();
+        let tiler = Tiler::new(w, h, &encoders.tiles).unwrap();
+        Pipeline::new(tiler, encoders, Arc::new(|why| panic!("stream broke: {why}")))
+    }
+
+    fn summary(frames: &[VideoFrame]) -> Vec<(u8, u32, u64, bool)> {
+        frames.iter().map(|f| (f.tile.index, f.update, f.update_mask, f.keyframe)).collect()
+    }
+
+    /// The host's video path without screen capture: synthetic frames through the tiler and one
+    /// encoder per tile, over real QUIC datagrams.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sends_only_changed_and_requested_tiles() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("tiles").await;
+        let (w, h) = (1280u32, 720u32);
+        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        // No full frames here (see `big_changes_go_out_as_one_full_frame`).
+        let mut pipeline = pipeline(&video, w, h, (2, 2), 2.0);
+        assert_eq!((pipeline.encoders.tiles.len(), pipeline.encoders.mask()), (4, 0b1111));
+        let tiles = pipeline.encoders.tiles.clone();
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        let pattern = |p: usize, x: usize, y: usize| (x * 7 + y * 3 + p * 50) as u8;
+        let mut update = |frame: Option<CapturedFrame>, work: Work| tokio::task::block_in_place(|| pipeline.update(&video, frame, u64::MAX, work));
+        let tiles_only = |keyframes, resends| Work { keyframes, resends, full_keyframe: false, drop_full: false };
+
+        // First frame: every tile, as keyframes, one update.
+        let out = update(Some(nv12(w as usize, h as usize, pattern)), Work::default());
+        assert_eq!((out.sent, out.sent_keyframes, out.resends, out.keyframes), (0b1111, 0b1111, 0, 0));
+        let frames = receive(&conn, &mut reassemblers, 4).await;
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.tile, tiles[i]);
+            assert_eq!((f.width, f.height, f.update, f.update_mask), (w, h, 0, 0b1111));
+            assert!(f.keyframe && !f.param_sets.is_empty(), "tile {i}");
+        }
+
+        // The same pixels: nothing is sent, and no update number is used.
+        assert_eq!(update(Some(nv12(w as usize, h as usize, pattern)), Work::default()).sent, 0);
+        assert_eq!(video.next_update.load(Ordering::Relaxed), 1);
+
+        // One pixel in tile 3: only it, as a delta frame.
+        let (px, py) = (w as usize - 5, h as usize - 5);
+        let changed = move |p: usize, x: usize, y: usize| pattern(p, x, y) ^ u8::from(p == 0 && x == px && y == py) * 0x80;
+        assert_eq!(update(Some(nv12(w as usize, h as usize, changed)), Work::default()).sent, 0b1000);
+        let frames = receive(&conn, &mut reassemblers, 1).await;
+        assert_eq!(summary(&frames), [(3, 1, 0b1000, false)]);
+
+        // Keyframes asked for while the screen is still: re-encoded from the tiles' last content.
+        let out = update(None, tiles_only(0b0110, 0));
+        assert_eq!((out.sent, out.sent_keyframes), (0b0110, 0b0110));
+        let frames = receive(&conn, &mut reassemblers, 2).await;
+        assert_eq!(summary(&frames), [(1, 2, 0b110, true), (2, 2, 0b110, true)]);
+
+        // Resends: the last content again, as ordinary frames.
+        assert_eq!(update(None, tiles_only(0, 0b1001)).sent_keyframes, 0);
+        let frames = receive(&conn, &mut reassemblers, 2).await;
+        assert_eq!(summary(&frames), [(0, 3, 0b1001, false), (3, 3, 0b1001, false)]);
+
+        // A tile that changed and was asked for goes once, as a keyframe; another one changed too.
+        let both = move |p: usize, x: usize, y: usize| changed(p, x, y) ^ u8::from(p == 1 && (x == 0 || x == w as usize - 1) && y == 0);
+        update(Some(nv12(w as usize, h as usize, both)), tiles_only(0b0001, 0));
+        let frames = receive(&conn, &mut reassemblers, 2).await;
+        assert_eq!(summary(&frames), [(0, 4, 0b11, true), (1, 4, 0b11, false)]);
+
+        // Nothing else was sent.
+        assert!(tokio::time::timeout(Duration::from_millis(100), conn.read_datagram()).await.is_err());
+
+        // Encoded but never sent: its stream needs a keyframe. (Its content was taken as sent, so
+        // the same pixels don't count as a change.)
+        host_conn.close(0u32.into(), b"done");
+        let out = update(None, tiles_only(0, 0b1000));
+        assert_eq!((out.sent, out.keyframes, out.resends), (0, 0b1000, 0));
+        assert!(update(Some(nv12(w as usize, h as usize, both)), Work::default()).keyframes == 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn big_changes_go_out_as_one_full_frame() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("full").await;
+        let (w, h) = (1280u32, 720u32);
+        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        let mut pipeline = pipeline(&video, w, h, (2, 2), 0.75);
+        assert!(pipeline.encoders.full.is_some());
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        let full = TileRect { index: FULL_FRAME_TILE, x: 0, y: 0, width: w, height: h };
+        let tiles = pipeline.encoders.tiles.clone();
+        // Tile areas: 640×384 at the top, 640×336 below.
+        assert_eq!((tiles[0].height, tiles[3].height), (384, 336));
+        let mut update = |frame: Option<CapturedFrame>, work: Work| tokio::task::block_in_place(|| pipeline.update(&video, frame, u64::MAX, work));
+        // A picture whose tile `i` is the base picture plus `seeds[i]`.
+        let frame = |seeds: [u8; 4]| {
+            let tiles = tiles.clone();
+            nv12(w as usize, h as usize, move |p, x, y| {
+                let (px, py) = if p == 0 { (x, y) } else { (x / 2 * 2, y * 2) };
+                let inside = |t: &TileRect| (t.x as usize..(t.x + t.width) as usize).contains(&px) && (t.y as usize..(t.y + t.height) as usize).contains(&py);
+                let seed = tiles.iter().position(inside).map_or(0, |i| seeds[i]);
+                ((x * 7 + y * 3 + p * 50) as u8).wrapping_add(seed)
+            })
+        };
+
+        // The first frame changes everything: one full frame, a keyframe.
+        let out = update(Some(frame([0, 0, 0, 0])), Work::default());
+        assert_eq!((out.sent, out.resends, out.keyframes), (0, 0, 0));
+        let frames = receive(&conn, &mut reassemblers, 1).await;
+        assert_eq!(summary(&frames), [(FULL_FRAME_TILE, 0, FULL_FRAME_BIT, true)]);
+        assert_eq!((frames[0].tile, frames[0].width, frames[0].height), (full, w, h));
+
+        // A small change goes as tiles (tile 3's first frame of its own: a keyframe).
+        update(Some(frame([0, 0, 0, 1])), Work::default());
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(3, 1, 0b1000, true)]);
+        // Three tiles, 77% of the picture: a full frame again, a delta frame now.
+        update(Some(frame([2, 2, 2, 1])), Work::default());
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(FULL_FRAME_TILE, 2, FULL_FRAME_BIT, false)]);
+        // Smaller changes after it: tiles, delta frames once a tile's stream has started.
+        update(Some(frame([3, 3, 2, 1])), Work::default());
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 2).await), [(0, 3, 0b11, true), (1, 3, 0b11, true)]);
+        update(Some(frame([4, 3, 2, 4])), Work::default());
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 2).await), [(0, 4, 0b1001, false), (3, 4, 0b1001, false)]);
+
+        // The viewer lost a full frame: every tile again (ordinary frames, from what they show
+        // now), and the next full frame is a keyframe.
+        let mut requests = Requests::default();
+        requests.ask(FULL_FRAME_BIT, 0b1111, true);
+        let work = requests.take(Instant::now());
+        assert_eq!(work, Work { keyframes: 0, resends: 0b1111, full_keyframe: true, drop_full: false });
+        let out = update(None, work);
+        requests.done(&out);
+        assert_eq!((out.sent, requests.resends), (0b1111, 0));
+        let frames = receive(&conn, &mut reassemblers, 4).await;
+        // Tile 2 never had a frame of its own: its first is a keyframe anyway.
+        assert_eq!(summary(&frames), [(0, 5, 0b1111, false), (1, 5, 0b1111, false), (2, 5, 0b1111, true), (3, 5, 0b1111, false)]);
+        update(Some(frame([6, 6, 6, 6])), Work::default());
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(FULL_FRAME_TILE, 6, FULL_FRAME_BIT, true)]);
+        update(Some(frame([7, 7, 7, 7])), Work::default());
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(FULL_FRAME_TILE, 7, FULL_FRAME_BIT, false)]);
+
+        // Tiles asked for never go in the full frame: they go beside it, in the same update.
+        update(Some(frame([8, 8, 8, 8])), Work { keyframes: 0b1000, resends: 0, full_keyframe: false, drop_full: false });
+        let mask = FULL_FRAME_BIT | 0b1000;
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 2).await), [(3, 8, mask, true), (FULL_FRAME_TILE, 8, mask, false)]);
+        // Whether a full frame is worth it depends on what it would carry beside the tiles asked
+        // for: here only half the picture, so it all goes as tiles.
+        update(Some(frame([9, 9, 9, 9])), Work { keyframes: 0b0010, resends: 0b0100, full_keyframe: false, drop_full: false });
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 4).await), [(0, 9, 0b1111, false), (1, 9, 0b1111, true), (2, 9, 0b1111, false), (3, 9, 0b1111, false)]);
+        assert!(tokio::time::timeout(Duration::from_millis(100), conn.read_datagram()).await.is_err());
+
+        // A full frame that never went out: its stream needs a keyframe, and the tiles it carried
+        // go again.
+        host_conn.close(0u32.into(), b"done");
+        let out = update(Some(frame([10, 10, 10, 9])), Work::default());
+        assert_eq!((out.sent, out.resends, out.keyframes), (0, 0b0111, 0));
+        assert!(pipeline.full_keyframe);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_tile_has_no_full_frame_stream() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("one").await;
+        let (w, h) = (640u32, 360u32);
+        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        let mut pipeline = pipeline(&video, w, h, (1, 1), 0.0);
+        assert!(pipeline.encoders.full.is_none());
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        let out = tokio::task::block_in_place(|| pipeline.update(&video, Some(nv12(w as usize, h as usize, |_, x, y| (x ^ y) as u8)), u64::MAX, Work::default()));
+        assert_eq!(out.sent, 1);
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(0, 0, 1, true)]);
+        // The full-frame stream's bit means nothing here.
+        let mut requests = Requests::default();
+        requests.ask(FULL_FRAME_BIT, 1, false);
+        assert_eq!(requests.wait(Instant::now()), None);
+    }
+
+    /// The encode thread as a stream runs it: newest frame wins, a frame the tiler failed on is
+    /// tried again (or a newer one instead), requests are served without a capture.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encode_loop_retries_and_serves_requests() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("loop").await;
+        let (w, h) = (640u32, 384u32);
+        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        let pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        let shared = Arc::new(Shared {
+            state: Mutex::default(),
+            wake: Condvar::new(),
+            layout: pipeline.encoders.tiles.clone(),
+            tiles: 0b11,
+            full: AtomicBool::new(false),
+            hints: false,
+        });
+        let (notes_tx, mut notes) = mpsc::channel(8);
+        video.set_notices(notes_tx);
+        let thread = std::thread::spawn({
+            let (shared, video) = (shared.clone(), video.clone());
+            move || encode_loop(&shared, pipeline, &video)
+        });
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        // Byte `x` of a row is in column `x` in both planes (CbCr pairs cover two columns).
+        let picture = |seed: u8| move |p: usize, x: usize, y: usize| ((x * 5 + y + p * 9) as u8).wrapping_add(seed * u8::from(x >= w as usize / 2 + 3));
+
+        shared.on_captured(nv12(w as usize, h as usize, picture(0)));
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 2).await), [(0, 0, 0b11, true), (1, 0, 0b11, true)]);
+        // Still for a moment: the viewer hears which update was the last.
+        let note = tokio::time::timeout(Duration::from_millis(500), notes.recv()).await.unwrap();
+        assert_eq!(note, Some(HostMsg::VideoIdle { update: 0, mask: 0b11 }));
+        // A frame the tiler can't take (another size) is held and tried again, until a newer one
+        // replaces it (only the right half changed).
+        shared.on_captured(nv12(w as usize / 2, h as usize, picture(0)));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(shared.state.lock().unwrap().retry_at.is_some());
+        shared.on_captured(nv12(w as usize, h as usize, picture(1)));
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(1, 1, 0b10, false)]);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(shared.state.lock().unwrap().retry_at.is_none(), "a frame went through: no more waiting");
+        // Asked for while the screen is still.
+        shared.request_keyframes(0b01 | FULL_FRAME_BIT);
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(0, 2, 0b01, true)]);
+        assert!(tokio::time::timeout(Duration::from_millis(100), conn.read_datagram()).await.is_err());
+
+        shared.state.lock().unwrap().stop = true;
+        shared.wake.notify_one();
+        tokio::task::block_in_place(|| thread.join().unwrap());
+    }
+
+    #[test]
+    fn requests_merge_and_wait_their_turn() {
+        let t0 = Instant::now();
+        let mut k = Requests::default();
+        assert_eq!(k.wait(t0), None);
+        assert_eq!(k.take(t0), Work::default());
+        k.ask(0b101, 0b1111, true);
+        k.ask(0b100 | 1 << 40, 0b1111, true);
+        assert_eq!(k.wait(t0), Some(Duration::ZERO));
+        assert_eq!(k.take(t0), Work { keyframes: 0b101, ..Work::default() });
+        assert_eq!(k.wait(t0), None);
+        // More arrive right after: merged, held until the interval is up, then all served.
+        k.ask(0b10, 0b1111, true);
+        k.ask(0b1000, 0b1111, true);
+        k.resends |= 0b1001;
+        let soon = t0 + KEYFRAME_MIN_INTERVAL / 2;
+        assert_eq!(k.wait(soon), Some(KEYFRAME_MIN_INTERVAL / 2));
+        assert_eq!(k.take(soon), Work::default());
+        let later = t0 + KEYFRAME_MIN_INTERVAL;
+        assert_eq!(k.wait(later), Some(Duration::ZERO));
+        // A tile asked for both ways goes once, as a keyframe.
+        assert_eq!(k.take(later), Work { keyframes: 0b1010, resends: 0b0001, full_keyframe: false, drop_full: false });
+        assert_eq!(k.take(later + KEYFRAME_MIN_INTERVAL), Work::default());
+
+        // The full-frame stream's bit: its next frame is a keyframe (whenever that is), and every
+        // tile goes again.
+        k.ask(FULL_FRAME_BIT, 0b1111, true);
+        let at = later + KEYFRAME_MIN_INTERVAL * 2;
+        assert_eq!(k.take(at), Work { keyframes: 0, resends: 0b1111, full_keyframe: true, drop_full: false });
+        k.ask(FULL_FRAME_BIT, 0b1111, true);
+        assert_eq!(k.take(at), Work { keyframes: 0, resends: 0, full_keyframe: true, drop_full: false }, "the flag isn't paced");
+        // Without a full-frame stream, nothing.
+        let mut none = Requests::default();
+        none.ask(FULL_FRAME_BIT, 0b1111, false);
+        assert_eq!(none.take(t0), Work::default());
+    }
+
+    #[test]
+    fn a_lost_full_frame_sends_the_tiles_again_once() {
+        let t0 = Instant::now();
+        let mut k = Requests::default();
+        k.ask(FULL_FRAME_BIT, 0b1111, true);
+        assert_eq!(k.take(t0), Work { keyframes: 0, resends: 0b1111, full_keyframe: true, drop_full: false });
+        k.done(&Outcome { sent: 0b1111, ..Outcome::default() });
+        // Asked again before any full frame went out: the tiles already carry that picture.
+        let later = t0 + KEYFRAME_MIN_INTERVAL;
+        k.ask(FULL_FRAME_BIT, 0b1111, true);
+        assert_eq!(k.take(later), Work { keyframes: 0, resends: 0, full_keyframe: true, drop_full: false });
+        // A full frame went out since, and was lost: every tile again.
+        k.done(&Outcome { full_sent: true, ..Outcome::default() });
+        k.ask(FULL_FRAME_BIT, 0b1111, true);
+        assert_eq!(k.take(later + KEYFRAME_MIN_INTERVAL).resends, 0b1111);
+    }
+
+    #[test]
+    fn no_full_frame_sends_every_tile_again() {
+        let mut k = Requests::default();
+        k.no_full_frame(0b111);
+        assert_eq!(k.take(Instant::now()), Work { keyframes: 0, resends: 0b111, full_keyframe: false, drop_full: true });
+    }
+
+    /// A keyframe the viewer waits for is owed until one goes out, even if the encoder dropped
+    /// it; an ordinary frame it dropped is just sent again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_keyframes_are_still_owed() {
+        let _encoders = encoders_turn();
+        let (host_conn, _conn) = loopback("owed").await;
+        let video = Arc::new(VideoOut::new(host_conn));
+        let mut pipeline = pipeline(&video, 640, 384, (2, 1), 2.0);
+        let mut out = Outcome::default();
+        pipeline.record(Route::Tile(0), Fate::Lost, 0, true, &mut out);
+        pipeline.record(Route::Tile(1), Fate::Lost, 0, false, &mut out);
+        assert_eq!((out.keyframes, out.resends), (0b01, 0b10));
+    }
+
+    /// The viewer can't decode full frames: they stop for good (this connection's next streams
+    /// too), and every tile goes again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_full_frame_stops_full_frames() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("nofull").await;
+        let (w, h) = (640u32, 384u32);
+        let video = Arc::new(VideoOut::new(host_conn));
+        let mut pipeline = pipeline(&video, w, h, (2, 1), 0.5);
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        tokio::task::block_in_place(|| pipeline.update(&video, Some(nv12(w as usize, h as usize, |_, x, y| (x + y) as u8)), u64::MAX, Work::default()));
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(FULL_FRAME_TILE, 0, FULL_FRAME_BIT, true)]);
+        let mut k = Requests::default();
+        k.no_full_frame(0b11);
+        let out = tokio::task::block_in_place(|| pipeline.update(&video, Some(nv12(w as usize, h as usize, |_, x, y| (x * y) as u8)), u64::MAX, k.take(Instant::now())));
+        assert!(pipeline.encoders.full.is_none() && video.no_full_frame.load(Ordering::Relaxed));
+        assert_eq!(out.sent, 0b11);
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 2).await), [(0, 1, 0b11, true), (1, 1, 0b11, true)]);
+        let next = TileEncoders::new(&video, &EncoderConfig { width: w, height: h, fps: 60, bitrate_bps: 8_000_000, codec: Codec::Hevc }, tile_layout(w, h, Some((2, 1))), 0.5).unwrap();
+        assert!(next.full.is_none());
+    }
+
+    /// Only the tiles ScreenCaptureKit's dirty rectangles name are read, except now and then,
+    /// when all are: a change they missed is caught then, and they aren't trusted for a while.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dirty_rectangles_limit_the_comparison_but_are_checked() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("dirty").await;
+        let (w, h) = (640u32, 384u32);
+        let video = Arc::new(VideoOut::new(host_conn));
+        let mut pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        let update = |pipeline: &mut Pipeline, frame: CapturedFrame, touched: u64| {
+            tokio::task::block_in_place(|| pipeline.update(&video, Some(frame), touched, Work::default()).sent)
+        };
+        // Seed `s` changes the left tile only.
+        let picture = |s: u8| nv12(w as usize, h as usize, move |p, x, y| ((x + y + p) as u8).wrapping_add(s * u8::from(x < 300)));
+        assert_eq!(update(&mut pipeline, picture(0), u64::MAX), 0b11);
+        receive(&conn, &mut reassemblers, 2).await;
+        // The left tile changed, but the rectangles only name the right one: not read.
+        assert_eq!(update(&mut pipeline, picture(1), 0b10), 0);
+        assert!(pipeline.distrust.is_none());
+        // Time for a full comparison: the change is found, and the rectangles lose trust.
+        pipeline.compared_all = Some(Instant::now() - FULL_COMPARE_INTERVAL);
+        assert_eq!(update(&mut pipeline, picture(1), 0b10), 0b01);
+        assert!(pipeline.distrust.is_some());
+        // Meanwhile every tile is compared whatever the rectangles say.
+        assert_eq!(update(&mut pipeline, picture(2), 0b10), 0b01);
+    }
+
+    /// A change the dirty rectangles missed in the last frame before the screen went still is
+    /// found before the screen counts as still.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_still_screen_is_checked_whole_before_it_counts_as_still() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("settle").await;
+        let (w, h) = (640u32, 384u32);
+        let video = Arc::new(VideoOut::new(host_conn));
+        let mut pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        let picture = |s: u8| nv12(w as usize, h as usize, move |p, x, y| ((x + y + p) as u8).wrapping_add(s * u8::from(x < 300)));
+        tokio::task::block_in_place(|| pipeline.update(&video, Some(picture(0)), u64::MAX, Work::default()));
+        receive(&conn, &mut reassemblers, 2).await;
+        // The left tile changed; the rectangles only name the right one.
+        let out = tokio::task::block_in_place(|| pipeline.update(&video, Some(picture(1)), 0b10, Work::default()));
+        assert_eq!(out.sent, 0);
+        let out = tokio::task::block_in_place(|| pipeline.settle(&video));
+        assert_eq!(out.sent, 0b01);
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(0, 1, 0b01, false)]);
+        assert!(pipeline.distrust.is_some());
+        // Nothing more to check.
+        assert_eq!(tokio::task::block_in_place(|| pipeline.settle(&video)).update, None);
+    }
+
+    /// A full frame carries every tile: tiles the dirty rectangles left out are compared too, so
+    /// what the tiler remembers is what the viewer shows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_frame_compares_every_tile_it_carries() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("fullrest").await;
+        let (w, h) = (1280u32, 384u32);
+        let video = Arc::new(VideoOut::new(host_conn));
+        let mut pipeline = pipeline(&video, w, h, (4, 1), 0.5);
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        // Seed `s[i]` changes tile `i` (320 px wide each).
+        let picture = |s: [u8; 4]| nv12(w as usize, h as usize, move |p, x, y| ((x + y + p) as u8).wrapping_add(s[(x / 320).min(3)]));
+        tokio::task::block_in_place(|| pipeline.update(&video, Some(picture([0; 4])), u64::MAX, Work::default()));
+        receive(&conn, &mut reassemblers, 1).await;
+        // Tiles 0-2 changed (75%: a full frame), and tile 3 too, but the rectangles miss it.
+        tokio::task::block_in_place(|| pipeline.update(&video, Some(picture([1, 1, 1, 1])), 0b0111, Work::default()));
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(FULL_FRAME_TILE, 1, FULL_FRAME_BIT, false)]);
+        // Tile 3 goes back: it differs from what the full frame showed, so it goes out.
+        let out = tokio::task::block_in_place(|| pipeline.update(&video, Some(picture([1, 1, 1, 0])), 0b1000, Work::default()));
+        assert_eq!(out.sent, 0b1000);
+    }
+
+    /// An encoder that keeps refusing frames is made again, and its tile's next frame is a
+    /// keyframe; the full frame's is dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn encoders_that_keep_failing_are_made_again() {
+        let _encoders = encoders_turn();
+        let (host_conn, _conn) = loopback("repair").await;
+        let video = Arc::new(VideoOut::new(host_conn));
+        let mut pipeline = pipeline(&video, 640, 384, (2, 1), 0.5);
+        pipeline.failures[1] = MAX_ENCODE_FAILURES;
+        pipeline.failures[2] = MAX_ENCODE_FAILURES;
+        let mut out = Outcome { resends: 0b10, ..Outcome::default() };
+        tokio::task::block_in_place(|| pipeline.repair(&mut out));
+        assert_eq!((out.keyframes, out.resends), (0b10, 0));
+        assert!(pipeline.encoders.full.is_none());
+        assert_eq!(pipeline.failures, [0, 0, 0]);
+    }
+
+    /// A frame whose dirty rectangles name the wrong tile sends nothing; the change it missed is
+    /// still found once the screen is still, and the viewer told.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_change_the_rectangles_missed_is_found_once_still() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("quiet").await;
+        let (w, h) = (640u32, 384u32);
+        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        let pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        let shared = Arc::new(Shared {
+            state: Mutex::default(),
+            wake: Condvar::new(),
+            layout: pipeline.encoders.tiles.clone(),
+            tiles: 0b11,
+            full: AtomicBool::new(false),
+            hints: true,
+        });
+        let (notes_tx, mut notes) = mpsc::channel(8);
+        video.set_notices(notes_tx);
+        let thread = std::thread::spawn({
+            let (shared, video) = (shared.clone(), video.clone());
+            move || encode_loop(&shared, pipeline, &video)
+        });
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        let picture = |s: u8| move |p: usize, x: usize, y: usize| ((x + y + p) as u8).wrapping_add(s * u8::from(x < 300));
+        shared.on_captured(nv12(w as usize, h as usize, picture(0)));
+        receive(&conn, &mut reassemblers, 2).await;
+        let note = tokio::time::timeout(Duration::from_millis(500), notes.recv()).await.unwrap();
+        assert_eq!(note, Some(HostMsg::VideoIdle { update: 0, mask: 0b11 }));
+        // The left tile changes, but the rectangles say the right one did.
+        let mut frame = nv12(w as usize, h as usize, picture(1));
+        frame.dirty = Some(vec![[400, 0, 410, 10]]);
+        shared.on_captured(frame);
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 1).await), [(0, 1, 0b01, false)]);
+        let note = tokio::time::timeout(Duration::from_millis(500), notes.recv()).await.unwrap();
+        assert_eq!(note, Some(HostMsg::VideoIdle { update: 1, mask: 0b01 }));
+        shared.state.lock().unwrap().stop = true;
+        shared.wake.notify_one();
+        tokio::task::block_in_place(|| thread.join().unwrap());
+    }
+
+    #[test]
+    fn requests_clear_once_an_update_sent_the_tile() {
+        let t0 = Instant::now();
+        let mut k = Requests::default();
+        k.ask(0b0001, 0b1111, true);
+        assert_eq!(k.take(t0).keyframes, 0b0001);
+        // While it's out: tile 1 is asked for, and lost frames come back.
+        k.ask(0b0010, 0b1111, true);
+        k.done(&Outcome { sent: 0b0001, sent_keyframes: 0b0001, resends: 0b0100, keyframes: 0b1000, ..Outcome::default() });
+        assert_eq!((k.keyframes, k.resends), (0b1010, 0b0100));
+        // Not their turn yet; meanwhile an update sends tiles 1 and 2 (1 as a keyframe, as its
+        // encoder had to): 2 needs no resend, 1 no keyframe.
+        let soon = t0 + KEYFRAME_MIN_INTERVAL / 2;
+        assert_eq!(k.take(soon), Work::default());
+        k.done(&Outcome { sent: 0b0110, sent_keyframes: 0b0010, ..Outcome::default() });
+        assert_eq!((k.keyframes, k.resends), (0b1000, 0));
+        // A keyframe asked for while the update is out may be about that very keyframe: kept.
+        assert_eq!(k.take(soon), Work::default());
+        k.ask(0b0100, 0b1111, true);
+        k.done(&Outcome { sent: 0b1100, sent_keyframes: 0b1100, ..Outcome::default() });
+        assert_eq!(k.keyframes, 0b0100);
     }
 
     #[test]

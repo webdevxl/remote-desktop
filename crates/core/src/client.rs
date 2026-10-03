@@ -2,16 +2,17 @@
 
 use std::ffi::c_void;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use platform_mac::decoder::Decoder;
-use platform_mac::{CFRetained, CVPixelBuffer, clock, system};
+use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth};
+use platform_mac::decoder::{DecodedFrame, Decoder};
+use platform_mac::{CVPixelBuffer, clock, system};
 use protocol::{
-    Arrangement, ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, DisplayChoice, DisplayReason, DisplayState, HostMsg, InputMsg,
-    PROTOCOL_VERSION, VideoFrame,
+    Arrangement, ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, DisplayChoice, DisplayReason, DisplayState, FULL_FRAME_TILE,
+    HostMsg, InputMsg, MAX_TILES, PROTOCOL_VERSION, TileRect, VideoFrame,
 };
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -20,16 +21,26 @@ use transport::framing::{read_msg, write_msg};
 use transport::identity::Fingerprint;
 use transport::pairing::client_start;
 use serde::Serialize;
-use transport::video::Reassembler;
+use transport::video::{Reassembler, tile_of};
 
 use crate::Trust;
 use crate::stats::{FrameTiming, Stats, StatsView};
-use crate::view::{ViewHandle, ViewSlot};
+use crate::view::{TileImage, ViewHandle, ViewSlot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PING_INTERVAL: Duration = Duration::from_millis(500);
-/// A frame missing packets for this long is considered lost even if no newer frame arrives.
+/// A tile frame missing packets for this long is considered lost even if no newer one arrives.
 const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_millis(60);
+/// The same for the full-frame stream: a whole-picture frame is many times a tile's size, and on
+/// Wi-Fi its packets can take that long to come in.
+const FULL_PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
+/// An update still missing tiles this long after its first one came is done with: no newer one
+/// came to say so earlier, so the screen went still (and the host's encoders are long done).
+const UPDATE_TIMEOUT: Duration = Duration::from_millis(150);
+/// A tile an update said it sent, but that never came (no packet of it either), is lost after
+/// this long unless its next frame comes first and shows nothing was skipped: then the host's
+/// encoder dropped that frame (the decoder is fine) and sent this one instead.
+const SUSPECT_TIMEOUT: Duration = Duration::from_millis(150);
 const KEYFRAME_RETRY: Duration = Duration::from_millis(200);
 /// While frames can't be decoded (a size this Mac's decoder doesn't take), ask for a keyframe only
 /// this often rather than flooding the host with requests that can't help.
@@ -121,37 +132,30 @@ pub enum SessionEvent {
 /// Input written per batch at most; anything more waits for the next write.
 const MAX_INPUT_BATCH: usize = 256;
 
-pub struct ReadyFrame {
-    pub pixel_buffer: CFRetained<CVPixelBuffer>,
-    pub timing: FrameTiming,
-}
-
-// SAFETY: CVPixelBuffer is a thread-safe, reference-counted CoreFoundation object.
-unsafe impl Send for ReadyFrame {}
-
 pub type SessionEvents = Arc<dyn Fn(SessionEvent) + Send + Sync>;
 
 /// State shared between the network task and the render thread.
 #[derive(Default)]
 pub struct Shared {
-    /// Hand-off to the render thread: holds only the newest decoded frame, never a queue.
+    /// Hand-off to the render thread: decoded tiles go there, never into a queue.
     pub slot: Arc<ViewSlot>,
     pub stats: Mutex<Stats>,
-    /// Timing of the access unit currently inside the (synchronous) decoder.
-    decoding: Mutex<FrameTiming>,
     /// Whether the host lets us control it right now. Input is dropped otherwise.
     controlling: AtomicBool,
     /// Id of our latest control request and whether it asked for control; answers to older
     /// ones are stale.
     latest_request: Mutex<(u32, bool)>,
-    /// Test hook: sees every decoded frame before it's drawn.
-    frame_probe: Mutex<Option<FrameProbe>>,
+    /// Test hook: sees every decoded tile before it's drawn. Read-locked, so tiles decoded at
+    /// once don't wait for each other.
+    frame_probe: RwLock<Option<FrameProbe>>,
     /// Id of our latest display request (they count apart from control requests).
     latest_display_request: Mutex<u32>,
     /// What the session shows, as the host last said.
     info: Mutex<Option<SessionInfo>>,
     /// A display change waiting for its first frame (see [`DISPLAY_SHOWN_TIMEOUT`]).
     pending_display: Mutex<Option<PendingDisplay>>,
+    /// The host's latest [`HostMsg::VideoIdle`], for the video task.
+    video_idle: Mutex<Option<(u32, u64)>>,
 }
 
 /// A `Display` event to send once a frame of `size` is decoded.
@@ -161,8 +165,22 @@ struct PendingDisplay {
     since: Instant,
 }
 
-/// Called with each decoded frame and its timing (see [`Session::set_frame_probe`]).
-pub type FrameProbe = Box<dyn Fn(&CVPixelBuffer, FrameTiming) + Send + Sync>;
+/// A decoded tile, as a [`FrameProbe`] sees it.
+pub struct ProbeFrame<'a> {
+    /// The tile's picture: `tile.width`×`tile.height`.
+    pub pixel_buffer: &'a CVPixelBuffer,
+    /// Where the tile sits in the stream.
+    pub tile: TileRect,
+    /// Size of the whole stream.
+    pub stream: (u32, u32),
+    /// [`protocol::VideoFrame::update`] and `update_mask`: tiles of one captured frame share them.
+    pub update: u32,
+    pub update_mask: u64,
+    pub timing: FrameTiming,
+}
+
+/// Called with each decoded tile (see [`Session::set_frame_probe`]), on a decoder thread.
+pub type FrameProbe = Box<dyn Fn(&ProbeFrame<'_>) + Send + Sync>;
 
 pub struct Session {
     shared: Arc<Shared>,
@@ -213,6 +231,20 @@ impl Session {
                 events(SessionEvent::Ended { error });
             }
         });
+        // Test runs (scripts/e2e-control.sh): what the overlay shows, in the log every second.
+        if std::env::var_os("LANKVM_LOG_STATS").is_some() {
+            let shared = Arc::downgrade(&shared);
+            rt.spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let Some(shared) = shared.upgrade() else { break };
+                    let view = shared.stats.lock().unwrap().view();
+                    tracing::info!(stats = %serde_json::to_string(&view).unwrap_or_default(), "viewer stats");
+                }
+            });
+        }
         Self { shared, conn, pin_tx, ctl_tx, input_tx, task, view: Mutex::new(None) }
     }
 
@@ -250,9 +282,9 @@ impl Session {
         }
     }
 
-    /// Lets a test look at every decoded frame (e.g. to time how fast input shows on screen).
+    /// Lets a test look at every decoded tile (e.g. to time how fast input shows on screen).
     pub fn set_frame_probe(&self, probe: Option<FrameProbe>) {
-        *self.shared.frame_probe.lock().unwrap() = probe;
+        *self.shared.frame_probe.write().unwrap() = probe;
     }
 
     /// Sends input to the host, if it lets us control it.
@@ -488,6 +520,7 @@ fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents) {
         HostMsg::Cursor(state) => events(SessionEvent::Cursor(state)),
         HostMsg::InputAck { seq, received_us, injected_us } => shared.stats.lock().unwrap().on_input_ack(seq, received_us, injected_us),
         HostMsg::Display(state) => on_display(state, shared, events),
+        HostMsg::VideoIdle { update, mask } => *shared.video_idle.lock().unwrap() = Some((update, mask)),
         other => tracing::debug!("ignoring {other:?}"),
     }
 }
@@ -606,32 +639,72 @@ async fn pair(send: &mut SendStream, recv: &mut RecvStream, client_fp: &Fingerpr
     write_msg(send, &ClientMsg::PairConfirm { mac }).await
 }
 
-/// Datagrams → frames → hardware decoder. Runs until the connection closes.
+/// What a tile frame's decoder callback needs besides the picture.
+struct TileMeta {
+    tile: TileRect,
+    stream: (u32, u32),
+    update: u32,
+    update_mask: u64,
+    keyframe: bool,
+    /// [`TileState::submitted`] when it went into the decoder.
+    seq: u64,
+    timing: FrameTiming,
+}
+
+/// A tile frame the decoder couldn't decode (reported from its callback).
+struct DecodeFailed {
+    tile: u8,
+    update: u32,
+    seq: u64,
+    keyframe: bool,
+    /// It decoded, but not to its tile's size. The host's next keyframe would most likely do the
+    /// same, so it is asked for as rarely as one this Mac can't decode.
+    wrong_size: bool,
+}
+
+/// One tile's receive state: each tile is its own video stream, with its own frame ids and its
+/// own decoder. The full-frame stream ([`FULL_FRAME_TILE`]) is one more of them.
+#[derive(Default)]
+struct TileState {
+    reassembler: Reassembler,
+    decoder: Option<Decoder<TileMeta>>,
+    /// Parameter sets this Mac's decoder refused, and when: their keyframes aren't tried again
+    /// for [`UNDECODABLE_RETRY`] (a refusal may pass, e.g. while the media server restarts).
+    undecodable: Option<(Vec<Vec<u8>>, Instant)>,
+    /// Frames handed to a decoder so far, and the count when the latest keyframe went in: a
+    /// failure from before that keyframe no longer matters.
+    submitted: u64,
+    keyframe_seq: u64,
+}
+
+/// Datagrams → tile frames → hardware decoders → view. Runs until the connection closes.
+///
+/// Each tile is reassembled and decoded on its own. Decoding is asynchronous, so this task only
+/// queues frames and never waits for the hardware; the decoder callbacks hand tiles to the view.
 async fn receive_video(
     conn: &Connection,
     shared: &Arc<Shared>,
     ctl: &mpsc::UnboundedSender<ClientMsg>,
     events: &SessionEvents,
 ) -> Result<()> {
-    let mut reassembler = Reassembler::new();
-    let mut decoder: Option<Decoder> = None;
-    let mut need_keyframe = true;
-    let mut last_request: Option<Instant> = None;
+    let mut tiles: Vec<TileState> = (0..MAX_TILES).map(|_| TileState::default()).collect();
+    let mut needs = KeyframeNeeds::new(Instant::now(), None);
+    let mut meter = UpdateMeter::default();
+    // Size of the stream being shown; frames of any other size are leftovers of the last one.
+    let mut stream: Option<(u32, u32)> = None;
+    let mut other_size = OtherSize::default();
+    // The stream size already reported as undecodable: once per picture, not once per tile.
+    let mut reported_undecodable: Option<(u32, u32)> = None;
+    let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<DecodeFailed>();
     let mut check = tokio::time::interval(Duration::from_millis(20));
-    // Parameter sets this Mac's decoder refused: their frames can't be shown, however often the
-    // host sends a keyframe.
-    let mut undecodable: Option<Vec<Vec<u8>>> = None;
-
-    let request_keyframe = |reassembler: &mut Reassembler, last_request: &mut Option<Instant>, undecodable: bool| {
-        let retry = if undecodable { UNDECODABLE_RETRY } else { KEYFRAME_RETRY };
-        if last_request.is_some_and(|t| t.elapsed() < retry) {
-            return;
-        }
-        *last_request = Some(Instant::now());
-        reassembler.clear_partial();
-        shared.stats.lock().unwrap().keyframe_requests += 1;
-        let _ = ctl.send(ClientMsg::RequestKeyframe);
-    };
+    // Tiles an update sent that never came, since when (see [`SUSPECT_TIMEOUT`]).
+    let mut suspects: [Option<Instant>; MAX_TILES] = [None; MAX_TILES];
+    // Where each tile of the stream is: a keyframe placing one elsewhere starts a new layout (the
+    // host fell back to fewer tiles at the same size).
+    let mut rects: [Option<TileRect>; MAX_TILES] = [None; MAX_TILES];
+    // What the view was last told about tiles waiting for a keyframe.
+    let mut waiting = 0u64;
+    let mut canvas = CanvasRepair::default();
 
     loop {
         tokio::select! {
@@ -641,12 +714,10 @@ async fn receive_video(
                     Err(quinn::ConnectionError::ApplicationClosed(_) | quinn::ConnectionError::LocallyClosed) => return Ok(()),
                     Err(e) => return Err(e).context("connection lost"),
                 };
-                let Some(frame) = reassembler.push(&datagram) else { continue };
+                let Some(t) = tile_of(&datagram) else { continue };
+                let Some(frame) = tiles[usize::from(t)].reassembler.push(&datagram) else { continue };
                 let received_us = clock::now_us();
-                if frame.skipped > 0 {
-                    shared.stats.lock().unwrap().frames_lost += u64::from(frame.skipped);
-                    need_keyframe = true;
-                }
+                let now = Instant::now();
                 let video: VideoFrame = match protocol::decode(&frame.data) {
                     Ok(v) => v,
                     Err(e) => {
@@ -654,91 +725,1168 @@ async fn receive_video(
                         continue;
                     }
                 };
-                record_arrival(shared, &video, frame.data.len(), received_us);
+                if !tile_fits(&video, t) {
+                    tracing::warn!(t, tile = ?video.tile, video.width, video.height, "frame's tile doesn't fit its stream");
+                    continue;
+                }
+                let size = (video.width, video.height);
+                let moved = rects[usize::from(t)].is_some_and(|r| r != video.tile);
+                if moved && !video.keyframe && stream == Some(size) {
+                    continue; // a straggler of the layout before
+                }
+                if video.keyframe && (stream != Some(size) || moved) {
+                    // A new picture (another display, a new size, or tiles laid out anew): its tiles
+                    // start over. Decoders
+                    // of the old one go; tiles it doesn't have never come back.
+                    tracing::debug!(?size, "new stream");
+                    stream = Some(size);
+                    reported_undecodable = None;
+                    needs = KeyframeNeeds::new(now, Some(size));
+                    other_size = OtherSize::default();
+                    suspects = [None; MAX_TILES];
+                    rects = [None; MAX_TILES];
+                    meter.flush(|bytes| shared.stats.lock().unwrap().on_frame_received(bytes));
+                    for tile in &mut tiles {
+                        tile.decoder = None;
+                        tile.undecodable = None;
+                    }
+                } else if stream != Some(size) {
+                    // A straggler from the picture before, or the next picture whose keyframes
+                    // were lost: nothing to decode it with either way.
+                    if other_size.frame(size, frame.skipped > 0, now) {
+                        tracing::debug!(?size, ?stream, "frames of another size keep coming");
+                        send_keyframe_request(shared, ctl, ClientMsg::RequestKeyframe);
+                    }
+                    continue;
+                }
+                rects[usize::from(t)] = Some(video.tile);
+                needs.seen(t);
+                if frame.skipped > 0 {
+                    shared.stats.lock().unwrap().frames_lost += u64::from(frame.skipped);
+                    // A keyframe repairs the tile whatever it skipped (one that doesn't decode is
+                    // asked for again below).
+                    if !video.keyframe {
+                        needs.lost(t);
+                    }
+                }
+                // This tile's own frame settles what it was suspected of: frames skipped before
+                // it are a loss (just noted); none means the host's encoder dropped a frame and
+                // this one replaces it.
+                suspects[usize::from(t)] = None;
+                let missing = record_arrival(shared, &mut meter, &video, frame.data.len(), received_us, now);
+                if missing.unknown {
+                    // A run of updates lost entirely: which tiles they had is unknown.
+                    let this = if video.keyframe { video.tile.bit() } else { 0 };
+                    for t in tiles_in(needs.seen_mask() & !this) {
+                        needs.lost(t);
+                    }
+                }
+                // Packets of a missing tile that came before this frame started are the missing
+                // frame's (the host sends an update only once the one before is out); later ones
+                // may be a resend of it.
+                let cutoff = frame.first_seen.checked_sub(Duration::from_micros(500));
+                suspect(missing.tiles & !video.tile.bit(), &mut suspects, &mut needs, &tiles, cutoff, now);
+                request_keyframes(&mut needs, &mut tiles, shared, ctl);
 
                 if video.keyframe {
-                    if !decoder.as_ref().is_some_and(|d| d.matches(video.codec, &video.param_sets)) {
-                        decoder = None;
-                        if undecodable.as_ref() == Some(&video.param_sets) {
+                    let tile = &mut tiles[usize::from(t)];
+                    if !tile.decoder.as_ref().is_some_and(|d| d.matches(video.codec, &video.param_sets)) {
+                        tile.decoder = None;
+                        if tile.undecodable.as_ref().is_some_and(|(sets, at)| *sets == video.param_sets && now.duration_since(*at) < UNDECODABLE_RETRY) {
                             continue;
                         }
-                        match new_decoder(&video, shared) {
+                        match new_decoder(&video, shared, events, &failed_tx) {
                             Ok(d) => {
-                                decoder = Some(d);
-                                undecodable = None;
+                                tile.decoder = Some(d);
+                                tile.undecodable = None;
+                                needs.set_undecodable(t, false, now);
+                            }
+                            Err(e) if t == FULL_FRAME_TILE => {
+                                // The tiles decode, only not the whole picture at once: the host
+                                // sends everything as tiles from now on.
+                                tracing::warn!(width = video.width, height = video.height, "full-frame decoder: {e:#}; asking for tiles only");
+                                tile.undecodable = Some((video.param_sets.clone(), now));
+                                needs.drop_full();
+                                send_keyframe_request(shared, ctl, ClientMsg::NoFullFrame);
+                                continue;
                             }
                             Err(e) => {
                                 // Keep the session: the host can still switch to something this
                                 // Mac decodes (its own screen, a smaller display).
-                                tracing::warn!(width = video.width, height = video.height, "decoder: {e:#}");
-                                events(SessionEvent::StreamError {
-                                    message: format!("This Mac can't decode the {}×{} picture ({e:#}).", video.width, video.height),
-                                    width: video.width,
-                                    height: video.height,
-                                });
-                                undecodable = Some(video.param_sets.clone());
-                                need_keyframe = true;
+                                tracing::warn!(width = video.width, height = video.height, ?video.tile, "decoder: {e:#}");
+                                if reported_undecodable != Some(size) {
+                                    reported_undecodable = Some(size);
+                                    events(SessionEvent::StreamError {
+                                        message: format!("This Mac can't decode the {}×{} picture ({e:#}).", video.width, video.height),
+                                        width: video.width,
+                                        height: video.height,
+                                    });
+                                }
+                                tile.undecodable = Some((video.param_sets.clone(), now));
+                                needs.set_undecodable(t, true, now);
+                                needs.mark(t);
                                 continue;
                             }
                         }
                     }
-                    need_keyframe = false;
-                    last_request = None;
+                    needs.got_keyframe(&video.tile);
                 }
-                if need_keyframe {
-                    request_keyframe(&mut reassembler, &mut last_request, undecodable.is_some());
+                if needs.needs(t) {
+                    needs.frame_while_needed(t, now);
+                    request_keyframes(&mut needs, &mut tiles, shared, ctl);
                     continue;
                 }
-                let Some(dec) = decoder.as_ref() else {
-                    need_keyframe = true;
+                let tile = &mut tiles[usize::from(t)];
+                let Some(dec) = tile.decoder.as_ref() else {
+                    needs.mark(t);
                     continue;
                 };
-                {
-                    let mut timing = shared.decoding.lock().unwrap();
-                    timing.received_us = received_us;
-                    timing.capture_local_us = shared.stats.lock().unwrap().clock.to_local(video.capture_time_us);
+                let seq = tile.submitted;
+                tile.submitted += 1;
+                if video.keyframe {
+                    tile.keyframe_seq = seq;
                 }
-                if let Err(e) = dec.decode(&video.data, 0) {
-                    tracing::warn!("decode: {e:#}");
-                    need_keyframe = true;
-                } else {
-                    flush_display(shared, events, Some((video.width, video.height)));
+                let capture_local_us = shared.stats.lock().unwrap().clock.to_local(video.capture_time_us);
+                let meta = TileMeta {
+                    tile: video.tile,
+                    stream: size,
+                    update: video.update,
+                    update_mask: video.update_mask,
+                    keyframe: video.keyframe,
+                    seq,
+                    timing: FrameTiming { capture_local_us, received_us, decoded_us: 0 },
+                };
+                shared.slot.expect_tile(video.tile, size, video.update, video.update_mask);
+                if let Err(e) = dec.decode(&video.data, meta) {
+                    // The session itself may be broken (e.g. after a GPU reset): make a new one
+                    // with the next keyframe.
+                    tracing::warn!(t, "decode: {e:#}");
+                    shared.slot.tile_failed(t, video.update);
+                    tile.decoder = None;
+                    needs.lost(t);
+                    request_keyframes(&mut needs, &mut tiles, shared, ctl);
                 }
+            }
+            Some(failed) = failed_rx.recv() => {
+                shared.slot.tile_failed(failed.tile, failed.update);
+                let tile = &mut tiles[usize::from(failed.tile)];
+                if failed.seq < tile.keyframe_seq || tile.decoder.is_none() {
+                    continue; // a keyframe since then repaired it, or one is awaited anyway
+                }
+                shared.stats.lock().unwrap().frames_lost += 1;
+                if failed.keyframe {
+                    // Even a fresh start failed: the next keyframe gets a new session.
+                    tile.decoder = None;
+                    if failed.wrong_size && failed.tile == FULL_FRAME_TILE {
+                        tracing::warn!("full frames don't decode to the picture's size; asking for tiles only");
+                        needs.drop_full();
+                        send_keyframe_request(shared, ctl, ClientMsg::NoFullFrame);
+                        continue;
+                    }
+                    if failed.wrong_size {
+                        needs.set_undecodable(failed.tile, true, Instant::now());
+                    }
+                }
+                needs.lost(failed.tile);
+                request_keyframes(&mut needs, &mut tiles, shared, ctl);
             }
             _ = check.tick() => {
+                let now = Instant::now();
                 flush_display(shared, events, None);
-                if need_keyframe || reassembler.has_stale_partial(PARTIAL_FRAME_TIMEOUT) {
-                    need_keyframe = true;
-                    request_keyframe(&mut reassembler, &mut last_request, undecodable.is_some());
+                // Updates nothing newer followed: the screen went still, so what they still miss
+                // isn't coming.
+                for t in tiles_in(meter.flush_stale(now, |bytes| shared.stats.lock().unwrap().on_frame_received(bytes))) {
+                    needs.seen(t);
+                    // One still coming in is left to its own (size-aware) timeout below.
+                    if tiles[usize::from(t)].reassembler.oldest_partial().is_none() {
+                        needs.lost(t);
+                    }
                 }
+                // The host says the screen went still after an update: anything of it (or of
+                // updates before it) not here yet is a suspect.
+                if let Some((update, mask)) = shared.video_idle.lock().unwrap().take() {
+                    let missing = meter.idle(update, mask, |bytes| shared.stats.lock().unwrap().on_frame_received(bytes));
+                    if missing.unknown {
+                        for t in tiles_in(needs.seen_mask()) {
+                            needs.lost(t);
+                        }
+                    }
+                    suspect(missing.tiles, &mut suspects, &mut needs, &tiles, None, now);
+                }
+                for (t, since) in suspects.iter_mut().enumerate() {
+                    if since.is_some_and(|at| now.duration_since(at) >= SUSPECT_TIMEOUT) {
+                        *since = None;
+                        // One still coming in is left to its own (size-aware) timeout below.
+                        if tiles[t].reassembler.oldest_partial().is_none() {
+                            needs.lost(t as u8);
+                        }
+                    }
+                }
+                let mut unknown = 0u64;
+                for (t, tile) in tiles.iter_mut().enumerate() {
+                    let timeout = if t == usize::from(FULL_FRAME_TILE) { FULL_PARTIAL_FRAME_TIMEOUT } else { PARTIAL_FRAME_TIMEOUT };
+                    if !tile.reassembler.has_stale_partial(timeout) {
+                        continue;
+                    }
+                    if needs.is_seen(t as u8) {
+                        needs.lost(t as u8);
+                    } else {
+                        // A tile this stream never showed: a leftover of the picture before, or
+                        // a tile whose whole update was this one frame. Asked for once: the
+                        // host ignores a tile it doesn't have.
+                        tile.reassembler.clear_partial();
+                        unknown |= 1u64 << t;
+                    }
+                }
+                if unknown != 0 {
+                    send_keyframe_request(shared, ctl, ClientMsg::RequestKeyframes { tiles: unknown });
+                }
+                if canvas.due(shared.slot.take_canvas_lost(), now) {
+                    // The decoders are fine, only the picture they drew is gone: every tile again.
+                    tracing::info!("view lost its picture: asking for every tile");
+                    send_keyframe_request(shared, ctl, ClientMsg::RequestKeyframe);
+                }
+                request_keyframes(&mut needs, &mut tiles, shared, ctl);
             }
+        }
+        // Updates needn't wait for tiles whose frames are dropped until their keyframe comes.
+        if needs.need != waiting {
+            waiting = needs.need;
+            shared.slot.set_waiting(waiting);
         }
     }
 }
 
-fn record_arrival(shared: &Shared, video: &VideoFrame, bytes: usize, received_us: u64) {
+/// Asks the host for every tile again when the view lost its picture: at most every
+/// [`KEYFRAME_RETRY`], so a view that keeps failing doesn't turn the stream into keyframes.
+#[derive(Default)]
+struct CanvasRepair {
+    pending: bool,
+    asked: Option<Instant>,
+}
+
+impl CanvasRepair {
+    /// `lost`: the view lost (part of) its picture since the last call. Returns whether to ask
+    /// for every tile now.
+    fn due(&mut self, lost: bool, now: Instant) -> bool {
+        self.pending |= lost;
+        if !self.pending || self.asked.is_some_and(|at| now.duration_since(at) < KEYFRAME_RETRY) {
+            return false;
+        }
+        self.pending = false;
+        self.asked = Some(now);
+        true
+    }
+}
+
+/// Whether a frame's tile is the one its datagrams named and lies inside its stream, where the
+/// renderer will copy it.
+fn tile_fits(video: &VideoFrame, t: u8) -> bool {
+    let tile = &video.tile;
+    tile.index == t
+        && tile.width > 0
+        && tile.height > 0
+        && tile.x.checked_add(tile.width).is_some_and(|right| right <= video.width)
+        && tile.y.checked_add(tile.height).is_some_and(|bottom| bottom <= video.height)
+}
+
+/// The tiles in a mask, lowest first.
+fn tiles_in(mask: u64) -> impl Iterator<Item = u8> {
+    (0..MAX_TILES as u8).filter(move |t| mask & (1u64 << t) != 0)
+}
+
+/// Tiles an update sent that never arrived. One with packets here from before `cutoff` (when
+/// the frames after the missing one started) lost the rest: the host sends an update only once
+/// the one before is out, and datagrams keep their order on a LAN; its decoder missed a frame, so
+/// it needs a keyframe now. Otherwise the frame may have been dropped by the host's encoder (its
+/// decoder is fine, and the host sends it again), or still be on its way: a suspect until its next
+/// frame says which, or [`SUSPECT_TIMEOUT`] passes (a frame still coming in is also watched by
+/// the stale-partial check). No `cutoff`: no packet counts as the missing frame's.
+fn suspect(
+    missing: u64,
+    suspects: &mut [Option<Instant>; MAX_TILES],
+    needs: &mut KeyframeNeeds,
+    tiles: &[TileState],
+    cutoff: Option<Instant>,
+    now: Instant,
+) {
+    for t in tiles_in(missing) {
+        if !needs.wanted(t) {
+            continue;
+        }
+        // Part of the stream even if no frame of it ever arrived.
+        needs.seen(t);
+        let partial = tiles[usize::from(t)].reassembler.oldest_partial();
+        if partial.zip(cutoff).is_some_and(|(since, cutoff)| since < cutoff) {
+            needs.lost(t);
+        } else {
+            suspects[usize::from(t)].get_or_insert(now);
+        }
+    }
+}
+
+/// Sends a keyframe request for the tiles that need one now, if any, and forgets their partial
+/// frames (the keyframe replaces them).
+fn request_keyframes(needs: &mut KeyframeNeeds, tiles: &mut [TileState], shared: &Shared, ctl: &mpsc::UnboundedSender<ClientMsg>) {
+    let Some((msg, asked)) = needs.due(Instant::now()) else { return };
+    for t in tiles_in(asked) {
+        tiles[usize::from(t)].reassembler.clear_partial();
+    }
+    send_keyframe_request(shared, ctl, msg);
+}
+
+fn send_keyframe_request(shared: &Shared, ctl: &mpsc::UnboundedSender<ClientMsg>, msg: ClientMsg) {
+    shared.stats.lock().unwrap().keyframe_requests += 1;
+    tracing::debug!(?msg, "keyframe request");
+    let _ = ctl.send(msg);
+}
+
+/// Which tiles wait for a keyframe, and when to ask (again) for each.
+struct KeyframeNeeds {
+    /// Until every part of the picture has had a keyframe (of its tile, or of the full frame),
+    /// ask for all tiles: a tile whose first keyframe never arrived at all is otherwise unknown
+    /// here, and its part of the picture would stay black.
+    all: bool,
+    all_asked: Instant,
+    /// Pixels in the stream, and how many of them tiles that had a keyframe cover (tiles of a
+    /// layout don't overlap).
+    area: u64,
+    covered: u64,
+    /// Tiles that had a keyframe since the stream started.
+    started: u64,
+    /// Tiles that had any frame of the stream (or that an update said it sent): only they are
+    /// asked for one at a time. (Before that, the request for every tile covers them; after, a
+    /// tile never seen isn't part of the stream, e.g. a leftover of a bigger picture before.)
+    seen: u64,
+    need: u64,
+    /// Tiles whose keyframes this Mac can't decode: asked for less often.
+    undecodable: u64,
+    asked: [Option<Instant>; MAX_TILES],
+    /// The full-frame stream doesn't decode here, and the host was told to stop using it.
+    full_off: bool,
+}
+
+impl KeyframeNeeds {
+    /// A new stream of size `stream` (None: none yet): its first keyframes are on their way, so
+    /// ask only if they don't arrive.
+    fn new(now: Instant, stream: Option<(u32, u32)>) -> Self {
+        Self {
+            all: true,
+            all_asked: now,
+            area: stream.map_or(u64::MAX, |(w, h)| u64::from(w) * u64::from(h)),
+            covered: 0,
+            started: 0,
+            seen: 0,
+            need: 0,
+            undecodable: 0,
+            asked: [None; MAX_TILES],
+            full_off: false,
+        }
+    }
+
+    /// The tiles that had a frame of this stream (see `seen`).
+    fn seen_mask(&self) -> u64 {
+        self.seen
+    }
+
+    /// Whether tile `t` is one this Mac shows (not the full frame once it's off).
+    fn wanted(&self, t: u8) -> bool {
+        !(self.full_off && t == FULL_FRAME_TILE)
+    }
+
+    /// The full-frame stream doesn't decode here: never wait or ask for it again.
+    fn drop_full(&mut self) {
+        self.full_off = true;
+        let bit = 1u64 << FULL_FRAME_TILE;
+        self.need &= !bit;
+        self.seen &= !bit;
+        self.undecodable &= !bit;
+    }
+
+    fn seen(&mut self, t: u8) {
+        if self.wanted(t) {
+            self.seen |= 1u64 << t;
+        }
+    }
+
+    fn is_seen(&self, t: u8) -> bool {
+        self.seen & (1u64 << t) != 0
+    }
+
+    /// Tile `t` needs a keyframe: asked for at the usual pace.
+    fn mark(&mut self, t: u8) {
+        if self.wanted(t) {
+            self.need |= 1u64 << t;
+        }
+    }
+
+    /// Tile `t` lost a frame (again). Like [`Self::mark`], and the full frame, asked for once
+    /// per loss (see [`Self::due`]), is asked for again.
+    fn lost(&mut self, t: u8) {
+        if !self.wanted(t) {
+            return;
+        }
+        self.mark(t);
+        if t == FULL_FRAME_TILE {
+            self.asked[usize::from(t)] = None;
+        }
+    }
+
+    /// A frame of tile `t` came while it waits for a keyframe. Full frames keep coming without
+    /// one long after it was asked for: the host didn't get the request, so ask again.
+    fn frame_while_needed(&mut self, t: u8, now: Instant) {
+        let retry = if self.undecodable & (1u64 << t) != 0 { UNDECODABLE_RETRY } else { KEYFRAME_RETRY };
+        if t == FULL_FRAME_TILE && self.asked[usize::from(t)].is_some_and(|at| now.duration_since(at) >= retry) {
+            self.asked[usize::from(t)] = None;
+        }
+    }
+
+    fn needs(&self, t: u8) -> bool {
+        self.need & (1u64 << t) != 0
+    }
+
+    /// An undecodable keyframe just arrived: asking again at once would only bring the same one.
+    fn set_undecodable(&mut self, t: u8, undecodable: bool, now: Instant) {
+        if undecodable {
+            self.undecodable |= 1u64 << t;
+            self.asked[usize::from(t)] = Some(now);
+        } else {
+            self.undecodable &= !(1u64 << t);
+        }
+    }
+
+    /// `tile` got a keyframe it decodes.
+    fn got_keyframe(&mut self, tile: &TileRect) {
+        let bit = tile.bit();
+        self.need &= !bit;
+        self.asked[usize::from(tile.index)] = None;
+        self.seen |= bit;
+        if self.started & bit == 0 {
+            self.started |= bit;
+            let area = if tile.index == FULL_FRAME_TILE { self.area } else { u64::from(tile.width) * u64::from(tile.height) };
+            self.covered = self.covered.saturating_add(area);
+        }
+        if self.covered >= self.area {
+            self.all = false;
+        }
+    }
+
+    /// How often to ask for every tile: rarely if all that is known to be missing is tiles this
+    /// Mac can't decode. (The full frame doesn't count: tiles may decode where it doesn't.)
+    fn all_retry(&self) -> Duration {
+        let waiting = self.seen & !self.started & !(1u64 << FULL_FRAME_TILE);
+        if waiting != 0 && waiting & !self.undecodable == 0 { UNDECODABLE_RETRY } else { KEYFRAME_RETRY }
+    }
+
+    /// The request to send now, if any, with the tiles it asks for: each tile at most every
+    /// [`KEYFRAME_RETRY`] (or [`UNDECODABLE_RETRY`]), so a lost keyframe is asked for again but
+    /// the host isn't flooded while one is on its way.
+    ///
+    /// Except the full frame: the host answers by sending every tile again at once and making its
+    /// next full frame a keyframe, which may not come for long (a still screen). Asking again
+    /// meanwhile would only send every tile again, so it is asked for once per loss.
+    fn due(&mut self, now: Instant) -> Option<(ClientMsg, u64)> {
+        let mut tiles = 0u64;
+        for t in 0..MAX_TILES {
+            let bit = 1u64 << t;
+            if self.need & self.seen & bit == 0 || (t == usize::from(FULL_FRAME_TILE) && self.asked[t].is_some()) {
+                continue;
+            }
+            let retry = if self.undecodable & bit != 0 { UNDECODABLE_RETRY } else { KEYFRAME_RETRY };
+            if self.asked[t].is_none_or(|at| now.duration_since(at) >= retry) {
+                tiles |= bit;
+            }
+        }
+        let all = self.all && now.duration_since(self.all_asked) >= self.all_retry();
+        if all {
+            self.all_asked = now;
+            tiles = self.need;
+        }
+        for (t, asked) in self.asked.iter_mut().enumerate() {
+            if tiles & (1u64 << t) != 0 {
+                *asked = Some(now);
+            }
+        }
+        match (all, tiles) {
+            (true, _) => Some((ClientMsg::RequestKeyframe, tiles)),
+            (false, 0) => None,
+            (false, tiles) => Some((ClientMsg::RequestKeyframes { tiles }, tiles)),
+        }
+    }
+}
+
+/// Frames of a size other than the stream's that aren't keyframes. Right after a switch they are
+/// stragglers of the picture before and stop at once; if they keep coming, they are the next
+/// picture and its keyframes were lost, and without one nothing of it can ever be shown.
+#[derive(Default)]
+struct OtherSize {
+    /// Their size, and since when they come.
+    since: Option<((u32, u32), Instant)>,
+    asked: Option<Instant>,
+}
+
+impl OtherSize {
+    /// A frame of `size` came (after `lost_before`: its tile lost frames before it, maybe its
+    /// keyframe). Returns whether to ask for keyframes of every tile now.
+    fn frame(&mut self, size: (u32, u32), lost_before: bool, now: Instant) -> bool {
+        let since = match self.since {
+            Some((s, at)) if s == size => at,
+            _ => self.since.insert((size, now)).1,
+        };
+        let lasting = lost_before || now.duration_since(since) >= KEYFRAME_RETRY;
+        let due = lasting && self.asked.is_none_or(|at| now.duration_since(at) >= KEYFRAME_RETRY);
+        if due {
+            self.asked = Some(now);
+        }
+        due
+    }
+}
+
+/// Wrapping-aware "update a comes after b".
+fn is_newer(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+/// The newest update while its tiles come in.
+struct PendingUpdate {
+    /// The tiles it sent, and those that arrived.
+    mask: u64,
+    got: u64,
+    bytes: usize,
+    since: Instant,
+}
+
+/// Tiles of updates that didn't come in whole.
+#[derive(Debug, Default, PartialEq)]
+struct Missing {
+    /// Tiles they sent that never came.
+    tiles: u64,
+    /// More updates than one were lost entirely: which tiles they had is unknown.
+    unknown: bool,
+}
+
+/// Follows updates (captured frames) by their masks. Counts updates, not tile frames, for the
+/// fps and Mbit/s readouts: an update is reported once, with the bytes of all its tiles, when
+/// they are all in, when a newer update starts, or after [`UPDATE_TIMEOUT`]. And finds tile
+/// frames that never came: the host sends updates in order, so tiles of an update still missing
+/// once a newer one arrives are missing for good, even if no datagram of them came; and update
+/// numbers count up by one, so an update lost entirely shows as a gap (its tiles are in the next
+/// one's `previous_mask`).
+#[derive(Default)]
+struct UpdateMeter {
+    /// Newest update seen.
+    newest: Option<u32>,
+    /// It, while tiles of it are still to come.
+    pending: Option<PendingUpdate>,
+    /// Bytes of late tiles, reported with the next update.
+    carry: usize,
+}
+
+impl UpdateMeter {
+    /// A frame of tile `bit` arrived, of `update` that sent the tiles in `mask` (and the update
+    /// before it those in `previous`). Returns what the updates before never delivered, if this
+    /// one ends them.
+    fn add(&mut self, update: u32, mask: u64, previous: u64, bit: u64, bytes: usize, now: Instant, mut report: impl FnMut(usize)) -> Missing {
+        let mut lost = Missing::default();
+        match self.newest {
+            Some(newest) if update == newest => match &mut self.pending {
+                Some(p) => {
+                    p.bytes += bytes;
+                    p.got |= bit;
+                    p.mask |= mask;
+                }
+                None => self.carry += bytes,
+            },
+            Some(newest) if !is_newer(update, newest) => match &mut self.pending {
+                Some(p) => p.bytes += bytes,
+                None => self.carry += bytes,
+            },
+            _ => {
+                if let Some(p) = self.pending.take() {
+                    report(p.bytes);
+                    lost.tiles = p.mask & !p.got;
+                    // The update right after it says what it really sent: its frames named what it
+                    // was to encode, before the host's encoder dropped any.
+                    if self.newest.is_some_and(|n| update.wrapping_sub(n) == 1) && previous != 0 {
+                        lost.tiles &= previous;
+                    }
+                }
+                if let Some(newest) = self.newest {
+                    lost = Self::skipped(lost, newest, update, previous);
+                }
+                self.newest = Some(update);
+                self.pending = Some(PendingUpdate { mask: mask | bit, got: bit, bytes: std::mem::take(&mut self.carry) + bytes, since: now });
+            }
+        }
+        if let Some(p) = &self.pending
+            && p.got & p.mask == p.mask
+        {
+            report(p.bytes);
+            self.pending = None;
+        }
+        lost
+    }
+
+    /// Reports what is pending and starts over (a new stream counts its updates afresh; what the
+    /// old one lost no longer matters).
+    fn flush(&mut self, mut report: impl FnMut(usize)) {
+        if let Some(p) = self.pending.take() {
+            report(p.bytes);
+        }
+        *self = Self::default();
+    }
+
+    /// What updates after `newest` and before `update` sent: none if they're next to each other;
+    /// else `previous` (the tiles of the one just before `update`), and if more than one is
+    /// missing, unknown tiles too.
+    fn skipped(mut lost: Missing, newest: u32, update: u32, previous: u64) -> Missing {
+        let gap = update.wrapping_sub(newest);
+        if gap >= 2 {
+            lost.tiles |= previous;
+            lost.unknown |= gap > 2;
+        }
+        lost
+    }
+
+    /// The host says the screen went still after `update`, which sent the tiles in `mask`:
+    /// whatever of it (or of updates before it) isn't here won't come any more. It counts as
+    /// seen from now on, so nothing is reported twice.
+    fn idle(&mut self, update: u32, mask: u64, mut report: impl FnMut(usize)) -> Missing {
+        let Some(newest) = self.newest else {
+            // Nothing of this stream came yet: the request for every tile covers it.
+            return Missing::default();
+        };
+        if update != newest && !is_newer(update, newest) {
+            return Missing::default(); // already past it
+        }
+        let mut missing = Missing::default();
+        if let Some(p) = self.pending.take() {
+            report(p.bytes);
+            // The note names what really went out of it (the host's encoder may have dropped some).
+            let sent = if update == newest { mask } else { u64::MAX };
+            missing.tiles = p.mask & sent & !p.got;
+        }
+        if update != newest {
+            // `update` came not at all, and what came between it and `newest` is unknown.
+            missing.tiles |= mask;
+            missing.unknown = update.wrapping_sub(newest) > 1;
+            self.newest = Some(update);
+        }
+        missing
+    }
+
+    /// Reports an update whose missing tiles are too late to wait for; returns them.
+    fn flush_stale(&mut self, now: Instant, mut report: impl FnMut(usize)) -> u64 {
+        match self.pending.take_if(|p| now.duration_since(p.since) >= UPDATE_TIMEOUT) {
+            Some(p) => {
+                report(p.bytes);
+                p.mask & !p.got
+            }
+            None => 0,
+        }
+    }
+}
+
+/// Notes a tile frame's arrival in the stats; returns the tiles lost whole before it (see
+/// [`UpdateMeter::add`]).
+fn record_arrival(shared: &Shared, meter: &mut UpdateMeter, video: &VideoFrame, bytes: usize, received_us: u64, now: Instant) -> Missing {
     let mut stats = shared.stats.lock().unwrap();
-    stats.on_frame_received(bytes);
+    let lost = meter.add(video.update, video.update_mask, video.previous_mask, video.tile.bit(), bytes, now, |sum| stats.on_frame_received(sum));
     stats.capture.add(video.encode_start_us.saturating_sub(video.capture_time_us) as f64);
     stats.encode.add(video.encoded_time_us.saturating_sub(video.encode_start_us) as f64);
     if let Some(encoded_local) = stats.clock.to_local(video.encoded_time_us) {
         stats.network.add(received_us.saturating_sub(encoded_local) as f64);
     }
+    lost
 }
 
-fn new_decoder(video: &VideoFrame, shared: &Arc<Shared>) -> Result<Decoder> {
-    let shared = shared.clone();
-    Decoder::new(video.codec, &video.param_sets, video.nal_length_size, move |decoded| {
-        let mut timing = *shared.decoding.lock().unwrap();
+/// When a warning repeated by every frame was last logged (µs, [`clock`]).
+static WRONG_SIZE_WARNED_US: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a warning that may repeat with every frame can be logged now: once a second at most.
+fn warn_now(last_us: &AtomicU64) -> bool {
+    let now = clock::now_us();
+    let last = last_us.load(Ordering::Relaxed);
+    (last == 0 || now.saturating_sub(last) >= 1_000_000)
+        && last_us.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_ok()
+}
+
+/// A decoder for one tile. Its callback (on a VideoToolbox thread) stamps the decode time and
+/// hands the tile to the view, or reports a failure back to [`receive_video`].
+fn new_decoder(
+    video: &VideoFrame,
+    shared: &Arc<Shared>,
+    events: &SessionEvents,
+    failed: &mpsc::UnboundedSender<DecodeFailed>,
+) -> Result<Decoder<TileMeta>> {
+    let (shared, events, failed) = (shared.clone(), events.clone(), failed.clone());
+    Decoder::new(video.codec, &video.param_sets, video.nal_length_size, move |decoded: DecodedFrame<TileMeta>| {
+        let DecodedFrame { image, tag: meta } = decoded;
+        let fail = |wrong_size| {
+            let _ = failed.send(DecodeFailed { tile: meta.tile.index, update: meta.update, seq: meta.seq, keyframe: meta.keyframe, wrong_size });
+        };
+        let Ok(pixel_buffer) = image else { return fail(false) };
+        // The renderer copies the picture into the tile's place: one of another size would land
+        // outside it, or leave part of it stale.
+        let size = (CVPixelBufferGetWidth(&pixel_buffer), CVPixelBufferGetHeight(&pixel_buffer));
+        if size != (meta.tile.width as usize, meta.tile.height as usize) {
+            if warn_now(&WRONG_SIZE_WARNED_US) {
+                tracing::warn!(tile = ?meta.tile, ?size, "decoded picture isn't its tile's size");
+            }
+            return fail(true);
+        }
+        let mut timing = meta.timing;
         timing.decoded_us = clock::now_us();
         {
             let mut stats = shared.stats.lock().unwrap();
             stats.decode.add(timing.decoded_us.saturating_sub(timing.received_us) as f64);
             stats.frames_decoded += 1;
         }
-        if let Some(probe) = shared.frame_probe.lock().unwrap().as_ref() {
-            probe(&decoded.pixel_buffer, timing);
+        if let Some(probe) = shared.frame_probe.read().unwrap().as_ref() {
+            probe(&ProbeFrame {
+                pixel_buffer: &pixel_buffer,
+                tile: meta.tile,
+                stream: meta.stream,
+                update: meta.update,
+                update_mask: meta.update_mask,
+                timing,
+            });
         }
-        shared.slot.publish(ReadyFrame { pixel_buffer: decoded.pixel_buffer, timing });
+        shared.slot.publish_tile(TileImage {
+            pixel_buffer,
+            tile: meta.tile,
+            stream: meta.stream,
+            update: meta.update,
+            update_mask: meta.update_mask,
+            timing,
+        });
+        flush_display(&shared, &events, Some(meta.stream));
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn requested(due: Option<(ClientMsg, u64)>) -> Option<u64> {
+        match due {
+            Some((ClientMsg::RequestKeyframes { tiles }, asked)) => {
+                assert_eq!(tiles, asked);
+                Some(tiles)
+            }
+            Some((ClientMsg::RequestKeyframe, _)) => Some(u64::MAX),
+            Some((other, _)) => panic!("unexpected {other:?}"),
+            None => None,
+        }
+    }
+
+    /// Tile `index` of a 200×400 stream cut into four rows of 200×100.
+    fn row(index: u8) -> TileRect {
+        TileRect { index, x: 0, y: u32::from(index) * 100, width: 200, height: 100 }
+    }
+
+    const STREAM: (u32, u32) = (200, 400);
+    const FULL: TileRect = TileRect { index: FULL_FRAME_TILE, x: 0, y: 0, width: 200, height: 400 };
+
+    #[test]
+    fn new_stream_asks_for_everything_only_if_keyframes_are_late() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        assert_eq!(requested(needs.due(t0)), None, "the first keyframes are on their way");
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY)), Some(u64::MAX));
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY * 3 / 2)), None, "paced");
+        // Three of the four rows arrive: still asking for all of them (the fourth is unknown).
+        for t in 0..3 {
+            needs.got_keyframe(&row(t));
+        }
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY * 2)), Some(u64::MAX));
+        needs.got_keyframe(&row(3));
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY * 10)), None, "the whole picture started");
+    }
+
+    #[test]
+    fn a_few_forced_tiles_dont_end_asking_for_everything() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        // The first frames of the stream to arrive are an update of only two tiles (keyframes
+        // the host was asked for, say): two rows of four are still unknown.
+        needs.got_keyframe(&row(1));
+        needs.got_keyframe(&row(2));
+        needs.got_keyframe(&row(2));
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY)), Some(u64::MAX));
+    }
+
+    #[test]
+    fn a_full_frame_starts_the_whole_picture_but_isnt_waited_for() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.got_keyframe(&FULL);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY * 5)), None);
+        // Tiles alone cover it too: the full-frame stream never has to start.
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        for t in 0..4 {
+            needs.got_keyframe(&row(t));
+        }
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY * 5)), None);
+        // Once started, a lost full frame is asked for like any tile.
+        needs.seen(FULL_FRAME_TILE);
+        needs.mark(FULL_FRAME_TILE);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY * 5)), Some(1 << 63));
+    }
+
+    #[test]
+    fn undecodable_from_the_start_is_asked_for_rarely() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        // Every keyframe of the stream arrives and can't be decoded.
+        for t in 0..4 {
+            needs.seen(t);
+            needs.set_undecodable(t, true, t0);
+            needs.mark(t);
+        }
+        for ms in (0..UNDECODABLE_RETRY.as_millis() as u64).step_by(20) {
+            assert_eq!(requested(needs.due(t0 + Duration::from_millis(ms))), None, "at {ms} ms");
+        }
+        assert_eq!(requested(needs.due(t0 + UNDECODABLE_RETRY)), Some(u64::MAX));
+        assert_eq!(requested(needs.due(t0 + UNDECODABLE_RETRY + KEYFRAME_RETRY)), None);
+    }
+
+    #[test]
+    fn an_undecodable_full_frame_doesnt_slow_asking_for_tiles() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        // The full frame is too big for this Mac's decoder; its tiles may not be.
+        needs.seen(FULL_FRAME_TILE);
+        needs.set_undecodable(FULL_FRAME_TILE, true, t0);
+        needs.mark(FULL_FRAME_TILE);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY / 2)), None);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY)), Some(u64::MAX));
+        // A decodable tile still missing next to an undecodable one: asked for at the usual pace.
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.seen(0);
+        needs.set_undecodable(0, true, t0);
+        needs.mark(0);
+        needs.seen(1);
+        needs.mark(1);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY)), Some(u64::MAX));
+    }
+
+    #[test]
+    fn lost_tiles_are_asked_for_together_and_paced_per_tile() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        for t in 0..4 {
+            needs.got_keyframe(&row(t));
+        }
+        needs.mark(1);
+        needs.mark(3);
+        assert!(needs.needs(1) && needs.needs(3) && !needs.needs(2));
+        assert_eq!(requested(needs.due(t0)), Some(1 << 1 | 1 << 3));
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY / 2)), None);
+        // Another tile breaks meanwhile: asked for at once, without repeating the others.
+        needs.lost(2);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY / 2)), Some(1 << 2));
+        needs.got_keyframe(&row(1));
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY)), Some(1 << 3), "1 is repaired, 2 not due yet");
+        // A repaired tile that breaks again is asked for right away.
+        needs.mark(1);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY)), Some(1 << 1));
+    }
+
+    #[test]
+    fn the_full_frame_is_asked_for_once_per_loss() {
+        let t0 = Instant::now();
+        let ms = |ms| t0 + Duration::from_millis(ms);
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.got_keyframe(&FULL);
+        needs.lost(FULL_FRAME_TILE);
+        assert_eq!(requested(needs.due(ms(0))), Some(1 << 63));
+        // The host sent every tile again; its next full frame is a keyframe, whenever that is.
+        assert_eq!(requested(needs.due(ms(10_000))), None);
+        // A stale partial of it again: lost again, asked again.
+        needs.lost(FULL_FRAME_TILE);
+        assert_eq!(requested(needs.due(ms(10_010))), Some(1 << 63));
+        // Full frames that aren't keyframes keep coming: the request went missing.
+        needs.frame_while_needed(FULL_FRAME_TILE, ms(10_100));
+        assert_eq!(requested(needs.due(ms(10_100))), None, "maybe sent before the host had it");
+        needs.frame_while_needed(FULL_FRAME_TILE, ms(10_010) + KEYFRAME_RETRY);
+        assert_eq!(requested(needs.due(ms(10_010) + KEYFRAME_RETRY)), Some(1 << 63));
+        // Tiles go on at their usual pace meanwhile.
+        needs.seen(1);
+        needs.lost(1);
+        assert_eq!(requested(needs.due(ms(20_000))), Some(1 << 1));
+        assert_eq!(requested(needs.due(ms(20_000) + KEYFRAME_RETRY)), Some(1 << 1));
+        needs.got_keyframe(&FULL);
+        needs.got_keyframe(&row(1));
+        assert_eq!(requested(needs.due(ms(30_000))), None);
+    }
+
+    #[test]
+    fn tiles_outside_the_stream_are_never_asked_for() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.got_keyframe(&FULL);
+        // Tile 9 isn't part of this stream (a stale partial of the picture before, say).
+        needs.mark(9);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY * 5)), None);
+        // Until a frame of it shows up after all.
+        needs.seen(9);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY * 5)), Some(1 << 9));
+    }
+
+    #[test]
+    fn undecodable_tiles_are_asked_for_rarely() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.got_keyframe(&FULL);
+        needs.seen(1);
+        needs.set_undecodable(1, true, t0);
+        needs.mark(1);
+        assert_eq!(requested(needs.due(t0)), None, "the keyframe that just came is the answer");
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY * 2)), None);
+        assert_eq!(requested(needs.due(t0 + UNDECODABLE_RETRY)), Some(1 << 1));
+        needs.set_undecodable(1, false, t0);
+        assert_eq!(requested(needs.due(t0 + UNDECODABLE_RETRY + KEYFRAME_RETRY)), Some(1 << 1));
+    }
+
+    #[test]
+    fn frames_of_another_size_ask_for_keyframes_only_if_they_keep_coming() {
+        let t0 = Instant::now();
+        let ms = |ms| t0 + Duration::from_millis(ms);
+        let mut other = OtherSize::default();
+        // Stragglers of the picture before: a few, for a moment.
+        assert!(!other.frame((640, 480), false, ms(0)));
+        assert!(!other.frame((640, 480), false, ms(30)));
+        // The next picture's P-frames keep coming: its keyframes were lost.
+        assert!(!other.frame((800, 600), false, ms(100)));
+        assert!(!other.frame((800, 600), false, ms(250)));
+        assert!(other.frame((800, 600), false, ms(300)));
+        assert!(!other.frame((800, 600), false, ms(400)), "paced");
+        assert!(other.frame((800, 600), false, ms(500)));
+        // A frame whose tile lost frames before it asks at once (paced all the same).
+        let mut other = OtherSize::default();
+        assert!(other.frame((800, 600), true, ms(0)));
+        assert!(!other.frame((800, 600), true, ms(100)));
+        assert!(other.frame((800, 600), true, ms(200)));
+    }
+
+    /// Runs `steps` of (update, mask, tile, bytes) through a meter: the bytes reported, and the
+    /// tiles found lost.
+    fn meter_run(steps: &[(u32, u64, u8, usize)]) -> (Vec<usize>, u64) {
+        let mut meter = UpdateMeter::default();
+        let (mut out, mut lost) = (Vec::new(), 0);
+        let now = Instant::now();
+        for &(update, mask, tile, bytes) in steps {
+            lost |= meter.add(update, mask, 0, 1 << tile, bytes, now, |b| out.push(b)).tiles;
+        }
+        (out, lost)
+    }
+
+    #[test]
+    fn meter_counts_updates_not_tiles() {
+        let reports = |steps: &[(u32, u64, u8, usize)]| meter_run(steps).0;
+        // Three tiles of update 7, then a one-tile update 8.
+        assert_eq!(reports(&[(7, 0b111, 0, 100), (7, 0b111, 1, 200), (7, 0b111, 2, 300), (8, 0b1, 0, 50)]), vec![600, 50]);
+        // Update 7 lost a tile: reported when 8 starts.
+        assert_eq!(reports(&[(7, 0b111, 0, 100), (7, 0b111, 2, 200), (8, 0b11, 0, 50), (8, 0b11, 1, 50)]), vec![300, 100]);
+        // A late tile of update 7 counts with the update in progress.
+        assert_eq!(reports(&[(7, 0b11, 0, 100), (8, 0b11, 0, 10), (7, 0b11, 1, 100), (8, 0b11, 1, 10)]), vec![100, 120]);
+        // ...or, when none is, with the next one.
+        assert_eq!(reports(&[(8, 0b1, 0, 10), (7, 0b11, 1, 100), (9, 0b1, 0, 1)]), vec![10, 101]);
+        // Update numbers wrap.
+        assert_eq!(reports(&[(u32::MAX, 0b11, 0, 1), (0, 0b1, 0, 2), (u32::MAX, 0b11, 1, 4), (1, 0b1, 0, 8)]), vec![1, 2, 12]);
+        // Completion goes by which tiles arrived, not how many: the full frame alone is a whole update.
+        assert_eq!(reports(&[(3, 1 << 63, 63, 500), (4, 0b101, 2, 5), (4, 0b101, 2, 5)]), vec![500]);
+    }
+
+    #[test]
+    fn meter_finds_tiles_lost_whole() {
+        // Tile 2 of update 7 never came: found when update 8 starts.
+        assert_eq!(meter_run(&[(7, 0b111, 0, 1), (7, 0b111, 1, 1), (8, 0b1, 0, 1)]).1, 0b100);
+        // Nothing is lost when every tile came, whatever their order.
+        assert_eq!(meter_run(&[(7, 0b110, 2, 1), (7, 0b110, 1, 1), (8, 0b1, 0, 1)]).1, 0);
+        // A lost full frame.
+        assert_eq!(meter_run(&[(7, 1 << 63, 0, 1), (8, 0b1, 0, 1)]).1, 1 << 63);
+        // A late tile of an older update finds nothing lost.
+        assert_eq!(meter_run(&[(7, 0b11, 0, 1), (7, 0b11, 1, 1), (8, 0b1, 0, 1), (6, 0b11, 1, 1)]).1, 0);
+    }
+
+    #[test]
+    fn meter_reports_incomplete_update_after_timeout() {
+        let mut meter = UpdateMeter::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        let none = Missing::default();
+        assert_eq!(meter.add(1, 0b1111, 0, 1 << 0, 100, t0, |b| out.push(b)), none);
+        assert_eq!(meter.add(1, 0b1111, 0, 1 << 3, 100, t0, |b| out.push(b)), none);
+        assert_eq!(meter.flush_stale(t0 + UPDATE_TIMEOUT / 2, |b| out.push(b)), 0);
+        assert!(out.is_empty());
+        assert_eq!(meter.flush_stale(t0 + UPDATE_TIMEOUT, |b| out.push(b)), 0b0110, "tiles 1 and 2 never came");
+        assert_eq!(out, vec![200]);
+        assert_eq!(meter.flush_stale(t0 + UPDATE_TIMEOUT * 2, |b| out.push(b)), 0, "found once");
+        // Its tile shows up after all: bytes go with the next update, not as a frame.
+        assert_eq!(meter.add(1, 0b1111, 0, 1 << 1, 7, t0, |b| out.push(b)), none);
+        assert_eq!(meter.add(2, 0b1, 0b1111, 1 << 0, 1, t0, |b| out.push(b)), none, "update 1 was already reported");
+        assert_eq!(out, vec![200, 8]);
+    }
+
+    #[test]
+    fn a_new_stream_forgets_what_the_old_one_lost() {
+        let mut meter = UpdateMeter::default();
+        let now = Instant::now();
+        meter.add(5, 0b11, 0, 0b01, 1, now, |_| {});
+        meter.flush(|_| {});
+        assert_eq!(meter.add(9, 0b1, 0b10, 0b1, 1, now, |_| {}), Missing::default(), "no gap from the old stream's numbers");
+    }
+
+    #[test]
+    fn lost_tiles_still_arriving_are_left_to_their_reassembler() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.got_keyframe(&FULL);
+        let mut tiles: Vec<TileState> = (0..MAX_TILES).map(|_| TileState::default()).collect();
+        // Tile 2's frame has some of its packets here; tile 3's none.
+        let packets = transport::video::Packetizer::for_tile(2).packetize(&[7; 5000], 1200).unwrap();
+        assert!(tiles[2].reassembler.push(&packets[0]).is_none());
+        std::thread::sleep(Duration::from_millis(1));
+        let mut suspects = [None; MAX_TILES];
+        // Packets of tile 2 that came before the next update's frames started: the rest were
+        // lost. A keyframe now. Nothing of tile 3 came: maybe the host's encoder dropped it.
+        let later = Instant::now();
+        suspect(1 << 2 | 1 << 3, &mut suspects, &mut needs, &tiles, Some(later), t0);
+        assert!(needs.needs(2) && !needs.needs(3));
+        assert!(suspects[2].is_none() && suspects[3] == Some(t0));
+        assert_eq!(requested(needs.due(t0)), Some(1 << 2), "never seen before, but the update said it was sent");
+        // Tile 3 stays a suspect, first noted when it was.
+        suspect(1 << 3, &mut suspects, &mut needs, &tiles, Some(later), t0 + SUSPECT_TIMEOUT);
+        assert_eq!(suspects[3], Some(t0));
+    }
+
+    /// A frame of a missing tile that started arriving only after the next update's frames did
+    /// may be the host's resend of it (its encoder dropped the missing one): a suspect, not a loss.
+    #[test]
+    fn a_resend_still_arriving_is_not_taken_for_a_loss() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.got_keyframe(&FULL);
+        let mut tiles: Vec<TileState> = (0..MAX_TILES).map(|_| TileState::default()).collect();
+        let cutoff = Instant::now();
+        std::thread::sleep(Duration::from_millis(1));
+        let packets = transport::video::Packetizer::for_tile(2).packetize(&[7; 5000], 1200).unwrap();
+        assert!(tiles[2].reassembler.push(&packets[0]).is_none());
+        let mut suspects = [None; MAX_TILES];
+        suspect(1 << 2, &mut suspects, &mut needs, &tiles, Some(cutoff), t0);
+        assert!(!needs.needs(2) && suspects[2] == Some(t0));
+        // Without a cutoff (the screen went still), packets here never count as the missing frame.
+        let mut suspects = [None; MAX_TILES];
+        suspect(1 << 2, &mut suspects, &mut needs, &tiles, None, t0);
+        assert!(!needs.needs(2) && suspects[2] == Some(t0));
+    }
+
+    #[test]
+    fn a_gap_in_update_numbers_names_what_was_lost() {
+        let now = Instant::now();
+        let mut meter = UpdateMeter::default();
+        let add = |meter: &mut UpdateMeter, update, mask, previous, tile: u8| meter.add(update, mask, previous, 1 << tile, 1, now, |_| {});
+        assert_eq!(add(&mut meter, 4, 0b1, 0, 0), Missing::default());
+        // Update 5 (tiles 2 and 3) never came at all: update 6 says what it had.
+        assert_eq!(add(&mut meter, 6, 0b1, 0b1100, 0), Missing { tiles: 0b1100, unknown: false });
+        // Two updates in a row: what the first had is unknown.
+        assert_eq!(add(&mut meter, 9, 0b1, 0b10, 0), Missing { tiles: 0b10, unknown: true });
+        // An update's frames name what it was to encode; the next one, what really went out: the
+        // tile the host's encoder dropped (and sends again) isn't missing.
+        let mut meter = UpdateMeter::default();
+        add(&mut meter, 1, 0b11, 0, 0);
+        assert_eq!(add(&mut meter, 2, 0b10, 0b01, 1), Missing::default());
+        // Numbers wrap.
+        let mut meter = UpdateMeter::default();
+        add(&mut meter, u32::MAX, 0b1, 0, 0);
+        assert_eq!(add(&mut meter, 1, 0b1, 0b100, 0), Missing { tiles: 0b100, unknown: false });
+    }
+
+    #[test]
+    fn the_host_saying_the_screen_is_still_finds_what_never_came() {
+        let now = Instant::now();
+        let mut meter = UpdateMeter::default();
+        let mut out = Vec::new();
+        assert_eq!(meter.idle(3, 0b1, |b| out.push(b)), Missing::default(), "nothing of the stream yet");
+        meter.add(3, 0b111, 0, 0b001, 10, now, |b| out.push(b));
+        meter.add(3, 0b111, 0, 0b100, 10, now, |b| out.push(b));
+        // The last update before the screen went still is 3: tile 1 isn't coming.
+        assert_eq!(meter.idle(3, 0b111, |b| out.push(b)), Missing { tiles: 0b010, unknown: false });
+        assert_eq!(out, vec![20]);
+        assert_eq!(meter.flush_stale(now + UPDATE_TIMEOUT, |b| out.push(b)), 0, "not twice");
+        // Update 4 (tiles 5 and 6) never came at all.
+        assert_eq!(meter.idle(4, 0b110_0000, |_| {}), Missing { tiles: 0b110_0000, unknown: false });
+        assert_eq!(meter.idle(4, 0b110_0000, |_| {}), Missing::default(), "said once");
+        // Two updates never came: the one before the last is unknown.
+        assert_eq!(meter.idle(6, 0b1, |_| {}), Missing { tiles: 0b1, unknown: true });
+        // An old note after newer updates: nothing.
+        assert_eq!(meter.idle(5, 0b1, |_| {}), Missing::default());
+    }
+
+    #[test]
+    fn a_view_that_keeps_losing_its_picture_is_repaired_at_a_pace() {
+        let t0 = Instant::now();
+        let mut canvas = CanvasRepair::default();
+        assert!(!canvas.due(false, t0));
+        assert!(canvas.due(true, t0));
+        assert!(!canvas.due(true, t0 + KEYFRAME_RETRY / 2), "asked just now");
+        // Still lost: asked again once it's time, even if not lost again since.
+        assert!(canvas.due(false, t0 + KEYFRAME_RETRY));
+        assert!(!canvas.due(false, t0 + KEYFRAME_RETRY * 3), "repaired");
+    }
+
+    #[test]
+    fn a_full_frame_this_mac_cant_decode_is_never_waited_for() {
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        for i in 0..4 {
+            needs.got_keyframe(&row(i));
+        }
+        needs.lost(FULL_FRAME_TILE);
+        needs.drop_full();
+        assert!(!needs.needs(FULL_FRAME_TILE));
+        needs.lost(FULL_FRAME_TILE);
+        needs.mark(FULL_FRAME_TILE);
+        needs.seen(FULL_FRAME_TILE);
+        assert!(!needs.needs(FULL_FRAME_TILE) && needs.seen_mask() & 1 << FULL_FRAME_TILE == 0);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY)), None);
+    }
+
+    #[test]
+    fn warnings_are_rate_limited() {
+        let last = AtomicU64::new(0);
+        assert!(warn_now(&last));
+        assert!(!warn_now(&last));
+        last.store(clock::now_us().saturating_sub(1_000_001).max(1), Ordering::Relaxed);
+        assert!(warn_now(&last));
+    }
+
+    #[test]
+    fn tiles_must_fit_their_stream() {
+        let mut video = VideoFrame {
+            codec: Codec::Hevc,
+            keyframe: false,
+            width: 6144,
+            height: 2560,
+            tile: TileRect { index: 15, x: 3072, y: 2240, width: 3072, height: 320 },
+            update: 1,
+            update_mask: 1 << 15,
+            previous_mask: 0,
+            capture_time_us: 0,
+            encode_start_us: 0,
+            encoded_time_us: 0,
+            param_sets: Vec::new(),
+            nal_length_size: 4,
+            data: Vec::new(),
+        };
+        assert!(tile_fits(&video, 15));
+        assert!(!tile_fits(&video, 14), "datagrams said another tile");
+        video.tile.height = 322;
+        assert!(!tile_fits(&video, 15));
+        video.tile.height = 320;
+        video.tile.x = u32::MAX;
+        assert!(!tile_fits(&video, 15), "no overflow");
+    }
 }

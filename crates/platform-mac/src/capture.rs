@@ -17,7 +17,7 @@ use objc2_core_video::{CVPixelBuffer, kCVImageBufferYCbCrMatrix_ITU_R_709_2};
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate,
-    SCStreamFrameInfoDisplayTime, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
+    SCStreamFrameInfoDirtyRects, SCStreamFrameInfoDisplayTime, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
 };
 
 use crate::clock;
@@ -49,6 +49,9 @@ pub struct CapturedFrame {
     pub pixel_buffer: CFRetained<CVPixelBuffer>,
     /// Host clock (µs) when the frame was shown on the host display.
     pub capture_time_us: u64,
+    /// What changed since the frame before, as ScreenCaptureKit says: `[left, top, right, bottom)`
+    /// in the frame's pixels. None if it didn't say.
+    pub dirty: Option<Vec<[u32; 4]>>,
 }
 
 // SAFETY: CVPixelBuffer is a thread-safe, reference-counted CoreFoundation object.
@@ -103,7 +106,8 @@ fn find_display(id: u32) -> Result<(SendRetained<SCShareableContent>, Retained<S
     }
 }
 
-fn native_pixel_size(display_id: u32) -> Option<(u32, u32)> {
+/// The display's size in pixels as it draws it now (points × backing scale).
+pub fn native_pixel_size(display_id: u32) -> Option<(u32, u32)> {
     let mode = CGDisplayCopyDisplayMode(display_id)?;
     let w = CGDisplayMode::pixel_width(Some(&mode));
     let h = CGDisplayMode::pixel_height(Some(&mode));
@@ -228,7 +232,26 @@ fn captured_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
         .map(|t| clock::mach_to_us(t.unsignedLongLongValue()))
         .unwrap_or_else(clock::now_us);
     let pixel_buffer = unsafe { sample.image_buffer() }?;
-    Some(CapturedFrame { pixel_buffer, capture_time_us })
+    let dirty = dirty_rects(&info);
+    Some(CapturedFrame { pixel_buffer, capture_time_us, dirty })
+}
+
+/// ScreenCaptureKit's dirty rectangles of a frame (CGRect dictionaries in the frame's pixels),
+/// rounded outwards to whole pixels.
+fn dirty_rects(info: &NSDictionary<NSString, NSNumber>) -> Option<Vec<[u32; 4]>> {
+    let value = info.objectForKey(unsafe { SCStreamFrameInfoDirtyRects })?;
+    // SAFETY: the value of this key is an NSArray of CGRect dictionaries (NSDictionary of
+    // NSString to NSNumber); the dictionary was typed with NSNumber values for the other keys.
+    let rects: &NSArray<NSDictionary<NSString, NSNumber>> =
+        unsafe { &*(&*value as *const NSNumber as *const NSArray<NSDictionary<NSString, NSNumber>>) };
+    let mut out = Vec::with_capacity(rects.count());
+    for rect in rects.iter() {
+        let field = |key: &str| rect.objectForKey(&NSString::from_str(key)).map(|n| n.doubleValue());
+        let (x, y, w, h) = (field("X")?, field("Y")?, field("Width")?, field("Height")?);
+        let edge = |v: f64| v.clamp(0.0, f64::from(u32::MAX)) as u32;
+        out.push([edge(x.floor()), edge(y.floor()), edge((x + w).ceil()), edge((y + h).ceil())]);
+    }
+    Some(out)
 }
 
 pub struct Capturer {
@@ -275,7 +298,7 @@ impl Capturer {
                 flags: CMTimeFlags::Valid,
                 epoch: 0,
             });
-            // One buffer is held back for keyframe re-encodes; keep slack for the pipeline.
+            // Frames go back once the tiler has copied them; keep slack for the pipeline.
             config.setQueueDepth(5);
             config.setShowsCursor(cfg.show_cursor);
             // `colorMatrix` is an unretained (assign) property, so it needs a CFString that

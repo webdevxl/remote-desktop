@@ -1,7 +1,11 @@
 //! Splits serialized video frames into datagrams and puts them back together.
 //!
+//! Each tile of the picture is its own stream of frames: it has its own packetizer on the host
+//! and its own reassembler on the client (route datagrams with [`tile_of`]), so tiles that
+//! finish encoding at different times never make each other look late.
+//!
 //! There is no retransmission: a frame that misses a packet is dropped, and the client asks the
-//! host for a keyframe (later milestones add FEC and reference-frame recovery).
+//! host for a keyframe of that tile.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -15,12 +19,19 @@ const MAX_PARTIAL_FRAMES: usize = 8;
 
 #[derive(Debug, Default)]
 pub struct Packetizer {
+    tile: u8,
     next_frame_id: u32,
 }
 
 impl Packetizer {
+    /// Packetizes tile 0 (the whole picture, when it isn't split).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Packetizes the frames of one tile.
+    pub fn for_tile(tile: u8) -> Self {
+        Self { tile, next_frame_id: 0 }
     }
 
     /// Splits `frame` into datagrams no larger than `max_datagram` bytes.
@@ -42,7 +53,7 @@ impl Packetizer {
             let start = (index as usize * chunk).min(frame.len());
             let end = (start + chunk).min(frame.len());
             let mut buf = Vec::with_capacity(VideoPacketHeader::LEN + end - start);
-            VideoPacketHeader { frame_id, index, count, total_len }.write(&mut buf);
+            VideoPacketHeader { tile: self.tile, frame_id, index, count, total_len }.write(&mut buf);
             buf.extend_from_slice(&frame[start..end]);
             out.push(Bytes::from(buf));
         }
@@ -57,6 +68,8 @@ pub struct Assembled {
     pub data: Vec<u8>,
     /// Frames between the previous delivered frame and this one that never completed.
     pub skipped: u32,
+    /// When its first packet arrived.
+    pub first_seen: Instant,
 }
 
 struct Partial {
@@ -72,6 +85,11 @@ struct Partial {
 pub struct Reassembler {
     partial: BTreeMap<u32, Partial>,
     last_delivered: Option<u32>,
+}
+
+/// The tile a datagram belongs to, or None if it isn't a valid video datagram.
+pub fn tile_of(datagram: &[u8]) -> Option<u8> {
+    VideoPacketHeader::parse(datagram).map(|(h, _)| h.tile)
 }
 
 /// Wrapping-aware "a comes after b".
@@ -129,7 +147,7 @@ impl Reassembler {
         // Anything older than this frame can no longer be shown.
         self.partial.retain(|&id, _| is_newer(id, h.frame_id));
         self.last_delivered = Some(h.frame_id);
-        Some(Assembled { frame_id: h.frame_id, data: done.buf, skipped })
+        Some(Assembled { frame_id: h.frame_id, data: done.buf, skipped, first_seen: done.first_seen })
     }
 
     /// True if some frame has been waiting for missing packets longer than `age`. On a static
@@ -138,9 +156,25 @@ impl Reassembler {
         self.partial.values().any(|p| p.first_seen.elapsed() > age)
     }
 
-    /// Forgets incomplete frames (e.g. after requesting a keyframe).
+    /// Forgets incomplete frames (e.g. after requesting a keyframe). Their packets still on the
+    /// way are ignored, rather than starting the same frame over (only to be given up again).
     pub fn clear_partial(&mut self) {
+        if let Some(newest) = self.partial.keys().copied().reduce(|a, b| if is_newer(b, a) { b } else { a })
+            && self.last_delivered.is_none_or(|last| is_newer(newest, last))
+        {
+            self.last_delivered = Some(newest);
+        }
         self.partial.clear();
+    }
+
+    /// When the first packet of the oldest frame still incomplete arrived, if any.
+    pub fn oldest_partial(&self) -> Option<Instant> {
+        self.partial.values().map(|p| p.first_seen).min()
+    }
+
+    /// Whether a frame has been delivered: later frames say how many were skipped since.
+    pub fn has_delivered(&self) -> bool {
+        self.last_delivered.is_some()
     }
 }
 
@@ -208,6 +242,25 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_frames_stay_abandoned() {
+        let mut p = Packetizer::new();
+        let mut r = Reassembler::new();
+        let f0 = p.packetize(&frame(5_000, 0), 1200).unwrap();
+        let f1 = p.packetize(&frame(5_000, 1), 1200).unwrap();
+        r.push(&f0[0]);
+        assert!(r.has_stale_partial(Duration::ZERO));
+        r.clear_partial();
+        // The rest of frame 0 arrives late: ignored, not a new partial frame.
+        for d in &f0[1..] {
+            assert!(r.push(d).is_none());
+        }
+        assert!(!r.has_stale_partial(Duration::ZERO));
+        // The next frame completes, and counts nothing skipped since the abandoned one.
+        let got = f1.iter().filter_map(|d| r.push(d)).next().unwrap();
+        assert_eq!((got.frame_id, got.skipped), (1, 0));
+    }
+
+    #[test]
     fn stale_partial_detected() {
         let mut p = Packetizer::new();
         let mut r = Reassembler::new();
@@ -224,9 +277,24 @@ mod tests {
         let mut r = Reassembler::new();
         assert!(r.push(&[1, 2, 3]).is_none());
         let mut bad = Vec::new();
-        VideoPacketHeader { frame_id: 0, index: 0, count: 2, total_len: 100 }.write(&mut bad);
+        VideoPacketHeader { tile: 0, frame_id: 0, index: 0, count: 2, total_len: 100 }.write(&mut bad);
         bad.extend_from_slice(&[0; 10]); // wrong chunk length
         assert!(r.push(&bad).is_none());
+    }
+
+    #[test]
+    fn tiles_count_frames_apart() {
+        let mut a = Packetizer::for_tile(3);
+        let mut b = Packetizer::for_tile(9);
+        let fa = a.packetize(&frame(3_000, 1), 1200).unwrap();
+        let fb = b.packetize(&frame(3_000, 2), 1200).unwrap();
+        assert!(fa.iter().all(|d| tile_of(d) == Some(3)));
+        assert!(fb.iter().all(|d| tile_of(d) == Some(9)));
+        assert_eq!(tile_of(&[0; 4]), None);
+        // Separate reassemblers: tile 9 finishing first doesn't abandon tile 3's frame.
+        let (mut ra, mut rb) = (Reassembler::new(), Reassembler::new());
+        assert!(fb.iter().filter_map(|d| rb.push(d)).next().is_some());
+        assert!(fa.iter().filter_map(|d| ra.push(d)).next().is_some());
     }
 
     #[test]

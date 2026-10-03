@@ -3,7 +3,9 @@
 //! One QUIC connection per session carries:
 //! - a bidirectional **control stream** of length-prefixed [`ClientMsg`] / [`HostMsg`],
 //! - unreliable **datagrams** host→client, each a [`VideoPacketHeader`] followed by a chunk of
-//!   a postcard-encoded [`VideoFrame`],
+//!   a postcard-encoded [`VideoFrame`]. The picture is split into tiles (see [`tile_layout`]),
+//!   each its own video stream: only tiles that changed are sent, and each one is decoded and
+//!   shown as soon as it arrives instead of waiting for the whole frame,
 //! - a unidirectional **input stream** client→host of length-prefixed [`InputMsg`], opened by
 //!   the client after `Welcome`. It is reliable and ordered, so a button press can never overtake
 //!   the move before it and every press reaches the host with its release.
@@ -14,7 +16,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const DEFAULT_PORT: u16 = 47800;
 pub const ALPN: &[u8] = b"lankvm/1";
 /// Upper bound for a single control message; protects against garbage length prefixes.
@@ -58,6 +60,13 @@ pub enum ClientMsg {
     /// Which of the host's displays to watch. The host answers with [`HostMsg::Display`] carrying
     /// the same `request` (1, 2, 3... per session, like [`ClientMsg::SetControl`]).
     SetDisplay { request: u32, display: DisplayChoice },
+    /// The client lost frames of some tiles (bit `i` is [`TileRect::index`] `i`) and can't decode
+    /// them until their next keyframe. [`ClientMsg::RequestKeyframe`] asks for every tile.
+    RequestKeyframes { tiles: u64 },
+    /// The client can't decode the full-frame stream ([`FULL_FRAME_TILE`]), though it decodes the
+    /// tiles (its decoder refuses the whole picture's size): send every change as tiles, for the
+    /// rest of the connection.
+    NoFullFrame,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -88,6 +97,10 @@ pub enum HostMsg {
     /// The display the client watches now, answering [`ClientMsg::SetDisplay`] or because it
     /// changed on the host's side. Frames of the new stream follow.
     Display(DisplayState),
+    /// The screen went still after `update`, which sent the tiles in `mask`: nothing follows
+    /// until it changes. Sent on the reliable control stream, so a client that lost that update
+    /// entirely (no newer one comes to reveal it) still learns which tiles to ask for again.
+    VideoIdle { update: u32, mask: u64 },
 }
 
 /// Which of the host's displays a client watches.
@@ -631,13 +644,104 @@ impl InputMsg {
     }
 }
 
-/// One encoded video frame, split across datagrams by the packetizer.
+/// Tile indexes a stream uses, the full-frame stream's included: tile masks are a `u64`.
+pub const MAX_TILES: usize = 64;
+
+/// The index of the stream that carries the whole picture as one tile. When most of the screen
+/// changes at once (scrolling, a new window), one encoder for the whole picture is faster than
+/// one per tile, so the host sends that frame there instead. Each tile stream and this one keep
+/// their own references, so the client just shows, for every part of the picture, the newest image
+/// that covers it. [`tile_layout`] never uses this index.
+pub const FULL_FRAME_TILE: u8 = (MAX_TILES - 1) as u8;
+
+/// One tile of the picture: a rectangle of the stream, in pixels, encoded as its own video stream
+/// (its own encoder on the host, its own decoder on the client).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TileRect {
+    /// Position in the stream's tile list, below [`MAX_TILES`].
+    pub index: u8,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl TileRect {
+    /// Bit of this tile in a tile mask.
+    pub fn bit(&self) -> u64 {
+        1u64 << self.index
+    }
+}
+
+/// Tile edges fall on multiples of this (one HEVC coding tree unit), except the stream's own
+/// right and bottom edges.
+pub const TILE_ALIGN: u32 = 64;
+/// Tiles are about this tall: small enough that typing or a menu re-encodes a sliver of the
+/// screen, big enough that a full-screen change doesn't pay per-tile overhead too many times.
+pub const TILE_TARGET_HEIGHT: u32 = 320;
+/// And at most this wide.
+pub const TILE_MAX_WIDTH: u32 = 4096;
+
+/// Splits a `width`×`height` stream into tiles: rows about [`TILE_TARGET_HEIGHT`] tall and
+/// columns at most [`TILE_MAX_WIDTH`] wide, edges on [`TILE_ALIGN`]. Row-major, top-left first.
+/// `grid` forces `(columns, rows)` instead (clamped so tiles stay at least [`TILE_ALIGN`] and
+/// there are fewer than [`MAX_TILES`]: the last index is [`FULL_FRAME_TILE`]); `(1, 1)` is one
+/// tile for the whole picture.
+pub fn tile_layout(width: u32, height: u32, grid: Option<(u32, u32)>) -> Vec<TileRect> {
+    let (width, height) = (width.max(2), height.max(2));
+    let (cols, rows) = grid.unwrap_or_else(|| {
+        (width.div_ceil(TILE_MAX_WIDTH), ((height + TILE_TARGET_HEIGHT / 2) / TILE_TARGET_HEIGHT).max(1))
+    });
+    // Each tile at least one alignment unit each way, and not more tiles than a mask holds.
+    let cols = cols.clamp(1, (width / TILE_ALIGN).clamp(1, MAX_TILES as u32 - 1));
+    let rows = rows.clamp(1, (height / TILE_ALIGN).max(1)).min(((MAX_TILES as u32 - 1) / cols).max(1));
+    let xs = edges(width, cols);
+    let ys = edges(height, rows);
+    let mut tiles = Vec::with_capacity(xs.len() * ys.len());
+    for y in ys.windows(2) {
+        for x in xs.windows(2) {
+            tiles.push(TileRect { index: tiles.len() as u8, x: x[0], y: y[0], width: x[1] - x[0], height: y[1] - y[0] });
+        }
+    }
+    tiles
+}
+
+/// `n` spans covering `0..len`, aligned to [`TILE_ALIGN`], as their `n + 1` edges. A remainder
+/// too small to be a span of its own joins the one before it.
+fn edges(len: u32, n: u32) -> Vec<u32> {
+    let step = len.div_ceil(n).div_ceil(TILE_ALIGN).max(1) * TILE_ALIGN;
+    let mut edges = vec![0];
+    let mut at = step;
+    while at < len {
+        edges.push(at);
+        at += step;
+    }
+    if edges.len() > 1 && len - edges[edges.len() - 1] < TILE_ALIGN {
+        edges.pop();
+    }
+    edges.push(len);
+    edges
+}
+
+/// One encoded update of one tile, split across datagrams by the packetizer.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct VideoFrame {
     pub codec: Codec,
     pub keyframe: bool,
+    /// Size of the whole stream; the tile is a part of it.
     pub width: u32,
     pub height: u32,
+    pub tile: TileRect,
+    /// Counts the host's captured frames that sent something, per connection (it keeps counting
+    /// across display switches) and wrapping. Every tile of one captured frame carries the same
+    /// number, so the client can show them together.
+    pub update: u32,
+    /// Which tiles that captured frame sent ([`TileRect::bit`]), this one included: the client
+    /// knows when it has all of them, and which one is missing if one never comes.
+    pub update_mask: u64,
+    /// `update_mask` of the update before (`update - 1`), so a client that lost every datagram of
+    /// that one still knows which tiles it missed (0 if unknown).
+    pub previous_mask: u64,
     /// Host clock (µs) when the frame was composited on the host display.
     pub capture_time_us: u64,
     /// Host clock (µs) when the frame went into the encoder.
@@ -655,6 +759,9 @@ pub struct VideoFrame {
 /// Header in front of every video datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoPacketHeader {
+    /// [`TileRect::index`] of the tile this datagram belongs to. Each tile counts its own
+    /// `frame_id`s and is reassembled on its own.
+    pub tile: u8,
     pub frame_id: u32,
     pub index: u16,
     pub count: u16,
@@ -663,9 +770,10 @@ pub struct VideoPacketHeader {
 }
 
 impl VideoPacketHeader {
-    pub const LEN: usize = 12;
+    pub const LEN: usize = 13;
 
     pub fn write(&self, out: &mut Vec<u8>) {
+        out.push(self.tile);
         out.extend_from_slice(&self.frame_id.to_le_bytes());
         out.extend_from_slice(&self.index.to_le_bytes());
         out.extend_from_slice(&self.count.to_le_bytes());
@@ -677,12 +785,13 @@ impl VideoPacketHeader {
             return None;
         }
         let header = Self {
-            frame_id: u32::from_le_bytes(buf[0..4].try_into().ok()?),
-            index: u16::from_le_bytes(buf[4..6].try_into().ok()?),
-            count: u16::from_le_bytes(buf[6..8].try_into().ok()?),
-            total_len: u32::from_le_bytes(buf[8..12].try_into().ok()?),
+            tile: buf[0],
+            frame_id: u32::from_le_bytes(buf[1..5].try_into().ok()?),
+            index: u16::from_le_bytes(buf[5..7].try_into().ok()?),
+            count: u16::from_le_bytes(buf[7..9].try_into().ok()?),
+            total_len: u32::from_le_bytes(buf[9..13].try_into().ok()?),
         };
-        if header.count == 0 || header.index >= header.count {
+        if header.count == 0 || header.index >= header.count || usize::from(header.tile) >= MAX_TILES {
             return None;
         }
         Some((header, &buf[Self::LEN..]))
@@ -728,7 +837,7 @@ mod tests {
 
     #[test]
     fn header_round_trip() {
-        let h = VideoPacketHeader { frame_id: 7, index: 3, count: 9, total_len: 12_345 };
+        let h = VideoPacketHeader { tile: 5, frame_id: 7, index: 3, count: 9, total_len: 12_345 };
         let mut buf = Vec::new();
         h.write(&mut buf);
         buf.extend_from_slice(b"payload");
@@ -739,11 +848,52 @@ mod tests {
 
     #[test]
     fn header_rejects_bad_index() {
-        let h = VideoPacketHeader { frame_id: 1, index: 4, count: 4, total_len: 10 };
+        let h = VideoPacketHeader { tile: 0, frame_id: 1, index: 4, count: 4, total_len: 10 };
         let mut buf = Vec::new();
         h.write(&mut buf);
         assert!(VideoPacketHeader::parse(&buf).is_none());
         assert!(VideoPacketHeader::parse(&buf[..5]).is_none());
+        let mut buf = Vec::new();
+        VideoPacketHeader { tile: MAX_TILES as u8, frame_id: 1, index: 0, count: 4, total_len: 10 }.write(&mut buf);
+        assert!(VideoPacketHeader::parse(&buf).is_none(), "tile out of range");
+    }
+
+    fn covers_exactly(width: u32, height: u32, tiles: &[TileRect]) {
+        let mut area = 0u64;
+        for (i, t) in tiles.iter().enumerate() {
+            assert_eq!(usize::from(t.index), i);
+            assert!(t.width >= 2 && t.height >= 2 && t.width % 2 == 0 && t.height % 2 == 0, "{t:?}");
+            assert!(t.x + t.width <= width && t.y + t.height <= height, "{t:?}");
+            area += u64::from(t.width) * u64::from(t.height);
+            for u in &tiles[..i] {
+                let apart = t.x >= u.x + u.width || u.x >= t.x + t.width || t.y >= u.y + u.height || u.y >= t.y + t.height;
+                assert!(apart, "{t:?} overlaps {u:?}");
+            }
+        }
+        assert_eq!(area, u64::from(width) * u64::from(height));
+        assert!(tiles.len() < MAX_TILES, "{} tiles: the last index is the full frame's", tiles.len());
+    }
+
+    #[test]
+    fn tile_layouts_cover_the_stream() {
+        let wide = tile_layout(6144, 2560, None);
+        assert_eq!(wide.len(), 16, "2 columns × 8 rows");
+        assert_eq!((wide[0].width, wide[0].height), (3072, 320));
+        assert_eq!((wide[15].x, wide[15].y), (3072, 2240));
+        covers_exactly(6144, 2560, &wide);
+        for (w, h) in [(4112, 2658), (3456, 2234), (2560, 1654), (1920, 1080), (1670, 1080), (640, 480), (8192, 4320), (64, 64), (2, 2), (130, 66)] {
+            covers_exactly(w, h, &tile_layout(w, h, None));
+        }
+        assert_eq!(tile_layout(1920, 1080, Some((1, 1))), vec![TileRect { index: 0, x: 0, y: 0, width: 1920, height: 1080 }]);
+        covers_exactly(8192, 4320, &tile_layout(8192, 4320, Some((64, 64))));
+        // No sliver tiles: a remainder too small for a row of its own joins the row above.
+        for h in (64..1200).step_by(2) {
+            for rows in 1..20 {
+                let tiles = tile_layout(256, h, Some((1, rows)));
+                covers_exactly(256, h, &tiles);
+                assert!(tiles.iter().all(|t| t.height >= TILE_ALIGN), "{h} px in {rows} rows: {tiles:?}");
+            }
+        }
     }
 
     /// `Hello` and `Rejected` are how mismatched versions find out about each other, so their
@@ -771,6 +921,9 @@ mod tests {
         assert_eq!(encode(&HostMsg::Control(state)).unwrap()[0], 5);
         assert_eq!(encode(&HostMsg::InputAck { seq: 0, received_us: 0, injected_us: 0 }).unwrap()[0], 8);
         assert_eq!(encode(&ClientMsg::SetDisplay { request: 1, display: DisplayChoice::Main }).unwrap(), [7, 1, 0]);
+        assert_eq!(encode(&ClientMsg::RequestKeyframes { tiles: 5 }).unwrap(), [8, 5]);
+        assert_eq!(encode(&ClientMsg::NoFullFrame).unwrap(), [9]);
+        assert_eq!(encode(&HostMsg::VideoIdle { update: 1, mask: 2 }).unwrap(), [10, 1, 2]);
         let state = DisplayState {
             request: 0,
             display: DisplayChoice::Main,

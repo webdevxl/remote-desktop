@@ -4,7 +4,7 @@
 #
 #   scripts/e2e-control.sh setup            # build, create identities, pre-pair host/viewer/probe
 #   scripts/e2e-control.sh host [record|hid|pid] # start the host copy (default: record, injects nothing)
-#   scripts/e2e-control.sh viewer           # start "LanKVM 2" as the viewer
+#   scripts/e2e-control.sh viewer           # start "LanKVM 2" as the viewer (connects itself, logs stats)
 #   scripts/e2e-control.sh lab              # start LanKVM Input Lab (logs what it receives)
 #   scripts/e2e-control.sh probe ARGS...    # run the headless viewer against the host copy
 #   scripts/e2e-control.sh stop             # quit the test copies
@@ -102,8 +102,11 @@ host)
     echo "host ($mode): pid $(holder "$HOST_PORT"), UDP $HOST_PORT, log $E2E/host/lankvm.log"
     ;;
 viewer)
-    LANKVM_NO_PROMPTS=1 LANKVM_APP="$APP" PORT="$VIEWER_PORT" DATA_DIR="$E2E/viewer" ./scripts/second-instance.sh --restart
-    echo "viewer: connect to 127.0.0.1:$HOST_PORT"
+    # Connects to the host copy by itself, and logs the overlay's stats (including on-screen
+    # latency) every second to $E2E/viewer/lankvm.log.
+    LANKVM_NO_PROMPTS=1 LANKVM_CONNECT="127.0.0.1:$HOST_PORT" LANKVM_LOG_STATS=1 LANKVM_APP="$APP" PORT="$VIEWER_PORT" \
+        DATA_DIR="$E2E/viewer" ./scripts/second-instance.sh --restart
+    echo "viewer: connecting to 127.0.0.1:$HOST_PORT; stats in $E2E/viewer/lankvm.log"
     ;;
 lab)
     stop_lab

@@ -28,7 +28,7 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use transport::identity::{DeviceIdentity, Fingerprint, short_hex};
 use transport::pairing::TrustStore;
 
-pub use crate::client::FrameProbe;
+pub use crate::client::{FrameProbe, ProbeFrame};
 pub use crate::stats::FrameTiming;
 use crate::client::{Session, SessionEvent, SessionInfo};
 
@@ -400,7 +400,7 @@ impl Core {
         }
     }
 
-    /// Test hook: calls `probe` with every decoded frame of the session.
+    /// Test hook: calls `probe` with every decoded tile of the session.
     pub fn set_frame_probe(&self, id: u64, probe: Option<FrameProbe>) {
         if let Some(s) = self.session(id) {
             s.set_frame_probe(probe);
@@ -579,7 +579,7 @@ fn data_dir() -> PathBuf {
 
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,wgpu_core=warn,wgpu_hal=warn,naga=warn"));
+        .unwrap_or_else(|_| EnvFilter::new("info"));
     // Log to a file too: a Finder-launched app has no terminal.
     let log_path = match data_dir_override() {
         Some(dir) => std::fs::create_dir_all(&dir).ok().map(|()| dir.join("lankvm.log")),

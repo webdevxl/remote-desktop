@@ -8,7 +8,7 @@
 
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -58,15 +58,19 @@ pub struct EncodedFrame {
     pub capture_time_us: u64,
     /// Host clock (µs) when the frame went into the encoder.
     pub encode_start_us: u64,
+    /// The tag passed to [`Encoder::encode`].
+    pub tag: u64,
 }
 
 type OutputFn = dyn Fn(EncodedFrame) + Send + Sync;
 
 /// A frame inside the encoder, matched to its output by `id` (the `sourceFrameRefcon`).
+#[derive(Clone, Copy)]
 struct InFlight {
     id: u64,
     capture_time_us: u64,
     encode_start_us: u64,
+    tag: u64,
 }
 
 struct Ctx {
@@ -74,11 +78,20 @@ struct Ctx {
     on_output: Box<OutputFn>,
     in_flight: Mutex<Vec<InFlight>>,
     idle: Condvar,
+    /// A frame may have gone into the encoder's references without reaching `on_output` (it
+    /// failed, or couldn't be read out): whoever decodes this stream can't decode the frames that
+    /// follow, so the next one is a keyframe.
+    broken: AtomicBool,
 }
 
 impl Ctx {
     fn new(codec: Codec, on_output: Box<OutputFn>) -> Self {
-        Self { codec, on_output, in_flight: Mutex::new(Vec::new()), idle: Condvar::new() }
+        Self { codec, on_output, in_flight: Mutex::new(Vec::new()), idle: Condvar::new(), broken: AtomicBool::new(false) }
+    }
+
+    /// The frame `id`, while it is in the encoder.
+    fn get(&self, id: u64) -> Option<InFlight> {
+        self.in_flight.lock().unwrap().iter().find(|f| f.id == id).copied()
     }
 
     /// Marks a frame as out of the encoder. None if it already was, so a frame is never
@@ -153,8 +166,12 @@ impl Encoder {
         unsafe { &*self.ctx }
     }
 
-    /// Submits a frame. Output arrives on the callback, usually within a few milliseconds.
-    pub fn encode(&self, pixel_buffer: &CVPixelBuffer, capture_time_us: u64, force_keyframe: bool) -> Result<()> {
+    /// Submits a frame. Output arrives on the callback, usually within a few milliseconds, with
+    /// `tag` in [`EncodedFrame::tag`]. A frame that never reaches the callback (dropped or failed)
+    /// is not referenced by later ones, except a failed one, after which the next is a keyframe.
+    pub fn encode(&self, pixel_buffer: &CVPixelBuffer, capture_time_us: u64, force_keyframe: bool, tag: u64) -> Result<()> {
+        let repair = self.ctx().broken.swap(false, Ordering::AcqRel);
+        let force_keyframe = repair || force_keyframe;
         // Presentation timestamps must strictly increase, even when re-encoding a held frame.
         let prev = self.last_pts_us.load(Ordering::Relaxed);
         let pts_us = capture_time_us.max(prev + 1);
@@ -167,7 +184,7 @@ impl Encoder {
         });
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let encode_start_us = clock::now_us();
-        self.ctx().in_flight.lock().unwrap().push(InFlight { id, capture_time_us, encode_start_us });
+        self.ctx().in_flight.lock().unwrap().push(InFlight { id, capture_time_us, encode_start_us, tag });
         let status = unsafe {
             self.session.encode_frame(
                 pixel_buffer,
@@ -180,12 +197,31 @@ impl Encoder {
         };
         if status != 0 {
             self.ctx().finish(id);
+            if repair {
+                // The keyframe that repairs the stream still has to come.
+                self.ctx().broken.store(true, Ordering::Release);
+            }
         }
         check(status, "VTCompressionSessionEncodeFrame")
     }
 
-    /// Waits until every submitted frame has come out of the encoder (its output callback has
-    /// started). Returns false on timeout.
+    /// Changes the average bitrate (and the matching hard cap) for the frames that follow.
+    pub fn set_bitrate(&self, bitrate_bps: u32) -> Result<()> {
+        // SAFETY: a VTCompressionSession is a VTSession.
+        let vt: &VTSession = unsafe { &*(&*self.session as *const VTCompressionSession as *const VTSession) };
+        unsafe {
+            check(
+                VTSessionSetProperty(vt, kVTCompressionPropertyKey_AverageBitRate, Some(CFNumber::new_i32(bitrate_bps as i32).as_ref())),
+                "set bitrate",
+            )?;
+            let _ = VTSessionSetProperty(vt, kVTCompressionPropertyKey_DataRateLimits, Some(data_rate_limits(bitrate_bps).as_ref()));
+        }
+        Ok(())
+    }
+
+    /// Waits until every submitted frame has come out of the encoder and its output callback has
+    /// returned (so whatever it did with the frame, e.g. send it, is done). Returns false on
+    /// timeout.
     pub fn wait_idle(&self, timeout: Duration) -> bool {
         let ctx = self.ctx();
         let in_flight = ctx.in_flight.lock().unwrap();
@@ -263,16 +299,19 @@ fn create_session(cfg: &EncoderConfig, codec: Codec, require_hardware: bool, ctx
         // Telling the encoder to expect 120 fps makes it finish each frame sooner (measured on an
         // M3 Max: about 1.5 ms less at 4112×2658), whatever the actual rate.
         set(kVTCompressionPropertyKey_ExpectedFrameRate, CFNumber::new_i32(cfg.fps.max(120) as i32).as_ref(), false)?;
-        // Hard cap: at most 2x the average over any one-second window.
-        let bytes = CFNumber::new_i64(i64::from(cfg.bitrate_bps) / 8 * 2);
-        let seconds = CFNumber::new_f64(1.0);
-        let limits = CFArray::from_objects(&[&*bytes, &*seconds]);
-        set(kVTCompressionPropertyKey_DataRateLimits, limits.as_ref(), false)?;
+        set(kVTCompressionPropertyKey_DataRateLimits, data_rate_limits(cfg.bitrate_bps).as_ref(), false)?;
         // Keyframes only on request (in practice; this is ten minutes).
         set(kVTCompressionPropertyKey_MaxKeyFrameInterval, CFNumber::new_i32((cfg.fps * 600) as i32).as_ref(), false)?;
         check(session.prepare_to_encode_frames(), "VTCompressionSessionPrepareToEncodeFrames")?;
     }
     Ok(session)
+}
+
+/// Hard cap: at most 2x the average over any one-second window.
+fn data_rate_limits(bitrate_bps: u32) -> CFRetained<CFArray<CFNumber>> {
+    let bytes = CFNumber::new_i64(i64::from(bitrate_bps) / 8 * 2);
+    let seconds = CFNumber::new_f64(1.0);
+    CFArray::from_objects(&[&*bytes, &*seconds])
 }
 
 fn uses_hardware(session: &VTCompressionSession) -> bool {
@@ -302,18 +341,31 @@ unsafe extern "C-unwind" fn output_callback(
     sample: *mut CMSampleBuffer,
 ) {
     let ctx = unsafe { &*(refcon as *const Ctx) };
-    let Some(frame) = ctx.finish(source_refcon as u64) else { return };
-    if status != 0 {
-        tracing::warn!("encode failed (OSStatus {status})");
-        return;
-    }
+    let id = source_refcon as u64;
+    // The frame counts as out only after its output was handled, so `wait_idle` covers that too.
+    let Some(frame) = ctx.get(id) else { return };
+    deliver(ctx, status, flags, unsafe { sample.as_ref() }, &frame);
+    ctx.finish(id);
+}
+
+fn deliver(ctx: &Ctx, status: i32, flags: VTEncodeInfoFlags, sample: Option<&CMSampleBuffer>, frame: &InFlight) {
+    // A dropped frame is skipped by the encoder's references; after any other loss here, they
+    // can't be trusted.
     if flags.contains(VTEncodeInfoFlags::FrameDropped) {
         return;
     }
-    let Some(sample) = (unsafe { sample.as_ref() }) else { return };
-    match encoded_frame(ctx.codec, sample, &frame) {
+    if status != 0 {
+        tracing::warn!("encode failed (OSStatus {status})");
+        ctx.broken.store(true, Ordering::Release);
+        return;
+    }
+    let Some(sample) = sample else { return };
+    match encoded_frame(ctx.codec, sample, frame) {
         Ok(frame) => (ctx.on_output)(frame),
-        Err(e) => tracing::warn!("read encoded frame: {e:#}"),
+        Err(e) => {
+            tracing::warn!("read encoded frame: {e:#}");
+            ctx.broken.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -336,6 +388,7 @@ fn encoded_frame(codec: Codec, sample: &CMSampleBuffer, frame: &InFlight) -> Res
         nal_length_size,
         capture_time_us: frame.capture_time_us,
         encode_start_us: frame.encode_start_us,
+        tag: frame.tag,
     })
 }
 

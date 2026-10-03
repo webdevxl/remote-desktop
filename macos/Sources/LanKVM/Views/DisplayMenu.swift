@@ -108,8 +108,8 @@ struct CustomDisplaySheet: View {
         _widthText = State(initialValue: String(draft.width))
         _heightText = State(initialValue: String(draft.height))
         _hidpi = State(initialValue: draft.hidpi)
-        // The fastest offered rate the screen it came from keeps up with, and that size allows.
-        let most = min(draft.refreshHz, DisplayLimits.maxRefresh(width: draft.width, height: draft.height))
+        // The fastest offered rate the screen it came from keeps up with.
+        let most = min(draft.refreshHz, DisplayLimits.maxRefresh)
         _refreshHz = State(initialValue: Self.refreshRates.last { $0 <= most } ?? 30)
     }
 
@@ -124,11 +124,6 @@ struct CustomDisplaySheet: View {
     private var problem: String? {
         guard let size else { return "Enter the width and the height in pixels." }
         return DisplayLimits.problem(width: size.width, height: size.height)
-    }
-
-    /// 120 Hz only up to 5.6 million pixels.
-    private var maxRefresh: UInt32 {
-        size.map { DisplayLimits.maxRefresh(width: $0.width, height: $0.height) } ?? 120
     }
 
     var body: some View {
@@ -164,7 +159,6 @@ struct CustomDisplaySheet: View {
                     Picker("Refresh", selection: $refreshHz) {
                         ForEach(Self.refreshRates, id: \.self) { hz in
                             Text("\(hz) Hz").tag(hz)
-                                .selectionDisabled(hz > maxRefresh)
                         }
                     }
                     .labelsHidden()
@@ -189,10 +183,6 @@ struct CustomDisplaySheet: View {
         .padding(24)
         .frame(width: 460)
         .background(Color.lkBackground)
-        // A size too big for 120 Hz goes down to 60 (the host would anyway).
-        .onChange(of: maxRefresh) { _, most in
-            if refreshHz > most { refreshHz = most }
-        }
     }
 
     /// A labelled line of the form, the labels right-aligned in a column of their own.
@@ -212,8 +202,9 @@ struct CustomDisplaySheet: View {
                 .foregroundStyle(Color.lkWarning)
         } else if let size {
             let display = RemoteDisplay(kind: .virtual, width: size.width, height: size.height, hidpi: hidpi, refreshHz: refreshHz)
-            // Roughly what the stream takes at that size and rate.
-            let mbps = min(max(Double(size.width) * Double(size.height) * Double(refreshHz) * 0.12 / 1_000_000, 8), 150)
+            // Roughly what the stream takes at that size: at most 60 fps worth, as the host
+            // spreads the same budget over more, smaller frames at 120.
+            let mbps = min(max(Double(size.width) * Double(size.height) * Double(min(refreshHz, 60)) * 0.12 / 1_000_000, 8), 150)
             VStack(alignment: .leading, spacing: 4) {
                 Text("Looks like \(display.looksLikeText) on “\(hostName)” · about \(Int(mbps.rounded())) Mbit/s at \(refreshHz) fps")
                 if String(size.width) != widthText.trimmingCharacters(in: .whitespaces)
@@ -229,7 +220,7 @@ struct CustomDisplaySheet: View {
     private func submit() {
         guard problem == nil, let size else { return }
         apply(RemoteDisplay(kind: .virtual, width: size.width, height: size.height, hidpi: hidpi,
-                            refreshHz: min(refreshHz, maxRefresh)))
+                            refreshHz: refreshHz))
     }
 }
 
@@ -244,8 +235,7 @@ struct DisplayDraft: Identifiable {
 
 /// A screen of this Mac as the display a host would make to fill it pixel for pixel: its size in
 /// pixels without the notch's strip (a full-screen window stays below it), rounded down to even;
-/// Retina when the screen is; and its refresh rate, at most 120 Hz, and 60 above 5.6 million
-/// pixels.
+/// Retina when the screen is; and its refresh rate, at most 120 Hz.
 struct ScreenFit: Identifiable, Equatable {
     let id: CGDirectDisplayID
     /// As macOS names it ("LG Ultrawide").
@@ -263,7 +253,7 @@ struct ScreenFit: Identifiable, Equatable {
         width = DisplayLimits.even(UInt32(max(0, (points.width * scale).rounded(.down))))
         height = DisplayLimits.even(UInt32(max(0, (points.height * scale).rounded(.down))))
         hidpi = scale >= 2
-        refreshHz = min(UInt32(max(30, screen.maximumFramesPerSecond)), DisplayLimits.maxRefresh(width: width, height: height))
+        refreshHz = min(UInt32(max(30, screen.maximumFramesPerSecond)), DisplayLimits.maxRefresh)
     }
 
     var size: CGSize { CGSize(width: Int(width), height: Int(height)) }
@@ -289,9 +279,9 @@ enum DisplayLimits {
     static let maxSide = UInt32(LK_DISPLAY_MAX_SIDE)
     static let maxPixels = UInt64(LK_DISPLAY_MAX_PIXELS)
     static let maxAspect = UInt64(LK_DISPLAY_MAX_ASPECT)
-    /// Above this many pixels a display refreshes at 60 Hz at most: 120 would take more than a
-    /// network usually carries.
-    static let maxPixelsAt120Hz: UInt64 = 5_600_000
+    /// The most often a display refreshes, in Hz, whatever its size: the host re-encodes only the
+    /// tiles of the picture that changed, several at once, and keeps the bit budget at 60 fps worth.
+    static let maxRefresh: UInt32 = 120
 
     /// Why a host wouldn't make a display this size, in words; nil if it would.
     static func problem(width: UInt32, height: UInt32) -> String? {
@@ -307,11 +297,6 @@ enum DisplayLimits {
     /// More pixels, or a longer side, than LanKVM makes.
     static func tooLarge(width: UInt32, height: UInt32) -> Bool {
         width > maxSide || height > maxSide || UInt64(width) * UInt64(height) > maxPixels
-    }
-
-    /// The most often a display this size refreshes, in Hz.
-    static func maxRefresh(width: UInt32, height: UInt32) -> UInt32 {
-        UInt64(width) * UInt64(height) > maxPixelsAt120Hz ? 60 : 120
     }
 
     /// Rounded down to even.

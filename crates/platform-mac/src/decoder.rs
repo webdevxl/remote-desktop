@@ -1,8 +1,13 @@
 //! Hardware video decoder (VideoToolbox). Output frames are IOSurface-backed, Metal-compatible
 //! NV12 pixel buffers, so the renderer can sample them without copying.
+//!
+//! Decoding is asynchronous: [`Decoder::decode`] only queues the frame, so the network task never
+//! waits for the hardware and the decoders of several tiles run in parallel.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
@@ -25,37 +30,69 @@ use crate::util::{check, dict};
 
 const PIXEL_FORMAT_NV12_FULL: i32 = i32::from_be_bytes(*b"420f");
 
-pub struct DecodedFrame {
-    pub pixel_buffer: CFRetained<CVPixelBuffer>,
-    /// The tag passed to [`Decoder::decode`].
-    pub tag: u64,
+/// What came out of the decoder for one submitted frame.
+pub struct DecodedFrame<T = u64> {
+    /// The picture, or the OSStatus saying why there is none (0 if the decoder dropped it).
+    /// After a failure the following frames reference a broken picture: ask for a keyframe.
+    pub image: Result<CFRetained<CVPixelBuffer>, i32>,
+    /// The tag passed to [`Decoder::decode`] with this frame.
+    pub tag: T,
 }
 
 // SAFETY: CVPixelBuffer is a thread-safe, reference-counted CoreFoundation object.
-unsafe impl Send for DecodedFrame {}
+unsafe impl<T: Send> Send for DecodedFrame<T> {}
 
-type FrameFn = dyn Fn(DecodedFrame) + Send + Sync;
+type FrameFn<T> = dyn Fn(DecodedFrame<T>) + Send + Sync;
 
-pub struct Decoder {
+/// Frames inside the decoder, in decode order, matched to their output by `id` (the
+/// `sourceFrameRefCon`), so any tag type can travel with them.
+struct InFlight<T> {
+    next_id: u64,
+    frames: VecDeque<(u64, T)>,
+}
+
+struct Ctx<T> {
+    on_frame: Box<FrameFn<T>>,
+    in_flight: Mutex<InFlight<T>>,
+}
+
+impl<T> Ctx<T> {
+    /// Takes a frame's tag out of the decoder. None if it already was, so a frame is never
+    /// finished twice whichever of the callback and a failed submit gets here first.
+    fn finish(&self, id: u64) -> Option<T> {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        // Output comes in decode order, so this is almost always the front.
+        let index = in_flight.frames.iter().position(|(i, _)| *i == id)?;
+        in_flight.frames.remove(index).map(|(_, tag)| tag)
+    }
+}
+
+pub struct Decoder<T = u64> {
     session: CFRetained<VTDecompressionSession>,
     format: CFRetained<CMFormatDescription>,
-    ctx: *mut Box<FrameFn>,
+    ctx: *mut Ctx<T>,
     codec: Codec,
     param_sets: Vec<Vec<u8>>,
 }
 
-// SAFETY: decode calls are serialized by the owner; `ctx` is freed only after invalidation.
-unsafe impl Send for Decoder {}
+// SAFETY: decode calls are serialized by the owner (`&self` but not `Sync`); `ctx` is shared with
+// the callbacks only through its mutex and freed only after invalidation.
+unsafe impl<T: Send> Send for Decoder<T> {}
 
-impl Decoder {
+impl<T: Send + 'static> Decoder<T> {
+    /// `on_frame` gets the result of every frame [`Decoder::decode`] accepted, on a VideoToolbox
+    /// thread, in decode order (see `decode` for a frame it refused).
     pub fn new(
         codec: Codec,
         param_sets: &[Vec<u8>],
         nal_length_size: u8,
-        on_frame: impl Fn(DecodedFrame) + Send + Sync + 'static,
+        on_frame: impl Fn(DecodedFrame<T>) + Send + Sync + 'static,
     ) -> Result<Self> {
         let format = format_description(codec, param_sets, nal_length_size)?;
-        let ctx: *mut Box<FrameFn> = Box::into_raw(Box::new(Box::new(on_frame)));
+        let ctx = Box::into_raw(Box::new(Ctx {
+            on_frame: Box::new(on_frame) as Box<FrameFn<T>>,
+            in_flight: Mutex::new(InFlight { next_id: 0, frames: VecDeque::new() }),
+        }));
 
         let surface_props: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(&[], &[]);
         let attrs = unsafe {
@@ -66,7 +103,7 @@ impl Decoder {
             ])
         };
         let record = VTDecompressionOutputCallbackRecord {
-            decompressionOutputCallback: Some(output_callback),
+            decompressionOutputCallback: Some(output_callback::<T>),
             decompressionOutputRefCon: ctx.cast(),
         };
         let mut raw: *mut VTDecompressionSession = ptr::null_mut();
@@ -97,8 +134,16 @@ impl Decoder {
         self.codec == codec && self.param_sets == param_sets
     }
 
-    /// Decodes one access unit synchronously; the callback runs before this returns.
-    pub fn decode(&self, data: &[u8], tag: u64) -> Result<()> {
+    fn ctx(&self) -> &Ctx<T> {
+        // SAFETY: `ctx` lives until Drop.
+        unsafe { &*self.ctx }
+    }
+
+    /// Queues one access unit and returns without waiting for it: the result reaches the
+    /// callback with `tag` once decoded. The callback sees `tag` at most once. If this returns an
+    /// error, it may already have: VideoToolbox can hand a frame's failure to the callback before
+    /// `DecodeFrame` returns it, so treat both as the same failure.
+    pub fn decode(&self, data: &[u8], tag: T) -> Result<()> {
         let len = data.len();
         let mut block: *mut CMBlockBuffer = ptr::null_mut();
         check(
@@ -142,26 +187,37 @@ impl Decoder {
         )?;
         let sample = unsafe { CFRetained::from_raw(NonNull::new(sample).context("null sample")?) };
 
+        let id = {
+            let mut in_flight = self.ctx().in_flight.lock().unwrap();
+            let id = in_flight.next_id;
+            in_flight.next_id = id.wrapping_add(1);
+            in_flight.frames.push_back((id, tag));
+            id
+        };
         let mut info = VTDecodeInfoFlags::empty();
-        check(
-            unsafe {
-                // No `1xRealTimePlayback` hint: it allows a low-power mode that decodes no faster
-                // than the frame rate, which adds latency to every frame.
-                self.session.decode_frame(
-                    &sample,
-                    VTDecodeFrameFlags::empty(),
-                    tag as *mut c_void,
-                    &mut info,
-                )
-            },
-            "VTDecompressionSessionDecodeFrame",
-        )
+        // Not under the lock: VideoToolbox may still run the callback on this thread.
+        let status = unsafe {
+            // No `1xRealTimePlayback` hint: it allows a low-power mode that decodes no faster
+            // than the frame rate, which adds latency to every frame.
+            self.session.decode_frame(
+                &sample,
+                VTDecodeFrameFlags::Frame_EnableAsynchronousDecompression,
+                id as *mut c_void,
+                &mut info,
+            )
+        };
+        if status != 0 {
+            // Unless the callback already had it.
+            self.ctx().finish(id);
+        }
+        check(status, "VTDecompressionSessionDecodeFrame")
     }
 }
 
-impl Drop for Decoder {
+impl<T> Drop for Decoder<T> {
     fn drop(&mut self) {
         unsafe {
+            // Every queued frame reaches the callback before this returns.
             self.session.wait_for_asynchronous_frames();
             self.session.invalidate();
             // SAFETY: the session is invalidated, so no callback can still see `ctx`.
@@ -194,22 +250,29 @@ fn format_description(codec: Codec, param_sets: &[Vec<u8>], nal_length_size: u8)
     Ok(unsafe { CFRetained::from_raw(NonNull::new(out as *mut CMFormatDescription).context("null format")?) })
 }
 
-unsafe extern "C-unwind" fn output_callback(
+unsafe extern "C-unwind" fn output_callback<T>(
     refcon: *mut c_void,
     source_refcon: *mut c_void,
     status: i32,
-    _flags: VTDecodeInfoFlags,
+    flags: VTDecodeInfoFlags,
     image: *mut CVImageBuffer,
     _pts: CMTime,
     _duration: CMTime,
 ) {
-    if status != 0 {
-        tracing::warn!("decode failed (OSStatus {status})");
-        return;
-    }
-    let Some(image) = NonNull::new(image) else { return };
-    let on_frame = unsafe { &*(refcon as *const Box<FrameFn>) };
-    // SAFETY: VideoToolbox hands us a borrowed, live image buffer; retaining keeps it alive.
-    let pixel_buffer = unsafe { CFRetained::retain(image) };
-    on_frame(DecodedFrame { pixel_buffer, tag: source_refcon as u64 });
+    let ctx = unsafe { &*(refcon as *const Ctx<T>) };
+    let Some(tag) = ctx.finish(source_refcon as u64) else { return };
+    let image = match NonNull::new(image) {
+        // SAFETY: VideoToolbox hands us a borrowed, live image buffer; retaining keeps it alive
+        // for as long as the renderer needs it, independent of the decoder's buffer pool.
+        Some(image) if status == 0 => Ok(unsafe { CFRetained::retain(image) }),
+        _ => {
+            if status != 0 {
+                tracing::warn!("decode failed (OSStatus {status})");
+            } else {
+                tracing::debug!(?flags, "decoder dropped a frame");
+            }
+            Err(status)
+        }
+    };
+    (ctx.on_frame)(DecodedFrame { image, tag });
 }

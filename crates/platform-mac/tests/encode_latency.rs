@@ -85,7 +85,7 @@ fn encode_latency() {
         let mut times = Vec::new();
         let mut bytes = 0;
         for (i, pb) in frames.iter().cycle().take(70).enumerate() {
-            encoder.encode(pb, clock::now_us(), i == 0).unwrap();
+            encoder.encode(pb, clock::now_us(), i == 0, 0).unwrap();
             let (us, len) = rx.recv_timeout(Duration::from_secs(2)).expect("encoded frame");
             // The first frames warm the encoder up.
             if i >= 10 {
