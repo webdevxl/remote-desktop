@@ -98,12 +98,6 @@ impl Samples {
         let i = ((v.len() - 1) as f64 * q.clamp(0.0, 1.0)).round() as usize;
         Some(v[i] / 1000.0)
     }
-
-    /// Samples kept now.
-    pub fn len(&mut self) -> usize {
-        self.trim(Instant::now());
-        self.samples.len()
-    }
 }
 
 /// Per-frame timing carried from reception to presentation (all on our clock, µs).
@@ -213,6 +207,7 @@ pub struct StatsView {
 impl Stats {
     const INPUT_LOG: usize = 512;
     /// A gap in what the host sends at least this long is a stall (see [`Stats::stalls`]).
+    #[allow(dead_code)] // Used by the viewer's stall detection, being added to client.rs.
     pub const STALL: Duration = Duration::from_millis(30);
 
     /// An update reached the screen.

@@ -15,6 +15,9 @@
 #
 # Env: LANKVM_APP (default target/release/LanKVM.app), PORT (default 47801),
 #      DATA_DIR (default ~/Library/Application Support/lankvm-2; pairings persist here).
+# Test settings pass through to it when set: LANKVM_NO_PROMPTS, LANKVM_INJECT, LANKVM_CONNECT,
+# LANKVM_CONNECT_DISPLAY, LANKVM_LOG_STATS, LANKVM_KEEP_WARM_MS, LANKVM_TILES,
+# LANKVM_FULL_FRAME_AT, LANKVM_MOTION, LANKVM_ENCODER_PROPS, MTL_HUD_ENABLED.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -54,7 +57,8 @@ fi
 mkdir -p "$DATA_DIR"
 # Pass through settings for test runs (e.g. LANKVM_NO_PROMPTS=1 from scripts/e2e-control.sh).
 extra=()
-for var in LANKVM_NO_PROMPTS LANKVM_INJECT LANKVM_CONNECT LANKVM_LOG_STATS; do
+for var in LANKVM_NO_PROMPTS LANKVM_INJECT LANKVM_CONNECT LANKVM_CONNECT_DISPLAY LANKVM_LOG_STATS LANKVM_KEEP_WARM_MS \
+    LANKVM_TILES LANKVM_FULL_FRAME_AT LANKVM_MOTION LANKVM_ENCODER_PROPS MTL_HUD_ENABLED; do
     [[ -n "${!var:-}" ]] && extra+=(--env "$var=${!var}")
 done
 open -n "$APP" --env LANKVM_PORT="$PORT" --env LANKVM_DATA_DIR="$DATA_DIR" ${extra[@]+"${extra[@]}"} \

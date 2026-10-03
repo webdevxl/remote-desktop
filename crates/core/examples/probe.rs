@@ -52,9 +52,24 @@
 //! which flips between black and white on every click) N times and times each click until the
 //! decoded video shows the change: input → host → app redraw → capture → encode → network →
 //! decode. Display (≈1 frame) is not included.
+//!
+//! Frame numbers (LanKVM Frame Source, scripts/frame-source.swift, draws its frame number in a
+//! strip of black and white squares on the host's screen):
+//!
+//!   probe HOST --virtual 2560x1600@2x --refresh 120 --barcode-log fs.jsonl [--trace updates.jsonl]
+//!   probe HOST --barcode X,Y,W,H [--barcode-scale 2] [--trace updates.jsonl]
+//!
+//! reads the number off every update decoded here, and reports per second and at the end how many
+//! source frames arrived (and how many never did), capture → decoded per update, and, joined with
+//! the source's log, source presented → decoded per frame. `--barcode-log` takes the strip's place
+//! from the source's log (its last "window" line, waited for); `--barcode` gives it in the captured
+//! display's points, converted with `--display WxH` or the display's pixels over `--barcode-scale`
+//! (default: 2 for a Retina virtual display, 1 for another, this Mac's main display's own scale).
+//! `--trace` writes a JSON line per finished update: {update, n, capture_local_us, decoded_us,
+//! tiles, bytes, new, full, motion} (n null where unreadable; new: the first update showing n).
 
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{BufRead, Read, Seek, Write};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -63,8 +78,8 @@ use lankvm_core::{Core, Event, ProbeFrame};
 use objc2_core_foundation::Type;
 use platform_mac::{CFRetained, CVPixelBuffer, clock};
 use protocol::{
-    Arrangement, DisplayChoice, DockAxis, FULL_FRAME_TILE, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction, TileRect,
-    VirtualDisplaySpec,
+    Arrangement, DisplayChoice, DockAxis, FULL_FRAME_TILE, GestureInput, GesturePhase, InputMsg, MOTION_FRAME_TILE, POS_MAX, ScrollInput,
+    SystemAction, TileRect, VirtualDisplaySpec,
 };
 use serde_json::Value;
 
@@ -88,6 +103,26 @@ struct Args {
     virtual_displays: Vec<VirtualDisplaySpec>,
     /// Then go back to the host's own screen.
     then_main: bool,
+    /// Where LanKVM Frame Source's frame number strip is, to read the frame each update shows.
+    barcode: Option<Barcode>,
+    /// The captured display's pixels per point, for `--barcode X,Y,W,H`.
+    barcode_scale: Option<f64>,
+    /// One JSON line per finished update goes here.
+    trace: Option<String>,
+}
+
+enum Barcode {
+    /// The source's log: its last "window" line says where the strip is, its "frame" lines when
+    /// each frame was presented.
+    Log(String),
+    /// The strip's rectangle in the captured display's points (16 squares).
+    Rect((f64, f64, f64, f64)),
+}
+
+/// "X,Y,W,H".
+fn rect_of(s: &str) -> Option<(f64, f64, f64, f64)> {
+    let v: Vec<f64> = s.split(',').map(|p| p.trim().parse().ok()).collect::<Option<_>>()?;
+    (v.len() == 4).then(|| (v[0], v[1], v[2], v[3]))
 }
 
 /// "6144x2560" or "6144x2560@2x".
@@ -120,6 +155,9 @@ fn parse_args() -> Result<Args, String> {
         fps: 120,
         virtual_displays: Vec::new(),
         then_main: false,
+        barcode: None,
+        barcode_scale: None,
+        trace: None,
     };
     let mut target = None;
     let mut arrangement = Arrangement::EXTEND;
@@ -131,13 +169,7 @@ fn parse_args() -> Result<Args, String> {
             "--control" => a.control = true,
             "--script" => a.script = Some(args.next().ok_or("--script needs a file")?),
             "--input-latency" => a.latency = Some(args.next().and_then(|s| s.parse().ok()).ok_or("--input-latency needs a count")?),
-            "--rect" => {
-                let v: Vec<f64> = args.next().unwrap_or_default().split(',').filter_map(|p| p.trim().parse().ok()).collect();
-                if v.len() != 4 {
-                    return Err("--rect needs X,Y,W,H".into());
-                }
-                a.rect = Some((v[0], v[1], v[2], v[3]));
-            }
+            "--rect" => a.rect = Some(args.next().as_deref().and_then(rect_of).ok_or("--rect needs X,Y,W,H")?),
             "--display" => a.display = Some(args.next().and_then(|s| pair_of(&s, 'x')).ok_or("--display needs WIDTHxHEIGHT")?),
             "--lab" => a.lab = Some(args.next().ok_or("--lab needs Input Lab's log file")?),
             "--fps" => a.fps = args.next().and_then(|s| s.parse().ok()).ok_or("--fps needs a number")?,
@@ -155,12 +187,18 @@ fn parse_args() -> Result<Args, String> {
             }
             "--then-main" => a.then_main = true,
             "--refresh" => refresh_hz = args.next().and_then(|s| s.parse().ok()).ok_or("--refresh needs a number")?,
+            "--barcode-log" => a.barcode = Some(Barcode::Log(args.next().ok_or("--barcode-log needs Frame Source's log file")?)),
+            "--barcode" => a.barcode = Some(Barcode::Rect(args.next().as_deref().and_then(rect_of).ok_or("--barcode needs X,Y,W,H")?)),
+            "--barcode-scale" => {
+                a.barcode_scale = Some(args.next().and_then(|s| s.parse().ok()).filter(|s: &f64| *s > 0.0).ok_or("--barcode-scale needs a number")?)
+            }
+            "--trace" => a.trace = Some(args.next().ok_or("--trace needs a file")?),
             _ if target.is_none() && !arg.starts_with('-') => target = Some(arg),
             _ => return Err(format!("unexpected argument {arg}")),
         }
     }
     a.target = target.ok_or(
-        "usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--virtual WxH[@2x] [--arrange extend|main|only] [--refresh HZ]] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]]",
+        "usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--virtual WxH[@2x] [--arrange extend|main|only] [--refresh HZ]] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]] [--barcode-log FILE | --barcode X,Y,W,H [--barcode-scale S]] [--trace FILE]",
     )?;
     if (a.script.is_some() || a.latency.is_some()) && !a.control {
         return Err("--script and --input-latency need --control".into());
@@ -193,6 +231,18 @@ fn main() -> ExitCode {
         unsafe { std::env::set_var("LANKVM_PORT", "0") };
     }
 
+    // Tiles decoded before the strip's place is known are kept to read it from.
+    let mut watch = Watch { latest: args.barcode.is_some().then(HashMap::new), ..Default::default() };
+    if let Some(path) = &args.trace {
+        match std::fs::File::create(path) {
+            Ok(file) => watch.trace = Some(std::io::BufWriter::new(file)),
+            Err(e) => {
+                eprintln!("--trace {path}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     let (tx, events) = mpsc::channel();
     let core = match Core::start(Arc::new(move |e| drop(tx.send(e)))) {
         Ok(c) => c,
@@ -202,7 +252,20 @@ fn main() -> ExitCode {
         }
     };
     let id = core.connect(&args.target, args.max, args.fps);
-    let mut probe = Probe { core: core.clone(), id, events, pending: Vec::new(), lab: Default::default(), updates: Arc::default() };
+    let source = match &args.barcode {
+        Some(Barcode::Log(path)) => Some(SourceLog::new(path)),
+        _ => None,
+    };
+    let mut probe = Probe {
+        core: core.clone(),
+        id,
+        events,
+        pending: Vec::new(),
+        lab: Default::default(),
+        watch: Arc::new(Mutex::new(watch)),
+        source,
+        shown: None,
+    };
     let code = probe.run(&args);
     core.disconnect(id);
     // Skip tearing down the runtime and capture threads; the OS cleans up.
@@ -213,6 +276,8 @@ fn main() -> ExitCode {
 struct Shown {
     kind: &'static str,
     stream: (u32, u32, u32),
+    /// The display's own size in pixels (the stream's for the host's own screen).
+    pixels: (u32, u32),
     hidpi: bool,
     arrangement: &'static str,
     reason: u16,
@@ -246,8 +311,12 @@ struct Probe {
     pending: Vec<Event>,
     /// Named rectangles (points, top-left origin) from Input Lab.
     lab: HashMap<String, (f64, f64, f64, f64)>,
-    /// Whole updates' latency, fed by every frame probe this installs.
-    updates: Arc<Mutex<UpdateTimes>>,
+    /// What every frame probe this installs (but the input-latency one) learns.
+    watch: Arc<Mutex<Watch>>,
+    /// Frame Source's log, given `--barcode-log`.
+    source: Option<SourceLog>,
+    /// The display the host shows now.
+    shown: Option<Shown>,
 }
 
 /// Times whole updates: from the host showing a frame to the last of its tiles decoded here (the
@@ -257,10 +326,22 @@ struct UpdateTimes {
     /// By update: the tiles it sent, those decoded, its capture time (our clock), and the newest
     /// decode time.
     pending: HashMap<u32, (u64, u64, Option<u64>, u64)>,
-    /// Finished updates' latency, ms.
+    /// Finished updates' latency, ms, since the last `take`.
     samples: Vec<f64>,
+    /// And since the last `take_all`.
+    all: Vec<f64>,
     /// Newest update seen.
     newest: Option<u32>,
+}
+
+/// An update all of whose tiles were decoded.
+struct Finished {
+    update: u32,
+    /// Its tiles ([`protocol::VideoFrame::update_mask`]).
+    mask: u64,
+    /// Captured on the host (our clock, µs), and its last tile decoded.
+    captured: Option<u64>,
+    decoded: u64,
 }
 
 /// Wrapping-aware "update a comes after b".
@@ -269,16 +350,21 @@ fn is_newer(a: u32, b: u32) -> bool {
 }
 
 impl UpdateTimes {
-    fn tile(&mut self, f: &ProbeFrame<'_>) {
+    /// Takes in a decoded tile; returns its update if that was its last tile.
+    fn tile(&mut self, f: &ProbeFrame<'_>) -> Option<Finished> {
         let entry = self.pending.entry(f.update).or_insert((0, 0, f.timing.capture_local_us, 0));
         entry.0 |= f.update_mask;
         entry.1 |= f.tile.bit();
         entry.3 = entry.3.max(f.timing.decoded_us);
+        let mut finished = None;
         if entry.1 & entry.0 == entry.0 {
-            let (_, _, captured, decoded) = self.pending.remove(&f.update).expect("just seen");
+            let (mask, _, captured, decoded) = self.pending.remove(&f.update).expect("just seen");
             if let Some(captured) = captured {
-                self.samples.push(decoded.saturating_sub(captured) as f64 / 1000.0);
+                let ms = decoded.saturating_sub(captured) as f64 / 1000.0;
+                self.samples.push(ms);
+                self.all.push(ms);
             }
+            finished = Some(Finished { update: f.update, mask, captured, decoded });
         }
         // Updates that lost a tile never finish (decoders finish in any order: go by the newest).
         if self.newest.is_none_or(|n| is_newer(f.update, n)) {
@@ -288,10 +374,308 @@ impl UpdateTimes {
             let newest = self.newest.unwrap_or(f.update);
             self.pending.retain(|&u, _| newest.wrapping_sub(u) < 32);
         }
+        finished
     }
 
     fn take(&mut self) -> Vec<f64> {
         std::mem::take(&mut self.samples)
+    }
+
+    fn take_all(&mut self) -> Vec<f64> {
+        std::mem::take(&mut self.all)
+    }
+}
+
+/// What the probe learns from every decoded tile: when whole updates finish, which source frame
+/// each shows, and the trace of them.
+#[derive(Default)]
+struct Watch {
+    updates: UpdateTimes,
+    /// Frame Source's strip, once its place is known.
+    strip: Option<Strip>,
+    /// Until then (given a strip to look for), each tile's latest picture, (picture, tile, stream,
+    /// update): read once the place is known, since a square whose tile doesn't change again
+    /// (a high bit of the frame number) would otherwise stay unread for long.
+    latest: Option<HashMap<u8, (Picture, TileRect, (u32, u32), u32)>>,
+    frames: SourceFrames,
+    trace: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl Watch {
+    fn tile(&mut self, f: &ProbeFrame<'_>) {
+        match (&mut self.strip, &mut self.latest) {
+            (Some(strip), _) => strip.sample(f.pixel_buffer, f.tile, f.stream, f.update),
+            (None, Some(latest)) => {
+                if latest.get(&f.tile.index).is_none_or(|l| is_newer(f.update, l.3)) {
+                    latest.insert(f.tile.index, (Picture(f.pixel_buffer.retain()), f.tile, f.stream, f.update));
+                }
+            }
+            (None, None) => {}
+        }
+        let Some(done) = self.updates.tile(f) else { return };
+        let read = self.strip.as_ref().map(|s| (s.read(done.update), s.modulus()));
+        let n = read.map(|(n, modulus)| self.frames.finished(n, modulus, done.captured, done.decoded));
+        if let Some(trace) = &mut self.trace {
+            let (n, new) = match n.flatten() {
+                Some((n, new)) => (Some(n), new),
+                None => (None, false),
+            };
+            let line = serde_json::json!({
+                "update": done.update,
+                "n": n,
+                "capture_local_us": done.captured,
+                "decoded_us": done.decoded,
+                "tiles": done.mask.count_ones(),
+                // Not known here yet: the frame probe doesn't see the encoded size.
+                "bytes": Value::Null,
+                "new": new,
+                "full": done.mask & (1 << FULL_FRAME_TILE) != 0,
+                "motion": done.mask & (1 << MOTION_FRAME_TILE) != 0,
+            });
+            let _ = writeln!(trace, "{line}");
+        }
+    }
+
+    /// Puts the strip in place, and reads it off the tiles decoded before, oldest first.
+    fn place_strip(&mut self, mut strip: Strip) {
+        let mut latest: Vec<_> = self.latest.take().unwrap_or_default().into_values().collect();
+        // Update numbers wrap: order them by how far they are from one of them.
+        let reference = latest.first().map_or(0, |l| l.3);
+        latest.sort_by_key(|l| l.3.wrapping_sub(reference) as i32);
+        for (picture, tile, stream, update) in &latest {
+            strip.sample(&picture.0, *tile, *stream, *update);
+        }
+        self.strip = Some(strip);
+    }
+}
+
+/// LanKVM Frame Source's frame number strip (scripts/frame-source.swift): a row of squares, each
+/// white or black, that spell the frame number in Gray code, bit 0 leftmost. Every decoded tile
+/// that covers a square says what that square shows from its update on; an update's frame number
+/// is what the squares show as of that update. Decoders finish in any order, so that is the
+/// newest sample from an update not newer than it, not the latest sample.
+struct Strip {
+    /// Where it is (x, y, width, height), and the size of the display it's on, in that display's
+    /// points.
+    rect: (f64, f64, f64, f64),
+    display: (f64, f64),
+    squares: usize,
+    /// The stream the samples are of: another size starts over.
+    stream: (u32, u32),
+    /// Per square: recent samples, (update, white or black, or None when it's neither).
+    seen: Vec<Vec<(u32, Option<bool>)>>,
+}
+
+/// Samples kept per square: enough for the updates in flight, with the newest of a square that
+/// rarely changes among them (only the tiles over a square sample it).
+const STRIP_SAMPLES: usize = 32;
+
+/// How far from mid-grey (128) a square must be to count as white or black: anything else (the
+/// desktop before the source draws, a half-decoded picture) is no frame number.
+const STRIP_MARGIN: f64 = 48.0;
+
+impl Strip {
+    fn new(rect: (f64, f64, f64, f64), display: (f64, f64), squares: usize) -> Self {
+        let squares = squares.clamp(1, 31);
+        Self { rect, display, squares, stream: (0, 0), seen: vec![Vec::new(); squares] }
+    }
+
+    /// The strip's numbers count modulo this.
+    fn modulus(&self) -> u64 {
+        1 << self.squares
+    }
+
+    /// Square `i`'s inner 60% (clear of its edges, which compression and scaling blur) in pixels
+    /// of a `stream`-sized stream, as (x0, y0, x1, y1).
+    fn square(&self, i: usize, stream: (u32, u32)) -> (f64, f64, f64, f64) {
+        let (fx, fy) = (f64::from(stream.0) / self.display.0, f64::from(stream.1) / self.display.1);
+        let side = self.rect.2 / self.squares as f64;
+        let (x, y, h) = (self.rect.0 + side * i as f64, self.rect.1, self.rect.3);
+        ((x + side * 0.2) * fx, (y + h * 0.2) * fy, (x + side * 0.8) * fx, (y + h * 0.8) * fy)
+    }
+
+    /// Samples the squares that `tile`, decoded for `update` of a `stream`-sized stream, covers.
+    /// A whole-picture frame's tile is the whole stream, however small its picture (the motion
+    /// stream's): `part_luma` maps through the tile's rectangle.
+    fn sample(&mut self, pixel_buffer: &CVPixelBuffer, tile: TileRect, stream: (u32, u32), update: u32) {
+        if stream != self.stream {
+            self.stream = stream;
+            self.seen.iter_mut().for_each(Vec::clear);
+        }
+        let (tx, ty) = (f64::from(tile.x), f64::from(tile.y));
+        let (tx1, ty1) = (tx + f64::from(tile.width), ty + f64::from(tile.height));
+        for i in 0..self.squares {
+            let (x0, y0, x1, y1) = self.square(i, stream);
+            let part = (x0.max(tx), y0.max(ty), x1.min(tx1), y1.min(ty1));
+            if part.2 - part.0 < 1.0 || part.3 - part.1 < 1.0 {
+                continue;
+            }
+            // A square is one colour: any part of it says which.
+            let white = part_luma(pixel_buffer, &tile, part).and_then(|luma| {
+                if luma >= 128.0 + STRIP_MARGIN {
+                    Some(true)
+                } else if luma <= 128.0 - STRIP_MARGIN {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            let seen = &mut self.seen[i];
+            seen.push((update, white));
+            if seen.len() > STRIP_SAMPLES {
+                // The oldest goes: the furthest back from this update.
+                let oldest = (0..seen.len()).max_by_key(|&j| update.wrapping_sub(seen[j].0) as i32).expect("not empty");
+                seen.remove(oldest);
+            }
+        }
+    }
+
+    /// The frame number (modulo [`Strip::modulus`]) shown as of `update`, if every square has
+    /// been seen and is white or black.
+    fn read(&self, update: u32) -> Option<u32> {
+        let mut gray = 0u32;
+        for (i, seen) in self.seen.iter().enumerate() {
+            // The newest sample not newer than `update`; two of one update (a square across tiles)
+            // must agree.
+            let mut best: Option<(u32, Option<bool>)> = None;
+            for &(u, white) in seen.iter().filter(|(u, _)| !is_newer(*u, update)) {
+                best = match best {
+                    Some((b, _)) if is_newer(b, u) => best,
+                    Some((b, w)) if b == u && w != white => Some((b, None)),
+                    _ => Some((u, white)),
+                };
+            }
+            if best?.1? {
+                gray |= 1 << i;
+            }
+        }
+        Some(gray_decode(gray))
+    }
+}
+
+/// The number whose Gray code is `gray`.
+fn gray_decode(gray: u32) -> u32 {
+    let (mut n, mut shift) = (gray, gray >> 1);
+    while shift != 0 {
+        n ^= shift;
+        shift >>= 1;
+    }
+    n
+}
+
+/// A jump in frame numbers bigger than this, either way, is no frame skipped or late: the source
+/// started over (or the first number read wasn't one), and counting starts again from there.
+const MAX_FRAME_JUMP: u64 = 1024;
+
+/// The source frames finished updates showed, in the order they finished.
+#[derive(Default)]
+struct SourceFrames {
+    /// The newest frame shown, counted from the source's start (the strip's number wraps).
+    newest: Option<u64>,
+    /// Frames as they first showed: (frame, its update's capture time, decoded time; µs).
+    shown: Vec<(u64, Option<u64>, u64)>,
+    /// Frames passed over: shown by the source, in no update here (or not in time for one).
+    skipped: u64,
+    /// Updates that showed an older frame than one already shown: they finished late.
+    late: u64,
+    /// Updates whose frame number couldn't be read.
+    unread: u64,
+    /// Times counting started over (see [`MAX_FRAME_JUMP`]).
+    restarts: u64,
+}
+
+impl SourceFrames {
+    /// An update finished showing frame `n` (modulo `modulus`), or one that couldn't be read.
+    /// Returns the frame counted from the source's start, and whether it's the first update
+    /// showing it.
+    fn finished(&mut self, n: Option<u32>, modulus: u64, captured: Option<u64>, decoded: u64) -> Option<(u64, bool)> {
+        let Some(n) = n else {
+            self.unread += 1;
+            return None;
+        };
+        let n = u64::from(n);
+        let Some(newest) = self.newest else {
+            self.newest = Some(n);
+            self.shown.push((n, captured, decoded));
+            return Some((n, true));
+        };
+        // The step from the newest, the short way round.
+        let step = (n + modulus - newest % modulus) % modulus;
+        let back = modulus - step;
+        if step == 0 {
+            Some((newest, false))
+        } else if step <= MAX_FRAME_JUMP {
+            let frame = newest + step;
+            self.skipped += step - 1;
+            self.newest = Some(frame);
+            self.shown.push((frame, captured, decoded));
+            Some((frame, true))
+        } else if back <= MAX_FRAME_JUMP && back <= newest {
+            self.late += 1;
+            Some((newest - back, false))
+        } else {
+            self.restarts += 1;
+            self.newest = Some(n);
+            self.shown.push((n, captured, decoded));
+            Some((n, true))
+        }
+    }
+}
+
+/// LanKVM Frame Source's log, read as it grows (the probe starts before the source does): where
+/// its strip is, and when each frame reached the screen.
+struct SourceLog {
+    path: String,
+    /// Bytes of complete lines read so far.
+    read: u64,
+    /// The strip's place from the latest "window" line: rectangle and screen size in points,
+    /// and its squares.
+    strip: Option<((f64, f64, f64, f64), (f64, f64), usize)>,
+    /// Frame → when it was presented (µs, the mach clock this probe's times are on too), for the
+    /// frames that reached the screen.
+    presented: HashMap<u64, u64>,
+    /// Frames drawn.
+    frames: u64,
+}
+
+impl SourceLog {
+    fn new(path: &str) -> Self {
+        Self { path: path.to_string(), read: 0, strip: None, presented: HashMap::new(), frames: 0 }
+    }
+
+    /// Reads the lines written since the last time.
+    fn poll(&mut self) {
+        let Ok(mut file) = std::fs::File::open(&self.path) else { return };
+        if file.metadata().is_ok_and(|m| m.len() < self.read) {
+            *self = Self::new(&self.path); // a new run of the source
+        }
+        let mut text = Vec::new();
+        if file.seek(std::io::SeekFrom::Start(self.read)).is_err() || file.read_to_end(&mut text).is_err() {
+            return;
+        }
+        // The last line may be half written: it waits for the next time.
+        let Some(end) = text.iter().rposition(|&b| b == b'\n') else { return };
+        for line in text[..end].split(|&b| b == b'\n') {
+            let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
+            match v["type"].as_str() {
+                Some("frame") => {
+                    self.frames += 1;
+                    if let (Some(n), Some(at)) = (v["n"].as_u64(), v["presented_us"].as_u64().filter(|&t| t > 0)) {
+                        self.presented.insert(n, at);
+                    }
+                }
+                Some("window") => {
+                    let numbers = |key: &str| v[key].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect::<Vec<_>>()).unwrap_or_default();
+                    let (rect, screen) = (numbers("strip_points"), numbers("screen_points"));
+                    if rect.len() == 4 && screen.len() == 2 {
+                        let squares = v["squares"].as_u64().unwrap_or(16) as usize;
+                        self.strip = Some(((rect[0], rect[1], rect[2], rect[3]), (screen[0], screen[1]), squares));
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.read += end as u64 + 1;
     }
 }
 
@@ -321,14 +705,16 @@ impl Probe {
         }
         if !args.virtual_displays.is_empty() {
             let size = Arc::new(Mutex::new(None));
-            let (sink, updates) = (size.clone(), self.updates.clone());
+            let (sink, watch) = (size.clone(), self.watch.clone());
             self.core.set_frame_probe(
                 self.id,
                 Some(Box::new(move |f| {
-                    // The stream's size, as long as the tile decoded to its own size.
+                    // The stream's size, as long as the tile decoded to its own size (the motion
+                    // stream's pictures are smaller by design: scaled up to the stream's size).
                     let decoded = platform_mac::gpu::frame_size(f.pixel_buffer);
-                    *sink.lock().unwrap() = Some(if decoded == (f.tile.width, f.tile.height) { f.stream } else { decoded });
-                    updates.lock().unwrap().tile(f);
+                    let whole = decoded == (f.tile.width, f.tile.height) || f.tile.index == MOTION_FRAME_TILE;
+                    *sink.lock().unwrap() = Some(if whole { f.stream } else { decoded });
+                    watch.lock().unwrap().tile(f);
                 })),
             );
             let steps = args.virtual_displays.iter().map(|spec| DisplayChoice::Virtual(*spec));
@@ -392,7 +778,9 @@ impl Probe {
         let want = match self.display(request, Duration::from_secs(30)) {
             Some(shown) if shown.reason == 0 => {
                 println!("{shown} after {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
-                (shown.stream.0, shown.stream.1)
+                let want = (shown.stream.0, shown.stream.1);
+                self.shown = Some(shown);
+                want
             }
             Some(shown) => {
                 println!("FAIL: {shown}");
@@ -420,6 +808,7 @@ impl Probe {
             Event::Display { info, reason, message, .. } => Shown {
                 kind: info.display.kind,
                 stream: (info.width, info.height, info.fps),
+                pixels: (info.display.width, info.display.height),
                 hidpi: info.display.hidpi,
                 arrangement: info.display.arrangement,
                 reason,
@@ -473,6 +862,7 @@ impl Probe {
                     let shown = Shown {
                         kind: info.display.kind,
                         stream: (info.width, info.height, info.fps),
+                        pixels: (info.display.width, info.display.height),
                         hidpi: info.display.hidpi,
                         arrangement: info.display.arrangement,
                         reason: 0,
@@ -480,6 +870,7 @@ impl Probe {
                         unavailable: info.display_unavailable,
                     };
                     println!("{shown}");
+                    self.shown = Some(shown);
                     return Ok(());
                 }
                 Ok(Event::Ended { error, .. }) => {
@@ -813,21 +1204,39 @@ impl Probe {
     fn watch_video(&mut self, args: &Args) -> i32 {
         let ms = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.1}"));
         if args.virtual_displays.is_empty() {
-            let updates = self.updates.clone();
-            self.core.set_frame_probe(self.id, Some(Box::new(move |f| updates.lock().unwrap().tile(f))));
+            let watch = self.watch.clone();
+            self.core.set_frame_probe(self.id, Some(Box::new(move |f| watch.lock().unwrap().tile(f))));
         }
+        {
+            // This watch's own numbers: an earlier step's were reported with it.
+            let mut watch = self.watch.lock().unwrap();
+            watch.updates.take_all();
+            watch.frames = SourceFrames::default();
+            if matches!(args.barcode, Some(Barcode::Rect(_))) {
+                watch.strip = None; // placed on the display shown now
+            }
+            if args.barcode.is_some() && watch.strip.is_none() {
+                watch.latest.get_or_insert_default();
+            }
+        }
+        self.find_strip(args);
+        // Per-second deltas of the source frames' counts.
+        let mut before = (0, 0, 0, 0);
         let streaming = Instant::now();
         let mut ended = None;
         for second in 1..=args.seconds {
             let deadline = streaming + Duration::from_secs(second);
             while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-                match self.events.recv_timeout(left) {
+                // The source starts after the probe: look for its strip often until it's there.
+                let looking = matches!(args.barcode, Some(Barcode::Log(_))) && self.watch.lock().unwrap().strip.is_none();
+                match self.events.recv_timeout(if looking { left.min(STRIP_LOOK_INTERVAL) } else { left }) {
                     Ok(Event::Ended { error, .. }) => {
                         ended = Some(error.unwrap_or_else(|| "closed by host".into()));
                         break;
                     }
                     Ok(_) => {}
-                    Err(_) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => self.find_strip(args),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
             if ended.is_some() {
@@ -838,11 +1247,11 @@ impl Probe {
                 (Some(c), Some(e), Some(n), Some(d)) => Some(c + e + n + d),
                 _ => None,
             };
-            let mut whole = self.updates.lock().unwrap().take();
+            let whole = self.watch.lock().unwrap().updates.take();
             let whole = if whole.is_empty() {
                 "-".to_string()
             } else {
-                format!("{:.1}/{:.1}", percentile(&mut whole, 0.5), percentile(&mut whole, 0.9))
+                format!("{:.1}/{:.1}", percentile(&whole, 0.5), percentile(&whole, 0.9))
             };
             println!(
                 "{second:>3}s  {:>3.0} fps  {:>6.1} Mbps  update capture→decoded p50/p90 {whole} ms  per tile {:>5} ms (capture {} + encode {} + network {} + decode {})  rtt {} ms  decoded {}  lost {}  keyframe requests {}",
@@ -858,8 +1267,10 @@ impl Probe {
                 s.frames_lost,
                 s.keyframe_requests
             );
+            self.report_second(&mut before);
         }
 
+        self.report_frames(args);
         let decoded = self.core.session_stats(self.id).map_or(0, |s| s.frames_decoded);
         match ended {
             Some(reason) => {
@@ -876,7 +1287,164 @@ impl Probe {
             }
         }
     }
+
+    /// Puts Frame Source's strip in place once its place is known (at once for `--barcode`; from
+    /// the source's log for `--barcode-log`, which may come later or change).
+    fn find_strip(&mut self, args: &Args) {
+        let place = match &args.barcode {
+            None => return,
+            Some(Barcode::Rect(rect)) => {
+                if self.watch.lock().unwrap().strip.is_some() {
+                    return;
+                }
+                (*rect, self.display_points(args), 16)
+            }
+            Some(Barcode::Log(_)) => {
+                let Some(source) = &mut self.source else { return };
+                source.poll();
+                let Some(place) = source.strip else { return };
+                place
+            }
+        };
+        let mut watch = self.watch.lock().unwrap();
+        if watch.strip.as_ref().is_some_and(|s| (s.rect, s.display, s.squares) == place) {
+            return;
+        }
+        let ((x, y, w, h), (dw, dh), squares) = place;
+        println!("frame numbers: {squares} squares at {x},{y} ({w}x{h} pt) on a {dw}x{dh} pt display");
+        watch.place_strip(Strip::new(place.0, place.1, place.2));
+    }
+
+    /// The captured display's size in points, for `--barcode`: `--display`; else the display
+    /// shown, its pixels over `--barcode-scale` (default 2 for a Retina virtual display, 1 for
+    /// another, and this Mac's main display's own).
+    fn display_points(&self, args: &Args) -> (f64, f64) {
+        if let Some(display) = args.display {
+            return display;
+        }
+        match &self.shown {
+            Some(shown) if shown.kind == "virtual" => {
+                let scale = args.barcode_scale.unwrap_or(if shown.hidpi { 2.0 } else { 1.0 });
+                (f64::from(shown.pixels.0) / scale, f64::from(shown.pixels.1) / scale)
+            }
+            _ => match args.barcode_scale {
+                Some(scale) => {
+                    let main = platform_mac::capture::main_display_bounds();
+                    (f64::from(main.width) / scale, f64::from(main.height) / scale)
+                }
+                None => main_display_points(),
+            },
+        }
+    }
+
+    /// The source frames of the last second: how many showed, were skipped or late, and source
+    /// presented → decoded for those whose presentation is in the source's log by now. `before`:
+    /// the counts at the last report (frames shown, skipped, late, unread).
+    fn report_second(&mut self, before: &mut (usize, u64, u64, u64)) {
+        if let Some(source) = &mut self.source {
+            source.poll();
+        }
+        let watch = self.watch.lock().unwrap();
+        if watch.strip.is_none() {
+            return;
+        }
+        let f = &watch.frames;
+        let new = &f.shown[before.0.min(f.shown.len())..];
+        let delays = self.presented_to_decoded(new).0;
+        let delays = if delays.is_empty() {
+            "-".to_string()
+        } else {
+            format!("{:.1}/{:.1}/{:.1}", percentile(&delays, 0.5), percentile(&delays, 0.95), percentile(&delays, 0.99))
+        };
+        println!(
+            "      source frames {:>3} new (n {}), {} skipped, {} late, {} unread  presented→decoded p50/p95/p99 {delays} ms",
+            new.len(),
+            f.newest.map_or("-".into(), |n| n.to_string()),
+            f.skipped - before.1,
+            f.late - before.2,
+            f.unread - before.3,
+        );
+        *before = (f.shown.len(), f.skipped, f.late, f.unread);
+    }
+
+    /// Source presented → decoded, and → captured, in ms, for the frames in `shown` whose
+    /// presentation is in the source's log.
+    fn presented_to_decoded(&self, shown: &[(u64, Option<u64>, u64)]) -> (Vec<f64>, Vec<f64>) {
+        let Some(source) = &self.source else { return Default::default() };
+        let since = |at: u64, t: u64| (t as i64 - at as i64) as f64 / 1000.0;
+        let mut decoded = Vec::new();
+        let mut captured = Vec::new();
+        for &(n, capture, decode) in shown {
+            let Some(&at) = source.presented.get(&n) else { continue };
+            decoded.push(since(at, decode));
+            captured.extend(capture.map(|c| since(at, c)));
+        }
+        (decoded, captured)
+    }
+
+    /// The whole watch: updates' latency, and with the strip, the source frames that showed.
+    fn report_frames(&mut self, args: &Args) {
+        if let Some(source) = &mut self.source {
+            source.poll();
+        }
+        let mut watch = self.watch.lock().unwrap();
+        if let Some(trace) = &mut watch.trace {
+            let _ = trace.flush();
+        }
+        let all = watch.updates.take_all();
+        if !all.is_empty() {
+            println!(
+                "updates: {} finished, capture→decoded p50 {:.1} ms, p95 {:.1} ms, p99 {:.1} ms",
+                all.len(),
+                percentile(&all, 0.5),
+                percentile(&all, 0.95),
+                percentile(&all, 0.99)
+            );
+        }
+        if args.barcode.is_none() {
+            return;
+        }
+        let f = &watch.frames;
+        let (Some(&(first, _, first_decoded)), Some(&(_, _, last_decoded)), Some(newest)) = (f.shown.first(), f.shown.last(), f.newest) else {
+            println!("source frames: none read (is Frame Source drawing on the display shown, and is the strip's place right?)");
+            return;
+        };
+        let span = last_decoded.saturating_sub(first_decoded) as f64 / 1e6;
+        println!(
+            "source frames: {} shown, {:.1} fps over {span:.1} s; {} skipped, {} late, {} unread updates{}; n {first}..{newest}",
+            f.shown.len(),
+            if span > 0.0 { (f.shown.len() - 1) as f64 / span } else { 0.0 },
+            f.skipped,
+            f.late,
+            f.unread,
+            if f.restarts > 0 { format!(", counting restarted {} times", f.restarts) } else { String::new() },
+        );
+        let Some(source) = &self.source else { return };
+        let (decoded, captured) = self.presented_to_decoded(&f.shown);
+        if !decoded.is_empty() {
+            println!(
+                "  source presented → decoded p50 {:.1} ms, p95 {:.1} ms, p99 {:.1} ms over {} frames; presented → captured p50 {:.1} ms",
+                percentile(&decoded, 0.5),
+                percentile(&decoded, 0.95),
+                percentile(&decoded, 0.99),
+                decoded.len(),
+                percentile(&captured, 0.5)
+            );
+        }
+        // What the source presented in that range and never showed here: skipped, or lost.
+        let seen: std::collections::HashSet<u64> = f.shown.iter().map(|s| s.0).collect();
+        let presented: Vec<u64> = source.presented.keys().copied().filter(|n| (first..=newest).contains(n)).collect();
+        println!(
+            "  the source presented {} frames in that range ({} drawn in all), {} of them never showed here",
+            presented.len(),
+            source.frames,
+            presented.iter().filter(|n| !seen.contains(n)).count()
+        );
+    }
 }
+
+/// How often to look for Frame Source's strip in its log until it's there.
+const STRIP_LOOK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The mean luma of a region of the stream, which may span several tiles: each tile's part is
 /// measured when that tile is decoded, and the region's mean is the area-weighted mean of the
@@ -1303,6 +1871,183 @@ mod tests {
         assert!(near(luma(&flat_frame(200, 300, 0), full, 2), 240.0 / 3.0), "the full frame under the newer tile");
         // An older tile than what's shown there changes nothing.
         assert_eq!(luma(&flat_frame(200, 100, 9), tile, 2), None);
+    }
+
+    /// A `width`×`height` NV12 picture whose luma at (x, y) is `luma(x, y)`.
+    fn picture(width: usize, height: usize, luma: impl Fn(usize, usize) -> u8) -> platform_mac::CFRetained<platform_mac::CVPixelBuffer> {
+        use objc2_core_video::{
+            CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+            CVPixelBufferUnlockBaseAddress,
+        };
+        let pb = flat_frame(width, height, 0);
+        unsafe {
+            CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags::empty());
+            let base = CVPixelBufferGetBaseAddressOfPlane(&pb, 0) as *mut u8;
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(&pb, 0);
+            for y in 0..height {
+                for x in 0..width {
+                    *base.add(y * stride + x) = luma(x, y);
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(&pb, CVPixelBufferLockFlags::empty());
+        }
+        pb
+    }
+
+    /// The test stream: 1280×256 pixels of a 640×128 point display, Frame Source's strip at
+    /// (16, 16) points, 16 squares of 32 points, showing frame `n`, on mid-grey.
+    const STREAM: (u32, u32) = (1280, 256);
+
+    fn test_strip() -> Strip {
+        Strip::new((16.0, 16.0, 512.0, 32.0), (640.0, 128.0), 16)
+    }
+
+    fn stream_luma(n: u32, x: usize, y: usize) -> u8 {
+        if !(32..96).contains(&y) || !(32..32 + 16 * 64).contains(&x) {
+            return 128;
+        }
+        let gray = n ^ (n >> 1);
+        if (gray >> ((x - 32) / 64)) & 1 == 1 { 235 } else { 16 }
+    }
+
+    /// Two tiles side by side; the strip's square 9 straddles them.
+    fn half(index: u8) -> TileRect {
+        TileRect { index, x: u32::from(index) * 640, y: 0, width: 640, height: 256 }
+    }
+
+    /// Tile `tile`'s picture of frame `n`.
+    fn tile_of(tile: TileRect, n: u32) -> platform_mac::CFRetained<platform_mac::CVPixelBuffer> {
+        picture(tile.width as usize, tile.height as usize, |x, y| stream_luma(n, tile.x as usize + x, tile.y as usize + y))
+    }
+
+    fn probe_frame(pixel_buffer: &platform_mac::CVPixelBuffer, tile: TileRect, update: u32, update_mask: u64) -> ProbeFrame<'_> {
+        ProbeFrame { pixel_buffer, tile, stream: STREAM, update, update_mask, timing: Default::default() }
+    }
+
+    #[test]
+    fn gray_codes_decode() {
+        for n in (0..=0xFFFF_u32).step_by(7).chain([0xBEEF, 0xFFFF]) {
+            assert_eq!(gray_decode(n ^ (n >> 1)), n);
+        }
+    }
+
+    #[test]
+    fn strip_reads_the_frame_as_of_each_update() {
+        let mut strip = test_strip();
+        let sample = |strip: &mut Strip, tile: TileRect, n: u32, update: u32| strip.sample(&tile_of(tile, n), tile, STREAM, update);
+        sample(&mut strip, half(0), 1000, 1);
+        assert_eq!(strip.read(1), None, "the right half's squares not seen yet");
+        sample(&mut strip, half(1), 1000, 1);
+        assert_eq!(strip.read(1), Some(1000));
+        // Update 3 finishes before update 2's right half is decoded: each reads as of itself.
+        sample(&mut strip, half(0), 1001, 2);
+        sample(&mut strip, half(0), 1002, 3);
+        sample(&mut strip, half(1), 1002, 3);
+        assert_eq!(strip.read(3), Some(1002));
+        sample(&mut strip, half(1), 1001, 2);
+        assert_eq!(strip.read(2), Some(1001));
+        assert_eq!(strip.read(3), Some(1002));
+        // A square that isn't white or black (the desktop under the source) reads as nothing.
+        let grey = picture(640, 256, |_, _| 128);
+        strip.sample(&grey, half(0), STREAM, 4);
+        assert_eq!(strip.read(4), None);
+        assert_eq!(strip.read(3), Some(1002), "older updates keep their samples");
+        // Another stream size starts over.
+        strip.sample(&grey, half(0), (2560, 512), 5);
+        assert_eq!(strip.read(3), None);
+    }
+
+    /// The whole-picture streams' pictures cover the stream, the motion stream's scaled down.
+    #[test]
+    fn strip_reads_whole_pictures_at_any_scale() {
+        let mut strip = test_strip();
+        let whole = |index| TileRect { index, x: 0, y: 0, width: STREAM.0, height: STREAM.1 };
+        let full = picture(1280, 256, |x, y| stream_luma(0xBEEF, x, y));
+        strip.sample(&full, whole(FULL_FRAME_TILE), STREAM, 1);
+        assert_eq!(strip.read(1), Some(0xBEEF));
+        for (n, (w, h)) in [(0xBEF0, (640, 128)), (0xBEF1, (853, 170))] {
+            let scaled = picture(w, h, |x, y| stream_luma(n, x * 1280 / w, y * 256 / h));
+            strip.sample(&scaled, whole(MOTION_FRAME_TILE), STREAM, n);
+            assert_eq!(strip.read(n), Some(n), "{w}x{h}");
+        }
+        // A tile after it replaces only its own squares.
+        strip.sample(&tile_of(half(1), 0), half(1), STREAM, 0xBEF2);
+        let left = 0xBEF1 ^ (0xBEF1 >> 1);
+        let mixed = (left & 0x01FF) | ((0 ^ (0 >> 1)) & 0xFE00);
+        assert_eq!(strip.read(0xBEF2), Some(gray_decode(mixed)), "square 9 straddles both: the newest of them wins");
+    }
+
+    #[test]
+    fn watch_reads_and_traces_each_finished_update() {
+        let path = std::env::temp_dir().join(format!("lankvm-probe-trace-{}.jsonl", std::process::id()));
+        let trace = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut watch = Watch { latest: Some(HashMap::new()), trace: Some(trace), ..Default::default() };
+        let both = half(0).bit() | half(1).bit();
+        let tile = |watch: &mut Watch, half: TileRect, n: u32, update: u32, mask: u64| {
+            watch.tile(&probe_frame(&tile_of(half, n), half, update, mask));
+        };
+        // Decoded before the strip's place was known: read from once it is.
+        tile(&mut watch, half(0), 7, 1, both);
+        tile(&mut watch, half(1), 7, 1, both);
+        watch.place_strip(test_strip());
+        // Frame 8 changes a square on the left only; frames 9 and 10 never arrive.
+        tile(&mut watch, half(0), 8, 2, half(0).bit());
+        tile(&mut watch, half(0), 11, 3, both);
+        tile(&mut watch, half(1), 11, 3, both);
+        let shown: Vec<u64> = watch.frames.shown.iter().map(|s| s.0).collect();
+        assert_eq!((shown, watch.frames.skipped), (vec![8, 11], 2));
+        drop(watch);
+        let lines: Vec<Value> = std::fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let _ = std::fs::remove_file(&path);
+        let field = |key: &str| lines.iter().map(|l| l[key].clone()).collect::<Vec<_>>();
+        assert_eq!(field("update"), [1, 2, 3]);
+        assert_eq!(field("n"), [Value::Null, 8.into(), 11.into()], "no strip yet when update 1 finished");
+        assert_eq!(field("new"), [false, true, true]);
+        assert_eq!(field("tiles"), [2, 1, 2]);
+    }
+
+    #[test]
+    fn source_frames_count_skipped_late_and_wrapped_frames() {
+        let modulus = 1 << 16;
+        let mut f = SourceFrames::default();
+        assert_eq!(f.finished(Some(10), modulus, Some(1), 2), Some((10, true)));
+        assert_eq!(f.finished(Some(11), modulus, Some(3), 4), Some((11, true)));
+        assert_eq!(f.finished(Some(11), modulus, Some(5), 6), Some((11, false)), "the same frame again");
+        assert_eq!(f.finished(Some(14), modulus, Some(7), 8), Some((14, true)), "12 and 13 skipped");
+        assert_eq!(f.finished(Some(13), modulus, Some(9), 10), Some((13, false)), "finished late");
+        assert_eq!(f.finished(None, modulus, None, 11), None);
+        assert_eq!((f.shown.len(), f.skipped, f.late, f.unread, f.restarts), (3, 2, 1, 1, 0));
+        assert_eq!(f.shown[2], (14, Some(7), 8));
+        // The strip's number wraps; the count goes on.
+        let mut f = SourceFrames { newest: Some(65_534), ..Default::default() };
+        assert_eq!(f.finished(Some(65_535), modulus, None, 1), Some((65_535, true)));
+        assert_eq!(f.finished(Some(1), modulus, None, 2), Some((65_537, true)));
+        assert_eq!(f.skipped, 1);
+        // A jump too big to be frames skipped starts the count over: the source started over.
+        assert_eq!(f.finished(Some(30_000), modulus, None, 3), Some((30_000, true)));
+        assert_eq!((f.restarts, f.skipped, f.late), (1, 1, 0));
+        assert_eq!(f.finished(Some(30_001), modulus, None, 4), Some((30_001, true)));
+    }
+
+    #[test]
+    fn source_log_is_read_as_it_grows() {
+        let path = std::env::temp_dir().join(format!("lankvm-probe-test-{}.jsonl", std::process::id()));
+        let window = r#"{"type":"window","display_id":3,"scale":2,"screen_points":[1280,800],"strip_points":[16,16,512,32],"squares":16}"#;
+        std::fs::write(&path, format!("{window}\n{{\"type\":\"frame\",\"n\":0,\"presented_us\":1000}}\n{{\"type\":\"frame\",\"n\":1,\"pres")).unwrap();
+        let mut log = SourceLog::new(path.to_str().unwrap());
+        log.poll();
+        assert_eq!(log.strip, Some(((16.0, 16.0, 512.0, 32.0), (1280.0, 800.0), 16)));
+        assert_eq!((log.frames, log.presented.get(&0)), (1, Some(&1000)), "the half-written line waits");
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "ented_us\":0}}\n{{\"type\":\"frame\",\"n\":2,\"presented_us\":9000}}").unwrap();
+        log.poll();
+        assert_eq!(log.frames, 3);
+        assert_eq!((log.presented.get(&1), log.presented.get(&2)), (None, Some(&9000)), "frame 1 never reached the screen");
+        // A new run of the source starts the log over.
+        std::fs::write(&path, "{\"type\":\"frame\",\"n\":0,\"presented_us\":5}\n").unwrap();
+        log.poll();
+        assert_eq!((log.strip, log.frames, log.presented.get(&0)), (None, 1, Some(&5)));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -4,11 +4,12 @@
 // exactly which source frame it shows and when that frame was on the host's screen.
 //
 //   swiftc -O scripts/frame-source.swift -o target/frame-source
-//   target/frame-source [--screen main|virtual|N] [--fullscreen | --frame X,Y,W,H] [--hz 120]
+//   target/frame-source [--screen main|virtual|N|display:ID] [--fullscreen | --frame X,Y,W,H] [--hz 120]
 //                       [--change tiny|small|band|scroll|full] [--log FILE] [--seconds S] [--click]
-//                       [--drawables 2|3] [--no-sync]
+//                       [--drawables 2|3] [--no-sync] [--background]
 //
-// --screen picks the screen (virtual: a LanKVM virtual display); --frame places the window in
+// --screen picks the screen (virtual: a LanKVM virtual display; N: NSScreen.screens[N];
+// display:ID: the display with that CGDirectDisplayID); --frame places the window in
 // that screen's points, top-left origin; --fullscreen covers the whole screen with a borderless
 // window. --change is what changes besides the frame number:
 //   tiny    nothing else (the strip is 512×32 points, top left)
@@ -17,11 +18,15 @@
 //   scroll  the whole window scrolls text-like blocks, 4 px a frame
 //   full    the whole window shows new text-like blocks every frame
 // --click: the patch flips only on mouse down (for input-to-photon tests), logged with the
-// event's timestamp.
+// event's timestamp. --background: no Dock icon, menu bar or focus taken from the app in front
+// (for unattended runs on a screen nobody looks at, e.g. scripts/latency-bench.sh).
+//
+// The strip shows n modulo 65536 (16 squares), so it wraps to 0 after 65535.
 //
 // The log (JSON lines, all times in µs of the mach clock LanKVM uses) has one "frame" line per
 // frame: {n, target_us, commit_us, presented_us} (presented_us 0 if it never reached the
-// screen), a "window" line describing where the strip is in screen pixels, and "click" lines.
+// screen), a "window" line describing where the strip is (strip_points: x, y, w, h in the
+// screen's points from its top-left corner; screen_points; scale; squares), and "click" lines.
 
 import AppKit
 import Metal
@@ -50,6 +55,7 @@ struct Options {
     /// new frame (logged as "warm" frames, not counted as frames).
     var warmMs: Double? = nil
     var displaySync = true
+    var background = false
 
     init() {
         var args = CommandLine.arguments.dropFirst().makeIterator()
@@ -71,8 +77,9 @@ struct Options {
             case "--overlay": overlay = args.next() ?? overlay
             case "--pace": paceHz = Float(args.next() ?? "")
             case "--warm": warmMs = Double(args.next() ?? "")
+            case "--background": background = true
             case "-h", "--help":
-                print("usage: frame-source [--screen main|virtual|N] [--fullscreen | --frame X,Y,W,H] [--hz N] [--change tiny|small|band|scroll|full] [--log FILE] [--seconds S] [--click]")
+                print("usage: frame-source [--screen main|virtual|N|display:ID] [--fullscreen | --frame X,Y,W,H] [--hz N] [--change tiny|small|band|scroll|full] [--log FILE] [--seconds S] [--click] [--background]")
                 exit(0)
             default:
                 FileHandle.standardError.write(Data("unknown argument \(arg)\n".utf8))
@@ -333,7 +340,9 @@ final class SourceView: NSView {
             out.append(GPURect(r: SIMD4(600 * s, 200 * s, 128 * s, 128 * s), color: patchWhite ? white : black))
         }
         // Frame number strip, last so nothing covers it: Gray code, bit 0 leftmost.
-        let gray = UInt32(truncatingIfNeeded: n) ^ (UInt32(truncatingIfNeeded: n) >> 1)
+        // Of n modulo 2^16: the Gray code of a bigger number doesn't wrap to 0 in 16 bits.
+        let low = UInt32(truncatingIfNeeded: n) & 0xFFFF
+        let gray = low ^ (low >> 1)
         let side = 32 * s
         out.append(GPURect(r: SIMD4(16 * s - 4 * s, 16 * s - 4 * s, side * 16 + 8 * s, side + 8 * s), color: SIMD4(0.5, 0.5, 0.5, 1)))
         for bit in 0..<16 {
@@ -401,17 +410,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let screens = NSScreen.screens
         let screen: NSScreen
+        let id = { (s: NSScreen) in (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0 }
         switch options.screen {
         case "main": screen = screens[0]
         case "virtual":
             // LanKVM's virtual displays use vendor 0x4C4B ("LK").
-            screen = screens.first { s in
-                let id = (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
-                return CGDisplayVendorNumber(id) == 0x4C4B
-            } ?? {
+            screen = screens.first { CGDisplayVendorNumber(id($0)) == 0x4C4B } ?? {
                 FileHandle.standardError.write(Data("no LanKVM virtual display\n".utf8))
                 exit(1)
             }()
+        case let name where name.hasPrefix("display:"):
+            // One display by its id: another LanKVM's virtual display may be there too.
+            guard let wanted = UInt32(name.dropFirst("display:".count)), let match = screens.first(where: { id($0) == wanted }) else {
+                FileHandle.standardError.write(Data("no display \(name.dropFirst("display:".count))\n".utf8))
+                exit(1)
+            }
+            screen = match
         default:
             guard let i = Int(options.screen), screens.indices.contains(i) else {
                 FileHandle.standardError.write(Data("no screen \(options.screen)\n".utf8))
@@ -481,15 +495,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             view.addSubview(glass)
         default: break
         }
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        if options.background {
+            window.orderFrontRegardless()
+        } else {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(options.background ? .accessory : .regular)
 let delegate = AppDelegate()
 app.delegate = delegate
 signal(SIGTERM) { _ in log.flush(); exit(0) }

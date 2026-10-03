@@ -20,14 +20,22 @@
 # Same-Mac control is enabled for the host copy (LANKVM_ALLOW_SAME_MAC_CONTROL); the viewer drops
 # events its host injected, so they don't loop. Control ends by itself after TTL seconds.
 #
-# Env: E2E (default target/e2e), HOST_PORT (47810), VIEWER_PORT (47811), TTL (120).
+# Env: E2E (default target/e2e), HOST_PORT (47810), VIEWER_PORT (47811), TTL (120),
+#      APP (the app bundle the host and viewer copies run, default target/release/LanKVM.app),
+#      PROBE (the probe binary, default target/release/examples/probe),
+#      HIDDEN=1 (start the host copy hidden: its window never shows),
+#      STATS=1 (the viewer shows its stats overlay; off by default, it changes what's measured).
+# Test knobs pass through when set: LANKVM_TILES, LANKVM_FULL_FRAME_AT, LANKVM_MOTION,
+# LANKVM_ENCODER_PROPS and LANKVM_LOG_STATS to the host copy; those and LANKVM_CONNECT_DISPLAY,
+# LANKVM_KEEP_WARM_MS and MTL_HUD_ENABLED to the viewer (scripts/second-instance.sh).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 E2E="${E2E:-$PWD/target/e2e}"
 HOST_PORT="${HOST_PORT:-47810}"
 VIEWER_PORT="${VIEWER_PORT:-47811}"
-APP="target/release/LanKVM.app"
+APP="${APP:-target/release/LanKVM.app}"
+PROBE="${PROBE:-target/release/examples/probe}"
 export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 
 holder() { lsof -nP -t -iUDP:"$1" 2>/dev/null | head -1 || true; }
@@ -95,15 +103,24 @@ host)
         ;;
     *) echo "error: mode is record, hid or pid" >&2; exit 2 ;;
     esac
-    open -n -g "$APP" --env LANKVM_PORT="$HOST_PORT" --env LANKVM_DATA_DIR="$E2E/host" \
+    knobs=()
+    for var in LANKVM_TILES LANKVM_FULL_FRAME_AT LANKVM_MOTION LANKVM_ENCODER_PROPS LANKVM_LOG_STATS; do
+        if [[ -n "${!var:-}" ]]; then knobs+=(--env "$var=${!var}"); fi
+    done
+    # -j: launched hidden, so its window stays off the screen (it's only a host).
+    hidden=()
+    if [[ "${HIDDEN:-0}" == 1 ]]; then hidden=(-j); fi
+    open -n -g ${hidden[@]+"${hidden[@]}"} "$APP" --env LANKVM_PORT="$HOST_PORT" --env LANKVM_DATA_DIR="$E2E/host" \
         --env LANKVM_ALLOW_SAME_MAC_CONTROL=1 --env LANKVM_NO_PROMPTS=1 --env LANKVM_TEST_CONTROL_TTL="${TTL:-120}" \
-        "${inject[@]}" --args -ApplePersistenceIgnoreState YES
+        "${inject[@]}" ${knobs[@]+"${knobs[@]}"} --args -ApplePersistenceIgnoreState YES
     wait_port "$HOST_PORT"
     echo "host ($mode): pid $(holder "$HOST_PORT"), UDP $HOST_PORT, log $E2E/host/lankvm.log"
     ;;
 viewer)
     # Connects to the host copy by itself, and logs the overlay's stats (including on-screen
-    # latency) every second to $E2E/viewer/lankvm.log.
+    # latency) every second to $E2E/viewer/lankvm.log. The overlay itself stays off unless
+    # STATS=1: text changing over the video slows what it measures.
+    defaults write dev.lankvm.LanKVM.second showStats -bool "$([[ "${STATS:-0}" == 1 ]] && echo true || echo false)"
     LANKVM_NO_PROMPTS=1 LANKVM_CONNECT="127.0.0.1:$HOST_PORT" LANKVM_LOG_STATS=1 LANKVM_APP="$APP" PORT="$VIEWER_PORT" \
         DATA_DIR="$E2E/viewer" ./scripts/second-instance.sh --restart
     echo "viewer: connecting to 127.0.0.1:$HOST_PORT; stats in $E2E/viewer/lankvm.log"
@@ -118,7 +135,7 @@ lab)
     ;;
 probe)
     shift
-    LANKVM_DATA_DIR="$E2E/probe" LANKVM_PORT=0 ./target/release/examples/probe "127.0.0.1:$HOST_PORT" "$@"
+    LANKVM_DATA_DIR="$E2E/probe" LANKVM_PORT=0 exec "$PROBE" "127.0.0.1:$HOST_PORT" "$@"
     ;;
 stop)
     stop_port "$HOST_PORT"

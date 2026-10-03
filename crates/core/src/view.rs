@@ -55,6 +55,7 @@ pub struct TileImage {
     pub update_mask: u64,
     /// [`protocol::VideoFrame::cover`]: for a whole-picture image, the tiles it paints (empty:
     /// all of it).
+    #[allow(dead_code)] // Read once motion frames (scaled whole pictures) are drawn by their cover.
     pub cover: Vec<TileRect>,
     pub timing: FrameTiming,
 }
@@ -667,10 +668,12 @@ fn on_screen(drawable: &ProtocolObject<dyn CAMetalDrawable>, timing: FrameTiming
         let glass_us = (seconds * 1e6) as u64;
         let mut stats = shared.stats.lock().unwrap();
         stats.present.add(glass_us.saturating_sub(timing.decoded_us) as f64);
+        stats.display_samples.add(glass_us.saturating_sub(timing.decoded_us) as f64);
         if let Some(captured) = timing.capture_local_us {
             stats.total.add(glass_us.saturating_sub(captured) as f64);
+            stats.total_samples.add(glass_us.saturating_sub(captured) as f64);
         }
-        stats.frames_shown += 1;
+        stats.on_shown();
     });
     // SAFETY: the block is valid; Metal copies it and calls it once.
     unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&presented)) };

@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 enum SidebarItem: String, CaseIterable, Identifiable {
@@ -28,6 +29,8 @@ struct ContentView: View {
     @State private var selection: SidebarItem?
     /// LANKVM_CONNECT is used once per launch.
     @MainActor private static var autoConnected = false
+    /// Waits for that session to connect, given LANKVM_CONNECT_DISPLAY.
+    @MainActor private static var connectDisplay: AnyCancellable?
 
     init(selection: SidebarItem = .connect) {
         _selection = State(initialValue: selection)
@@ -57,13 +60,58 @@ struct ContentView: View {
         }
         .onAppear {
             // Test runs (scripts/e2e-control.sh viewer): connect at once, as if typed in Connect.
-            if !Self.autoConnected, let address = ProcessInfo.processInfo.environment["LANKVM_CONNECT"], !address.isEmpty {
+            let env = ProcessInfo.processInfo.environment
+            if !Self.autoConnected, let address = env["LANKVM_CONNECT"], !address.isEmpty {
                 Self.autoConnected = true
                 // This window may appear before the app finished launching: the core first.
                 core.start()
-                openWindow(id: "viewer", value: core.connect(to: address))
+                let id = core.connect(to: address)
+                openWindow(id: "viewer", value: id)
+                // And a display of this size next to the host's own (scripts/latency-bench.sh VIEWER=1).
+                if let spec = env["LANKVM_CONNECT_DISPLAY"], let display = Self.testDisplay(spec) {
+                    Self.showOnceConnected(display, session: id)
+                }
             }
         }
+    }
+
+    /// LANKVM_CONNECT_DISPLAY's "WxH[@2x][@HZ]" (pixels; @2x: Retina; HZ: its refresh rate, 60
+    /// by default) as a display next to the host's own screens; nil if it isn't one.
+    static func testDisplay(_ spec: String) -> RemoteDisplay? {
+        var parts = spec.lowercased().split(separator: "@").map(String.init)
+        let size = parts.isEmpty ? [] : parts.removeFirst().split(separator: "x").compactMap { UInt32($0) }
+        guard size.count == 2 else { return nil }
+        var display = RemoteDisplay(kind: .virtual, width: size[0], height: size[1], arrangement: .extend)
+        for part in parts {
+            if part == "2x" {
+                display.hidpi = true
+            } else if let hz = UInt32(part.hasSuffix("hz") ? String(part.dropLast(2)) : part) {
+                display.refreshHz = hz
+            } else {
+                return nil
+            }
+        }
+        return display
+    }
+
+    /// Asks for `display` once the session connects, as if picked on connecting (like the display
+    /// remembered for a host: the window shows no picture of the host's own screen meanwhile, and
+    /// it isn't remembered).
+    @MainActor private static func showOnceConnected(_ display: RemoteDisplay, session id: UInt64) {
+        guard let session = CoreModel.shared.session(id) else { return }
+        connectDisplay = session.$phase
+            .first { phase in
+                if case .connected = phase { return true }
+                return false
+            }
+            // $phase tells before the change is made: ask once it is, after what connecting asks for.
+            .receive(on: DispatchQueue.main)
+            .sink { _ in
+                MainActor.assumeIsolated {
+                    CoreModel.shared.showDisplay(display, for: id, fromConnect: true)
+                    connectDisplay = nil
+                }
+            }
     }
 }
 
