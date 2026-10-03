@@ -79,7 +79,16 @@ pub struct Stats {
     pub frames_shown: u64,
     pub keyframe_requests: u64,
     pub frames_lost: u64,
+    /// Viewer input → injected on the host (from the host's input acks).
+    pub input: Ema,
+    /// Of that: viewer input → received by the host.
+    pub input_network: Ema,
+    /// Of that: received → posted on the host (decoding, `CGEventPost`).
+    pub input_inject: Ema,
+    pub inputs_sent: u64,
     window: RateWindow,
+    /// Send times of recent input writes: (last sequence number in the write, our clock µs).
+    input_sent: VecDeque<(u64, u64)>,
 }
 
 /// A snapshot for the UI. Times are in milliseconds.
@@ -99,9 +108,36 @@ pub struct StatsView {
     pub frames_shown: u64,
     pub frames_lost: u64,
     pub keyframe_requests: u64,
+    /// Viewer input → injected on the host, while controlling.
+    pub input_ms: Option<f64>,
+    pub input_network_ms: Option<f64>,
+    pub input_inject_ms: Option<f64>,
+    pub inputs_sent: u64,
 }
 
 impl Stats {
+    const INPUT_LOG: usize = 512;
+
+    /// Input messages up to `last_seq` (counted from 1) were written at `sent_us`.
+    pub fn on_input_sent(&mut self, last_seq: u64, sent_us: u64) {
+        self.inputs_sent = last_seq;
+        if self.input_sent.len() == Self::INPUT_LOG {
+            self.input_sent.pop_front();
+        }
+        self.input_sent.push_back((last_seq, sent_us));
+    }
+
+    /// The host received input up to `seq` at `received_us` and injected it at `injected_us`
+    /// (host clock).
+    pub fn on_input_ack(&mut self, seq: u64, received_us: u64, injected_us: u64) {
+        self.input_inject.add(injected_us.saturating_sub(received_us) as f64);
+        let Some(&(_, sent_us)) = self.input_sent.iter().find(|(last, _)| *last >= seq) else { return };
+        if let (Some(received), Some(injected)) = (self.clock.to_local(received_us), self.clock.to_local(injected_us)) {
+            self.input_network.add(received.saturating_sub(sent_us) as f64);
+            self.input.add(injected.saturating_sub(sent_us) as f64);
+        }
+    }
+
     pub fn view(&mut self) -> StatsView {
         StatsView {
             fps: self.fps(),
@@ -117,6 +153,10 @@ impl Stats {
             frames_shown: self.frames_shown,
             frames_lost: self.frames_lost,
             keyframe_requests: self.keyframe_requests,
+            input_ms: self.input.ms(),
+            input_network_ms: self.input_network.ms(),
+            input_inject_ms: self.input_inject.ms(),
+            inputs_sent: self.inputs_sent,
         }
     }
 

@@ -1,0 +1,4 @@
+# The viewer holds a key and goes silent (no heartbeats): the host must let go after about 1 s.
+{"click":"text+300,200"}
+{"hold":"x","ms":2500,"heartbeat":false}
+{"assert_idle":true}

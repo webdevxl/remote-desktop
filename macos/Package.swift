@@ -30,6 +30,9 @@ let package = Package(
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("Metal"),
                 .linkedFramework("IOSurface"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("AppKit"),
             ]
         ),
     ]

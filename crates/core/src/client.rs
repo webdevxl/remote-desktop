@@ -2,13 +2,14 @@
 
 use std::ffi::c_void;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use platform_mac::decoder::Decoder;
 use platform_mac::{CFRetained, CVPixelBuffer, clock, system};
-use protocol::{ClientMsg, Codec, DEFAULT_PORT, HostMsg, PROTOCOL_VERSION, VideoFrame};
+use protocol::{ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, HostMsg, InputMsg, PROTOCOL_VERSION, VideoFrame};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::sync::mpsc;
 use transport::endpoint::peer_fingerprint;
@@ -32,6 +33,10 @@ const KEYFRAME_RETRY: Duration = Duration::from_millis(200);
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub host_name: String,
+    /// The host's device id (stable across addresses), e.g. to remember per-host choices.
+    pub host_id: String,
+    /// The host is this same Mac (another copy of LanKVM): pointer and keyboard are shared.
+    pub same_machine: bool,
     pub address: String,
     pub width: u32,
     pub height: u32,
@@ -45,7 +50,15 @@ pub enum SessionEvent {
     PinNeeded,
     Connected(SessionInfo),
     Ended { error: Option<String> },
+    /// The host granted, refused or ended control.
+    Control(ControlState),
+    /// A cursor image to draw locally while controlling (PNG at 2x; sizes in points).
+    CursorShape { id: u32, png: Vec<u8>, width: f32, height: f32, hot_x: f32, hot_y: f32 },
+    Cursor(CursorState),
 }
+
+/// Input written per batch at most; anything more waits for the next write.
+const MAX_INPUT_BATCH: usize = 256;
 
 pub struct ReadyFrame {
     pub pixel_buffer: CFRetained<CVPixelBuffer>,
@@ -65,12 +78,26 @@ pub struct Shared {
     pub stats: Mutex<Stats>,
     /// Timing of the access unit currently inside the (synchronous) decoder.
     decoding: Mutex<FrameTiming>,
+    /// Whether the host lets us control it right now. Input is dropped otherwise.
+    controlling: AtomicBool,
+    /// Id of our latest control request and whether it asked for control; answers to older
+    /// ones are stale.
+    latest_request: Mutex<(u32, bool)>,
+    /// Test hook: sees every decoded frame before it's drawn.
+    frame_probe: Mutex<Option<FrameProbe>>,
 }
+
+/// Called with each decoded frame and its timing (see [`Session::set_frame_probe`]).
+pub type FrameProbe = Box<dyn Fn(&CVPixelBuffer, FrameTiming) + Send + Sync>;
 
 pub struct Session {
     shared: Arc<Shared>,
     conn: Arc<Mutex<Option<Connection>>>,
     pin_tx: mpsc::UnboundedSender<String>,
+    /// Control messages from the app (queued until connected).
+    ctl_tx: mpsc::UnboundedSender<ClientMsg>,
+    /// Input for the host, with our clock (µs) when it happened.
+    input_tx: mpsc::UnboundedSender<(InputMsg, u64)>,
     task: tokio::task::JoinHandle<()>,
     view: Mutex<Option<ViewHandle>>,
 }
@@ -82,15 +109,28 @@ impl Session {
         trust: Arc<Trust>,
         target: String,
         max_size: (u32, u32),
+        max_fps: u32,
         events: SessionEvents,
     ) -> Self {
         let shared = Arc::new(Shared::default());
         let conn = Arc::new(Mutex::new(None));
         let (pin_tx, pin_rx) = mpsc::unbounded_channel();
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
         let task = rt.spawn({
-            let (shared, conn) = (shared.clone(), conn.clone());
+            let (shared, conn, ctl_tx) = (shared.clone(), conn.clone(), ctl_tx.clone());
             async move {
-                let ctx = RunCtx { trust, max_size, shared, conn_slot: conn, events: events.clone(), pin_rx };
+                let ctx = RunCtx {
+                    trust,
+                    max_size,
+                    max_fps,
+                    shared,
+                    conn_slot: conn,
+                    events: events.clone(),
+                    pin_rx,
+                    ctl: (ctl_tx, ctl_rx),
+                    input_rx,
+                };
                 let result = run(endpoint, &target, ctx).await;
                 let error = result.err().map(|e| format!("{e:#}"));
                 if let Some(e) = &error {
@@ -99,7 +139,43 @@ impl Session {
                 events(SessionEvent::Ended { error });
             }
         });
-        Self { shared, conn, pin_tx, task, view: Mutex::new(None) }
+        Self { shared, conn, pin_tx, ctl_tx, input_tx, task, view: Mutex::new(None) }
+    }
+
+    /// Asks the host for control (true) or to only view it (false); `take_over` takes control
+    /// from another device that has it. The answer arrives as a [`SessionEvent::Control`] for the
+    /// returned request id.
+    pub fn set_control(&self, on: bool, take_over: bool) -> u32 {
+        let mut latest = self.shared.latest_request.lock().unwrap();
+        let request = latest.0.wrapping_add(1).max(1);
+        *latest = (request, on);
+        if !on {
+            // Let go of everything first (the input stream is ordered before the request); the
+            // host also releases on its side.
+            self.send_input(InputMsg::ReleaseAll);
+            self.shared.controlling.store(false, Ordering::Release);
+        }
+        let _ = self.ctl_tx.send(ClientMsg::SetControl { on, request, take_over });
+        request
+    }
+
+    /// While controlling: whether this window has the focus and forwards input.
+    pub fn set_focus(&self, forwarding: bool) {
+        if self.shared.controlling.load(Ordering::Acquire) {
+            let _ = self.ctl_tx.send(ClientMsg::Focus { forwarding });
+        }
+    }
+
+    /// Lets a test look at every decoded frame (e.g. to time how fast input shows on screen).
+    pub fn set_frame_probe(&self, probe: Option<FrameProbe>) {
+        *self.shared.frame_probe.lock().unwrap() = probe;
+    }
+
+    /// Sends input to the host, if it lets us control it.
+    pub fn send_input(&self, msg: InputMsg) {
+        if self.shared.controlling.load(Ordering::Acquire) {
+            let _ = self.input_tx.send((msg, clock::now_us()));
+        }
     }
 
     /// Starts drawing frames into `layer` (a `CAMetalLayer`) on a dedicated render thread.
@@ -161,10 +237,14 @@ async fn resolve(target: &str) -> Result<SocketAddr> {
 struct RunCtx {
     trust: Arc<Trust>,
     max_size: (u32, u32),
+    /// The viewer screen's refresh rate: no point streaming faster.
+    max_fps: u32,
     shared: Arc<Shared>,
     conn_slot: Arc<Mutex<Option<Connection>>>,
     events: SessionEvents,
     pin_rx: mpsc::UnboundedReceiver<String>,
+    ctl: (mpsc::UnboundedSender<ClientMsg>, mpsc::UnboundedReceiver<ClientMsg>),
+    input_rx: mpsc::UnboundedReceiver<(InputMsg, u64)>,
 }
 
 async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
@@ -183,7 +263,7 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
         device_name: system::device_name(),
         max_width: ctx.max_size.0,
         max_height: ctx.max_size.1,
-        fps: 60,
+        fps: ctx.max_fps,
         trusts_host,
     };
     write_msg(&mut send, &hello).await?;
@@ -193,7 +273,16 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
                 if !trusts_host {
                     ctx.trust.hosts.lock().unwrap().add(host_fp, &device_name)?;
                 }
-                break SessionInfo { host_name: device_name, address: addr.to_string(), width, height, fps, codec };
+                break SessionInfo {
+                    host_name: device_name,
+                    host_id: transport::identity::short_hex(&host_fp),
+                    same_machine: crate::is_this_mac(addr.ip()),
+                    address: addr.to_string(),
+                    width,
+                    height,
+                    fps,
+                    codec,
+                };
             }
             HostMsg::PairingRequired => {
                 (ctx.events)(SessionEvent::PinNeeded);
@@ -214,12 +303,12 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
             other => bail!("unexpected reply {other:?}"),
         }
     };
-    let RunCtx { shared, events, .. } = ctx;
+    let RunCtx { shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, .. } = ctx;
     tracing::info!(?info, "connected");
     events(SessionEvent::Connected(info));
 
-    // Control stream: one writer task fed by a channel, one reader task for pongs.
-    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ClientMsg>();
+    // Control stream: one writer task fed by a channel (pings, keyframe requests and the app's
+    // control requests), one reader task for everything the host sends.
     let writer = tokio::spawn(async move {
         while let Some(msg) = ctl_rx.recv().await {
             if write_msg(&mut send, &msg).await.is_err() {
@@ -228,12 +317,18 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
         }
     });
     let reader = tokio::spawn({
-        let shared = shared.clone();
+        let (shared, events) = (shared.clone(), events.clone());
         async move {
             while let Ok(Some(msg)) = read_msg::<HostMsg>(&mut recv).await {
-                if let HostMsg::Pong { client_time_us, host_time_us } = msg {
-                    shared.stats.lock().unwrap().clock.add(client_time_us, clock::now_us(), host_time_us);
-                }
+                handle_host_msg(msg, &shared, &events);
+            }
+        }
+    });
+    let input = tokio::spawn({
+        let (conn, shared) = (conn.clone(), shared.clone());
+        async move {
+            if let Err(e) = write_input(&conn, input_rx, &shared).await {
+                tracing::info!("input stream: {e:#}");
             }
         }
     });
@@ -254,7 +349,85 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
     pinger.abort();
     reader.abort();
     writer.abort();
+    input.abort();
+    shared.controlling.store(false, Ordering::Release);
     result
+}
+
+fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents) {
+    match msg {
+        HostMsg::Pong { client_time_us, host_time_us } => {
+            shared.stats.lock().unwrap().clock.add(client_time_us, clock::now_us(), host_time_us);
+        }
+        HostMsg::Control(state) => {
+            let latest = shared.latest_request.lock().unwrap();
+            // An answer to a request we've since replaced would flip the state back: ignore it.
+            if state.request != 0 && state.request != latest.0 {
+                tracing::debug!(?state, "stale control answer");
+                return;
+            }
+            // The host never grants control unasked, nor when we asked only to view.
+            if state.active && (state.request == 0 || !latest.1) {
+                tracing::warn!(?state, "ignoring control we didn't ask for");
+                return;
+            }
+            shared.controlling.store(state.active, Ordering::Release);
+            drop(latest);
+            events(SessionEvent::Control(state));
+        }
+        HostMsg::CursorShape { id, png, width, height, hot_x, hot_y } => {
+            events(SessionEvent::CursorShape { id, png, width, height, hot_x, hot_y });
+        }
+        HostMsg::Cursor(state) => events(SessionEvent::Cursor(state)),
+        HostMsg::InputAck { seq, received_us, injected_us } => shared.stats.lock().unwrap().on_input_ack(seq, received_us, injected_us),
+        other => tracing::debug!("ignoring {other:?}"),
+    }
+}
+
+/// Writes input to the host on its own stream, opened with the first input. Sends each event
+/// as soon as it arrives; only when events pile up (we fell behind) are consecutive moves and
+/// scroll steps merged, never across a click or key, so order is kept. If the host gives up on
+/// the stream (bad input), it ends control too; the next input after a new grant opens a new one.
+async fn write_input(conn: &Connection, mut rx: mpsc::UnboundedReceiver<(InputMsg, u64)>, shared: &Shared) -> Result<()> {
+    let mut send: Option<SendStream> = None;
+    let mut batch: Vec<InputMsg> = Vec::new();
+    let mut bytes = Vec::new();
+    let mut seq = 0u64;
+    while let Some((first, mut at_us)) = rx.recv().await {
+        batch.clear();
+        batch.push(first);
+        while batch.len() < MAX_INPUT_BATCH {
+            let Ok((msg, t)) = rx.try_recv() else { break };
+            at_us = t;
+            if !batch.last_mut().is_some_and(|last| last.coalesce(&msg)) {
+                batch.push(msg);
+            }
+        }
+        bytes.clear();
+        for msg in &batch {
+            bytes.extend_from_slice(&protocol::encode_framed(msg)?);
+        }
+        seq += batch.len() as u64;
+        shared.stats.lock().unwrap().on_input_sent(seq, at_us);
+        // Once more on a new stream if the host stopped reading this one.
+        for attempt in 0..2 {
+            if send.is_none() {
+                let stream = conn.open_uni().await.context("open input stream")?;
+                // Ahead of any other stream we might add later (it doesn't outrank video datagrams).
+                let _ = stream.set_priority(100);
+                send = Some(stream);
+            }
+            match send.as_mut().expect("opened above").write_all(&bytes).await {
+                Ok(()) => break,
+                Err(quinn::WriteError::Stopped(code)) => {
+                    tracing::info!(%code, attempt, "host stopped reading our input stream");
+                    send = None;
+                }
+                Err(e) => return Err(e).context("write input"),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Client half of PIN pairing (see `transport::pairing`).
@@ -369,6 +542,9 @@ fn new_decoder(video: &VideoFrame, shared: &Arc<Shared>) -> Result<Decoder> {
             let mut stats = shared.stats.lock().unwrap();
             stats.decode.add(timing.decoded_us.saturating_sub(timing.received_us) as f64);
             stats.frames_decoded += 1;
+        }
+        if let Some(probe) = shared.frame_probe.lock().unwrap().as_ref() {
+            probe(&decoded.pixel_buffer, timing);
         }
         shared.slot.publish(ReadyFrame { pixel_buffer: decoded.pixel_buffer, timing });
     })

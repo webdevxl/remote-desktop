@@ -52,7 +52,12 @@ else
 fi
 
 mkdir -p "$DATA_DIR"
-open -n "$APP" --env LANKVM_PORT="$PORT" --env LANKVM_DATA_DIR="$DATA_DIR"
+# Pass through settings for test runs (e.g. LANKVM_NO_PROMPTS=1 from scripts/e2e-control.sh).
+extra=()
+for var in LANKVM_NO_PROMPTS LANKVM_INJECT; do
+    [[ -n "${!var:-}" ]] && extra+=(--env "$var=${!var}")
+done
+open -n "$APP" --env LANKVM_PORT="$PORT" --env LANKVM_DATA_DIR="$DATA_DIR" ${extra[@]+"${extra[@]}"}
 
 for _ in {1..50}; do [[ -n "$(holder)" ]] && break; sleep 0.1; done
 if [[ -z "$(holder)" ]]; then

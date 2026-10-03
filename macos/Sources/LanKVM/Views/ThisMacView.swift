@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import SwiftUI
 
 struct ThisMacView: View {
@@ -12,6 +13,8 @@ struct ThisMacView: View {
             )
 
             ScreenSharingCard()
+
+            RemoteControlCard()
 
             if let mac = core.thisMac {
                 VStack(alignment: .leading, spacing: 8) {
@@ -33,16 +36,24 @@ struct ThisMacView: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                SectionLabel(title: "Viewing this Mac now")
+                SectionLabel(title: "Connected to this Mac now")
                 Card {
                     if core.host.viewers.isEmpty {
                         CardRow(icon: "eye.slash", title: "Nobody is connected")
                     }
                     ForEach(Array(core.host.viewers.enumerated()), id: \.element.id) { index, viewer in
                         if index > 0 { CardDivider() }
-                        CardRow(icon: "eye", tint: .lkAccent, title: viewer.name, detail: viewer.address, monospacedDetail: true) {
-                            Button("Disconnect") { core.kick(viewer) }
-                                .buttonStyle(SecondaryButtonStyle(destructive: true))
+                        CardRow(icon: viewer.controlling ? "cursorarrow.rays" : "eye", tint: .lkAccent, title: viewer.name,
+                                detail: "\(viewer.controlling ? "Controlling" : "Viewing") · \(viewer.address)", monospacedDetail: true) {
+                            HStack(spacing: 8) {
+                                if viewer.controlling {
+                                    Button("Stop Control") { core.stopControl(viewer) }
+                                        .buttonStyle(SecondaryButtonStyle())
+                                        .help("Take back the mouse and keyboard; \(viewer.name) keeps viewing (⌃⌥⌘.)")
+                                }
+                                Button("Disconnect") { core.kick(viewer) }
+                                    .buttonStyle(SecondaryButtonStyle(destructive: true))
+                            }
                         }
                     }
                 }
@@ -129,10 +140,94 @@ private struct ScreenSharingCard: View {
 
     private var explanation: String {
         switch core.canShareScreen {
-        case .some(true): "Paired Macs can see and control this screen. You'll be asked for a code the first time a new Mac connects."
+        case .some(true): "Paired Macs can see this screen. You'll be asked for a code the first time a new Mac connects."
         case .some(false): "macOS hasn't allowed LanKVM to record the screen yet, so other Macs can't view this one."
         case .none: "Checking Screen Recording permission…"
         }
+    }
+}
+
+/// Whether paired Macs can use this Mac's mouse and keyboard, and how to allow it.
+private struct RemoteControlCard: View {
+    @EnvironmentObject private var core: CoreModel
+    private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    private var allowed: Binding<Bool> {
+        Binding(get: { core.host.allowControl }, set: { core.setAllowControl($0) })
+    }
+
+    var body: some View {
+        Card {
+            HStack(alignment: .top, spacing: 12) {
+                IconBadge(systemName: needsPermission ? "exclamationmark.triangle" : "cursorarrow.rays", tint: needsPermission ? .lkWarning : .lkAccent)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Remote control")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.lkText)
+                        Spacer()
+                        status
+                    }
+                    Text(explanation)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.lkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Toggle("Let paired Macs control this Mac", isOn: allowed)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .font(.system(size: 12))
+                        .padding(.top, 2)
+                    if needsPermission {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Step(number: 1, text: "Click Allow Control and choose Open System Settings.")
+                            Step(number: 2, text: "Turn on LanKVM under Accessibility.")
+                            Step(number: 3, text: "Already on but still not ready? Remove LanKVM with −, add it again, or relaunch LanKVM.")
+                        }
+                        .padding(.top, 2)
+                        HStack(spacing: 8) {
+                            Button("Allow Control…") { core.requestControlPermission() }
+                                .buttonStyle(PrimaryButtonStyle())
+                            Button("Open Accessibility Settings") { core.openAccessibilitySettings() }
+                                .buttonStyle(SecondaryButtonStyle())
+                            Button("Relaunch") { core.relaunch() }
+                                .buttonStyle(SecondaryButtonStyle())
+                        }
+                        .padding(.top, 4)
+                    }
+                }
+            }
+            .padding(14)
+        }
+        .onReceive(poll) { _ in
+            // macOS reports a new Accessibility grant while LanKVM runs; pick it up quickly. Only
+            // the cheap check runs every second (the full status asks the permission database,
+            // which takes milliseconds on the thread that forwards input).
+            if needsPermission && AXIsProcessTrusted() { core.refreshHost() }
+        }
+    }
+
+    private var needsPermission: Bool { core.host.allowControl && !core.host.controlPermission }
+
+    @ViewBuilder private var status: some View {
+        if let controller = core.host.controller {
+            StatusPill(text: "Controlled by \(controller.name)", color: .lkAccent)
+        } else if !core.host.allowControl {
+            StatusPill(text: "Off", color: .lkSecondary)
+        } else if needsPermission {
+            StatusPill(text: "Needs permission", color: .lkWarning)
+        } else {
+            StatusPill(text: "Ready", color: .lkSuccess)
+        }
+    }
+
+    private var explanation: String {
+        if !core.host.allowControl {
+            return "Paired Macs can only view this screen."
+        }
+        if needsPermission {
+            return "To use this Mac's mouse and keyboard from another Mac, macOS needs to allow LanKVM under Accessibility."
+        }
+        return "Paired Macs can switch to Control and use this Mac's mouse and keyboard. To take it back at any time, press ⌃⌥⌘ and the period key here."
     }
 }
 

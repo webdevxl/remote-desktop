@@ -3,6 +3,7 @@
 //! The SwiftUI app drives it through the C ABI in [`ffi`] and receives [`Event`]s as JSON.
 
 mod client;
+pub mod control;
 pub mod ffi;
 mod host;
 mod render;
@@ -18,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use platform_mac::{permissions, system};
-use protocol::DEFAULT_PORT;
+use protocol::{CursorState, DEFAULT_PORT, InputMsg};
 use quinn::Endpoint;
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
@@ -26,6 +27,8 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use transport::identity::{DeviceIdentity, Fingerprint, short_hex};
 use transport::pairing::TrustStore;
 
+pub use crate::client::FrameProbe;
+pub use crate::stats::FrameTiming;
 use crate::client::{Session, SessionEvent, SessionInfo};
 
 /// Notifications for the UI. Delivered on arbitrary threads.
@@ -40,6 +43,37 @@ pub enum Event {
     PinNeeded { session: u64 },
     Connected { session: u64, info: SessionInfo },
     Ended { session: u64, error: Option<String> },
+    /// Whether this session controls its host now (answering `request`, or 0 when the host acted
+    /// on its own); `reason` (a `ControlReason` code) and `message` say why not.
+    #[serde(rename_all = "camelCase")]
+    Control { session: u64, request: u32, active: bool, reason: u16, message: String, injected_tag: i64, host_pid: u32 },
+    /// A host cursor image (base64 PNG at 2x; sizes and hot spot in points, top-left origin).
+    #[serde(rename_all = "camelCase")]
+    CursorShape {
+        session: u64,
+        id: u32,
+        #[serde(serialize_with = "base64")]
+        png: Vec<u8>,
+        width: f32,
+        height: f32,
+        hot_x: f32,
+        hot_y: f32,
+    },
+    /// How to show the host's cursor: `shape` with `id`, `hidden`, or `inVideo`.
+    Cursor { session: u64, state: &'static str, id: Option<u32> },
+}
+
+/// Serializes bytes as standard base64 (what Swift's `JSONDecoder` expects for `Data`).
+fn base64<S: serde::Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    s.serialize_str(&out)
 }
 
 pub type EventSink = Arc<dyn Fn(Event) + Send + Sync>;
@@ -79,33 +113,119 @@ pub struct Core {
     recents: Mutex<Recents>,
     sessions: Mutex<HashMap<u64, Arc<Session>>>,
     next_session: AtomicU64,
+    _activity: Activity,
+}
+
+/// Keeps App Nap from throttling the process: a host usually runs in the background, and a
+/// throttled timer or thread is added latency for whoever controls it.
+struct Activity(#[allow(dead_code)] system::ActivityToken);
+// SAFETY: the token is an opaque object that is only kept alive, never used.
+unsafe impl Send for Activity {}
+unsafe impl Sync for Activity {}
+
+/// How a core runs. [`CoreOptions::from_env`] is what the app uses; tests run several cores in
+/// one process with their own directories and ports.
+#[derive(Clone, Debug)]
+pub struct CoreOptions {
+    /// Identity, trust lists and settings.
+    pub data_dir: PathBuf,
+    /// UDP port to listen on (0: any free port).
+    pub port: u16,
+    /// Stream the screen to viewers. Without it a host still accepts viewers and remote control,
+    /// for tests that run without Screen Recording permission.
+    pub video: bool,
+    /// Where injected input goes.
+    pub backend: control::Backend,
+    /// Let a viewer on this same Mac control it (only for testing: the pointer and keyboard are
+    /// shared, so it would otherwise loop).
+    pub allow_same_mac_control: bool,
+    /// Tests: inject only into this process's windows (`LANKVM_INJECT_GUARD_PID`).
+    pub guard_pid: Option<i32>,
+    /// Tests: end control this long after granting it (`LANKVM_TEST_CONTROL_TTL`, seconds).
+    pub control_ttl: Option<std::time::Duration>,
+}
+
+impl CoreOptions {
+    /// `LANKVM_DATA_DIR`, `LANKVM_PORT` and `LANKVM_INJECT`, or the defaults.
+    pub fn from_env() -> Self {
+        Self {
+            data_dir: data_dir(),
+            port: std::env::var("LANKVM_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT),
+            video: true,
+            backend: control::Backend::from_env(),
+            allow_same_mac_control: std::env::var("LANKVM_ALLOW_SAME_MAC_CONTROL").is_ok_and(|v| v == "1"),
+            guard_pid: std::env::var("LANKVM_INJECT_GUARD_PID").ok().and_then(|v| v.parse().ok()),
+            control_ttl: std::env::var("LANKVM_TEST_CONTROL_TTL")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
+                .filter(|d| !d.is_zero()),
+        }
+    }
 }
 
 impl Core {
     pub fn start(events: EventSink) -> Result<Arc<Self>> {
+        Self::start_with(events, CoreOptions::from_env())
+    }
+
+    pub fn start_with(events: EventSink, options: CoreOptions) -> Result<Arc<Self>> {
         init_logging();
-        let dir = data_dir();
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+        let activity = Activity(system::begin_latency_critical_activity());
+        let CoreOptions { data_dir: dir, port, video, backend, allow_same_mac_control, guard_pid, control_ttl } = options;
+        // Video decode runs synchronously on these (3-6 ms a frame); enough workers keep the
+        // connection drivers and input writer from waiting behind it.
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
         let identity = DeviceIdentity::load_or_create(&dir)?;
-        let port = std::env::var("LANKVM_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT);
         let endpoint = {
             let _guard = rt.enter();
             transport::endpoint::make_endpoint(SocketAddr::from(([0, 0, 0, 0], port)), &identity)
                 .with_context(|| format!("Can't listen on UDP port {port}. Is LanKVM already running?"))?
         };
+        let port = endpoint.local_addr()?.port();
         let device_id = short_hex(&identity.fingerprint);
         tracing::info!(addr = %endpoint.local_addr()?, %device_id, "listening");
+        tracing::info!(
+            screen_capture = permissions::screen_capture_allowed(),
+            input_control = permissions::input_control_allowed(),
+            "permissions"
+        );
 
         let trust = Arc::new(Trust {
             fingerprint: identity.fingerprint,
             viewers: Mutex::new(TrustStore::load(&dir.join("trusted-viewers.txt"))),
             hosts: Mutex::new(TrustStore::load(&dir.join("trusted-hosts.txt"))),
         });
+        // The first keyboard event a process creates must be made on the main thread (it loads
+        // the keyboard layout); lk_start runs there. Elsewhere (tests) it would do no good.
+        if platform_mac::system::is_main_thread() {
+            platform_mac::inject::warm_up();
+        }
+        let settings_path = dir.join("host-settings.json");
+        if backend != control::Backend::Hid {
+            tracing::warn!(?backend, "injected input is redirected (LANKVM_INJECT)");
+        }
         let host = Arc::new(host::HostCtx {
             status: Mutex::new(host::HostStatus::default()),
             events: events.clone(),
             trust: trust.clone(),
+            settings: Mutex::new(control::HostSettings::load(&settings_path)),
+            settings_path,
+            backend,
+            injected_tag: platform_mac::inject::new_injected_tag(),
+            rt: rt.handle().clone(),
+            video,
+            inputs: Mutex::new(Vec::new()),
+            allow_same_mac_control,
+            controller: Mutex::new(None),
+            guard_pid,
+            control_ttl,
+            pairing_throttle: Default::default(),
+            pending: Default::default(),
         });
+        if guard_pid.is_some() || control_ttl.is_some() {
+            tracing::warn!(?guard_pid, ?control_ttl, "test limits on remote control");
+        }
         rt.spawn(host::run(endpoint.clone(), host.clone()));
 
         let this_mac = ThisMac { name: system::device_name(), addresses: local_addresses(), port, device_id };
@@ -119,7 +239,23 @@ impl Core {
             recents: Mutex::new(Recents::load(&dir.join("recent-hosts.txt"))),
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
+            _activity: activity,
         }))
+    }
+
+    /// Before the app quits: lets go of everything held on this Mac for a remote viewer, and of
+    /// everything this Mac holds on remote Macs, so no key stays down anywhere. Blocks briefly.
+    pub fn shutdown(&self) {
+        self.host.release_all_input(std::time::Duration::from_millis(300));
+        let sessions: Vec<_> = self.sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
+        for s in &sessions {
+            s.close();
+        }
+        // Tell every peer (viewers of this Mac included) the connection is over, rather than
+        // leaving them to time out, and give that a moment to go out.
+        self.endpoint.close(0u32.into(), b"LanKVM quit");
+        let endpoint = self.endpoint.clone();
+        let _ = self.rt.block_on(async { tokio::time::timeout(std::time::Duration::from_millis(300), endpoint.wait_idle()).await });
     }
 
     pub fn this_mac(&self) -> &ThisMac {
@@ -148,7 +284,8 @@ impl Core {
     }
 
     /// Opens a viewer session; progress arrives as events tagged with the returned id.
-    pub fn connect(self: &Arc<Self>, target: &str, max_size: (u32, u32)) -> u64 {
+    /// `max_size` and `max_fps` describe this Mac's screen (pixels, refresh rate).
+    pub fn connect(self: &Arc<Self>, target: &str, max_size: (u32, u32), max_fps: u32) -> u64 {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
         let target = target.trim().to_string();
         let weak = Arc::downgrade(self);
@@ -167,6 +304,26 @@ impl Core {
                     std::thread::spawn(move || drop(ended));
                     Event::Ended { session: id, error }
                 }
+                SessionEvent::Control(state) => Event::Control {
+                    session: id,
+                    request: state.request,
+                    active: state.active,
+                    reason: state.reason.0,
+                    message: state.message,
+                    injected_tag: state.injected_tag,
+                    host_pid: state.host_pid,
+                },
+                SessionEvent::CursorShape { id: shape, png, width, height, hot_x, hot_y } => {
+                    Event::CursorShape { session: id, id: shape, png, width, height, hot_x, hot_y }
+                }
+                SessionEvent::Cursor(state) => {
+                    let (state, shape) = match state {
+                        CursorState::Shape(shape) => ("shape", Some(shape)),
+                        CursorState::Hidden => ("hidden", None),
+                        CursorState::InVideo => ("inVideo", None),
+                    };
+                    Event::Cursor { session: id, state, id: shape }
+                }
             };
             (core.events)(event);
         });
@@ -176,6 +333,7 @@ impl Core {
             self.trust.clone(),
             target,
             max_size,
+            max_fps,
             on_event,
         );
         self.sessions.lock().unwrap().insert(id, Arc::new(session));
@@ -189,6 +347,32 @@ impl Core {
     pub fn submit_pin(&self, id: u64, pin: &str) {
         if let Some(s) = self.session(id) {
             s.submit_pin(pin.to_string());
+        }
+    }
+
+    /// Asks the session's host for control (true) or to only view it (false). Returns the
+    /// request id the answer will carry (0 if there's no such session).
+    pub fn set_control(&self, id: u64, on: bool, take_over: bool) -> u32 {
+        self.session(id).map_or(0, |s| s.set_control(on, take_over))
+    }
+
+    /// While controlling: whether the session's window has the focus.
+    pub fn set_focus(&self, id: u64, forwarding: bool) {
+        if let Some(s) = self.session(id) {
+            s.set_focus(forwarding);
+        }
+    }
+
+    pub fn send_input(&self, id: u64, msg: InputMsg) {
+        if let Some(s) = self.session(id) {
+            s.send_input(msg);
+        }
+    }
+
+    /// Test hook: calls `probe` with every decoded frame of the session.
+    pub fn set_frame_probe(&self, id: u64, probe: Option<FrameProbe>) {
+        if let Some(s) = self.session(id) {
+            s.set_frame_probe(probe);
         }
     }
 
@@ -227,6 +411,26 @@ impl Core {
 
     pub fn kick_viewer(&self, id: u64) {
         self.host.close_viewer(id);
+    }
+
+    /// Takes control back from a viewer, which keeps viewing.
+    pub fn stop_control(&self, id: u64) {
+        self.host.stop_control(id);
+    }
+
+    /// Takes control back from whoever has it.
+    pub fn stop_all_control(&self) {
+        self.host.stop_all_control();
+    }
+
+    /// Whether paired Macs may control this one.
+    pub fn set_allow_control(&self, allow: bool) {
+        self.host.set_allow_control(allow);
+    }
+
+    /// Fresh check of the Accessibility permission (the host status includes it too).
+    pub fn control_permission(&self) -> bool {
+        self.host.backend.permitted()
     }
 
     pub fn deny_pairing(&self, id: u64) {
@@ -345,6 +549,12 @@ fn init_logging() {
     };
 }
 
+/// Whether `ip` belongs to this Mac (loopback or one of its interfaces).
+pub(crate) fn is_this_mac(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback() || if_addrs::get_if_addrs().unwrap_or_default().iter().any(|i| i.ip() == ip)
+}
+
 /// Private IPv4 addresses of this Mac, i.e. what to type on the other machine.
 fn local_addresses() -> Vec<String> {
     let mut addrs: Vec<String> = if_addrs::get_if_addrs()
@@ -364,6 +574,20 @@ fn local_addresses() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_the_standard() {
+        let enc = |b: &[u8]| {
+            let mut out = Vec::new();
+            base64(b, &mut serde_json::Serializer::new(&mut out)).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(enc(b""), "\"\"");
+        assert_eq!(enc(b"f"), "\"Zg==\"");
+        assert_eq!(enc(b"fo"), "\"Zm8=\"");
+        assert_eq!(enc(b"foo"), "\"Zm9v\"");
+        assert_eq!(enc(b"\x89PNG\r\n"), "\"iVBORw0K\"");
+    }
 
     #[test]
     fn hex_round_trip() {

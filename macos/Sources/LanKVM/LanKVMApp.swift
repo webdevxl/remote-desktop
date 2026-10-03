@@ -26,6 +26,43 @@ struct LanKVMApp: App {
         }
         .defaultSize(width: 1280, height: 800)
         .windowToolbarStyle(.unified(showsTitle: true))
+        .commands {
+            CommandMenu("Control") {
+                Toggle("Send System Shortcuts to Remote Mac", isOn: $sendSystemShortcuts)
+                Text("⌘Tab, ⌘Space, Mission Control and screenshot keys go to the Mac you control.")
+            }
+        }
+
+        // Shown while another Mac views or controls this one, so whoever sits here can see it
+        // and take control back.
+        MenuBarExtra(isInserted: Binding(get: { !core.host.viewers.isEmpty }, set: { _ in })) {
+            HostMenu().environmentObject(core)
+        } label: {
+            Image(systemName: core.host.controller != nil ? "cursorarrow.rays" : "eye")
+        }
+    }
+
+    @AppStorage(SystemShortcuts.defaultsKey) private var sendSystemShortcuts = true
+}
+
+/// The menu-bar menu on a Mac others are connected to.
+private struct HostMenu: View {
+    @EnvironmentObject private var core: CoreModel
+
+    var body: some View {
+        ForEach(core.host.viewers) { viewer in
+            Text("\(viewer.name) is \(viewer.controlling ? "controlling" : "viewing") this Mac")
+        }
+        Divider()
+        if core.host.controller != nil {
+            Button("Stop Control (⌃⌥⌘.)") { core.stopAllControl() }
+        }
+        Button("Disconnect All") { core.host.viewers.forEach(core.kick) }
+        Divider()
+        Button("Open LanKVM") {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first { $0.identifier?.rawValue.hasPrefix("main") == true }?.makeKeyAndOrderFront(nil)
+        }
     }
 }
 
@@ -43,5 +80,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Keep running (and reachable by other Macs) when the window is closed.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            // ⌘Tab and Spotlight belong to this Mac again, and no key or button may stay down on
+            // either Mac.
+            SystemShortcuts.restore()
+            CoreModel.shared.shutdown()
+        }
     }
 }

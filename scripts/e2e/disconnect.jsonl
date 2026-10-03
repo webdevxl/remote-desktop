@@ -1,0 +1,8 @@
+# The viewer holds shift, a key and the mouse button, then disconnects: everything is released.
+{"move":"patch"}
+{"mods":["lshift"]}
+{"keydown":"x"}
+{"down":"patch"}
+{"move":"patch+30,30"}
+{"disconnect":true}
+{"assert_idle":true}

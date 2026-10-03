@@ -67,6 +67,14 @@ pub fn main_display() -> Result<DisplayInfo> {
     Ok(DisplayInfo { id, width, height })
 }
 
+/// The main display's id and pixel size without asking ScreenCaptureKit (which needs Screen
+/// Recording permission). Enough to map input; not to capture.
+pub fn main_display_bounds() -> DisplayInfo {
+    let id = CGMainDisplayID();
+    let (width, height) = native_pixel_size(id).unwrap_or((1920, 1080));
+    DisplayInfo { id, width, height }
+}
+
 fn native_pixel_size(display_id: u32) -> Option<(u32, u32)> {
     let mode = CGDisplayCopyDisplayMode(display_id)?;
     let w = CGDisplayMode::pixel_width(Some(&mode));
@@ -167,6 +175,9 @@ fn captured_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
 
 pub struct Capturer {
     stream: Retained<SCStream>,
+    /// Kept to change settings later: `updateConfiguration` replaces the whole configuration,
+    /// and a fresh one would silently fall back to 1080p video-range frames.
+    config: Retained<SCStreamConfiguration>,
     _output: Retained<StreamOutput>,
     _queue: DispatchRetained<DispatchQueue>,
 }
@@ -231,7 +242,21 @@ impl Capturer {
                 .map_err(|e| anyhow!("add stream output: {}", e.localizedDescription()))?;
             wait_completion(|block| stream.startCaptureWithCompletionHandler(Some(block)))
                 .context("start capture")?;
-            Ok(Self { stream, _output: output, _queue: queue })
+            Ok(Self { stream, config, _output: output, _queue: queue })
+        }
+    }
+
+    /// Draws the cursor into the frames or leaves it out, without restarting capture. Blocks
+    /// until ScreenCaptureKit applies it, so call it off the async runtime.
+    pub fn set_shows_cursor(&self, show: bool) -> Result<()> {
+        unsafe {
+            if self.config.showsCursor() == show {
+                return Ok(());
+            }
+            self.config.setShowsCursor(show);
+            let (stream, config) = (&self.stream, &self.config);
+            wait_completion(|block| stream.updateConfiguration_completionHandler(config, Some(block)))
+                .context("update capture configuration")
         }
     }
 }

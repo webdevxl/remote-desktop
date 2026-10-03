@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{Connection, Endpoint, EndpointConfig, TransportConfig};
+use quinn::{AckFrequencyConfig, Connection, Endpoint, EndpointConfig, TransportConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -45,7 +45,7 @@ pub fn make_endpoint(bind: SocketAddr, identity: &DeviceIdentity) -> Result<Endp
     client_crypto.alpn_protocols = vec![protocol::ALPN.to_vec()];
     let mut client_config =
         quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
-    client_config.transport_config(transport_config());
+    client_config.transport_config(client_transport_config());
 
     let socket = bind_socket(bind).with_context(|| format!("bind UDP {bind}"))?;
     let runtime = quinn::default_runtime().context("no async runtime")?;
@@ -65,7 +65,36 @@ fn bind_socket(bind: SocketAddr) -> Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
+/// Hosts accept exactly one control stream and one input stream from each viewer (two input
+/// streams while a replaced one winds down) and never read datagrams. Tight limits keep a peer,
+/// paired or not, from making the host buffer data it never reads.
 fn transport_config() -> Arc<TransportConfig> {
+    let mut t = base_transport_config();
+    t.max_concurrent_bidi_streams(1u32.into());
+    t.max_concurrent_uni_streams(2u32.into());
+    t.receive_window((8u32 * 1024 * 1024).into());
+    // Not None: quinn then refuses to send datagrams too, and video travels in them.
+    t.datagram_receive_buffer_size(Some(64 * 1024));
+    Arc::new(t)
+}
+
+/// The viewer side sends input, so it asks the host to acknowledge every packet within a
+/// millisecond. A lost input packet is then noticed and resent in a few ms instead of waiting
+/// out QUIC's default 25 ms ACK delay (measured: ~4 ms instead of ~35 ms on a LAN).
+fn client_transport_config() -> Arc<TransportConfig> {
+    let mut t = base_transport_config();
+    let mut ack = AckFrequencyConfig::default();
+    ack.ack_eliciting_threshold(0u32.into())
+        .max_ack_delay(Some(Duration::from_millis(1)))
+        .reordering_threshold(1u32.into());
+    t.ack_frequency_config(Some(ack));
+    // Hosts never open streams.
+    t.max_concurrent_bidi_streams(0u32.into());
+    t.max_concurrent_uni_streams(0u32.into());
+    Arc::new(t)
+}
+
+fn base_transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
     t.max_idle_timeout(Some(Duration::from_secs(8).try_into().expect("valid idle timeout")));
     t.keep_alive_interval(Some(Duration::from_secs(1)));
@@ -74,7 +103,7 @@ fn transport_config() -> Arc<TransportConfig> {
     t.congestion_controller_factory(Arc::new(LanControllerFactory));
     // Ethernet and Wi-Fi both carry 1500-byte frames; MTU discovery can still raise this.
     t.initial_mtu(1400);
-    Arc::new(t)
+    t
 }
 
 /// Fingerprint of the certificate the peer presented during the handshake.

@@ -23,9 +23,10 @@ enum Snapshot {
                 ZStack { Color.lkBackground; PinEntryView(hostLabel: "192.168.1.31", onSubmit: { _ in }, onCancel: {}) },
                 size: CGSize(width: 640, height: 460), appearance: appearance,
                 to: dir.appendingPathComponent("pin-entry-\(suffix).png"))
-            let info = SessionInfo(hostName: "Studio", address: "192.168.1.31:47800", width: 3024, height: 1964, fps: 60, codec: "Hevc")
+            let info = SessionInfo(hostName: "Studio", hostId: "9f12:0ab3:77c1:e402", address: "192.168.1.31:47800", width: 3024, height: 1964, fps: 60, codec: "Hevc")
             let sample = SessionStats(fps: 60, mbps: 31.4, totalMs: 17.8, captureMs: 4.3, encodeMs: 4.1, networkMs: 0.9, decodeMs: 2.3,
-                                      displayMs: 1.9, rttMs: 0.6, framesShown: 1200, framesLost: 0, keyframeRequests: 1)
+                                      displayMs: 1.9, rttMs: 0.6, framesShown: 1200, framesLost: 0, keyframeRequests: 1,
+                                      inputMs: 0.4, inputsSent: 5210)
             render(
                 ZStack(alignment: .topLeading) {
                     LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -33,6 +34,24 @@ enum Snapshot {
                 }.environmentObject(core),
                 size: CGSize(width: 520, height: 320), appearance: appearance,
                 to: dir.appendingPathComponent("hud-\(suffix).png"))
+            let refused = SessionModel(id: 0, target: "192.168.1.31")
+            refused.control = .refused(ControlReason.needsPermission, "Studio hasn't allowed LanKVM to control it yet. On that Mac, turn on LanKVM in System Settings → Privacy & Security → Accessibility.")
+            let inUse = SessionModel(id: 0, target: "192.168.1.31")
+            inUse.control = .refused(ControlReason.inUse, "Mac mini is controlling Studio right now.")
+            let asking = SessionModel(id: 0, target: "192.168.1.31")
+            asking.control = .requesting
+            render(
+                ZStack(alignment: .top) {
+                    LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    VStack(spacing: 12) {
+                        ControlBanner(session: refused, hostName: "Studio")
+                        ControlBanner(session: inUse, hostName: "Studio")
+                        ControlBanner(session: asking, hostName: "Studio")
+                    }
+                    .padding(.top, 14)
+                },
+                size: CGSize(width: 640, height: 260), appearance: appearance,
+                to: dir.appendingPathComponent("control-banners-\(suffix).png"))
             render(EndedView(target: "192.168.1.31", error: "That Mac hasn't allowed Screen Recording for LanKVM yet.", reconnect: {}, close: {}),
                    size: CGSize(width: 640, height: 420), appearance: appearance,
                    to: dir.appendingPathComponent("ended-\(suffix).png"))

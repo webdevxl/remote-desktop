@@ -68,3 +68,40 @@ pub fn import_nv12(device: &wgpu::Device, pixel_buffer: CFRetained<CVPixelBuffer
     drop(hal);
     Ok(Nv12Frame { y, uv, width, height, _pixel_buffer: pixel_buffer })
 }
+
+/// Mean brightness (0-255) of a region of an NV12 frame's luma plane, for tests that watch the
+/// video for a change. The region is normalized (0...1, top-left origin). Reads the frame on the
+/// CPU, so only for diagnostics.
+pub fn mean_luma(pixel_buffer: &objc2_core_video::CVPixelBuffer, x0: f64, y0: f64, x1: f64, y1: f64) -> Option<f64> {
+    use objc2_core_video::{
+        CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane,
+        CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    };
+    let read_only = CVPixelBufferLockFlags::ReadOnly;
+    unsafe {
+        if CVPixelBufferLockBaseAddress(pixel_buffer, read_only) != 0 {
+            return None;
+        }
+        let base = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0) as *const u8;
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
+        let (w, h) = (CVPixelBufferGetWidthOfPlane(pixel_buffer, 0), CVPixelBufferGetHeightOfPlane(pixel_buffer, 0));
+        let mut result = None;
+        if !base.is_null() && w > 0 && h > 0 {
+            let px = |v: f64, n: usize| ((v.clamp(0.0, 1.0) * n as f64) as usize).min(n - 1);
+            let (ax, bx, ay, by) = (px(x0, w), px(x1, w), px(y0, h), px(y1, h));
+            let (mut sum, mut count) = (0u64, 0u64);
+            for y in (ay..=by).step_by(2) {
+                let row = base.add(y * stride);
+                for x in (ax..=bx).step_by(2) {
+                    sum += u64::from(*row.add(x));
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                result = Some(sum as f64 / count as f64);
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pixel_buffer, read_only);
+        result
+    }
+}

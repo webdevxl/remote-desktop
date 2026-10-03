@@ -1,0 +1,56 @@
+# Remote-control scenario for LanKVM Input Lab (positions name its parts; run the probe with
+# --lab <lab log>). scripts/e2e/check_lab.py checks what the lab received.
+# Pointer: aim, click into the text box and type, with shift and punctuation.
+{"move":"text"}
+{"click":"text"}
+{"text":"Hello, LanKVM! 123"}
+{"sleep":150}
+# Shortcuts: select all, then replace.
+{"mods":["lcmd"]}
+{"key":"a"}
+{"mods":[]}
+{"text":"ok"}
+# Arrows and delete: "ok" -> left, delete -> "k"
+{"key":"left"}
+{"key":"delete"}
+# Option dead key: option-e then e gives é (ABC/US layout on the host).
+{"mods":["lopt"]}
+{"key":"e"}
+{"mods":[]}
+{"key":"e"}
+# Right shift (device bit 0x4) and caps lock as state.
+{"mods":["rshift"]}
+{"key":"b"}
+{"mods":[]}
+{"mods":["caps"]}
+{"text":"cd"}
+{"mods":[]}
+{"sleep":150}
+# Clicks on the patch: single, double, triple, right, middle.
+{"click":"patch"}
+{"sleep":400}
+{"double":"patch+40,40"}
+{"sleep":400}
+{"triple":"patch+80,80"}
+{"sleep":400}
+{"click":"patch+60,200","button":1}
+{"sleep":300}
+{"click":"patch+200,60","button":2}
+{"sleep":300}
+# A drag across the patch, and a command-click.
+{"drag":["patch+20,20","patch+250,250"],"steps":15}
+{"mods":["lcmd"]}
+{"click":"patch+30,240"}
+{"mods":[]}
+# Trackpad-style scroll with phases, then a wheel click, in the scroll area.
+{"scroll":"scroll","dy":-240,"steps":8}
+{"sleep":200}
+{"wheel":"scroll","lines":-3}
+{"sleep":200}
+# A key held for 1.5 s with heartbeats: one press, no host-made repeats. The click (below the
+# text, away from the scroller) puts the caret at the end first.
+{"click":"text+300,200"}
+{"hold":"space","ms":1500,"heartbeat":true}
+{"sleep":300}
+# Nothing left held anywhere on this Mac.
+{"assert_idle":true}

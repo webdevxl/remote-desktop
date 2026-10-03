@@ -260,7 +260,9 @@ fn create_session(cfg: &EncoderConfig, codec: Codec, require_hardware: bool, ctx
         };
         set(kVTCompressionPropertyKey_ProfileLevel, profile.as_ref(), false)?;
         set(kVTCompressionPropertyKey_AverageBitRate, CFNumber::new_i32(cfg.bitrate_bps as i32).as_ref(), true)?;
-        set(kVTCompressionPropertyKey_ExpectedFrameRate, CFNumber::new_i32(cfg.fps as i32).as_ref(), false)?;
+        // Telling the encoder to expect 120 fps makes it finish each frame sooner (measured on an
+        // M3 Max: about 1.5 ms less at 4112×2658), whatever the actual rate.
+        set(kVTCompressionPropertyKey_ExpectedFrameRate, CFNumber::new_i32(cfg.fps.max(120) as i32).as_ref(), false)?;
         // Hard cap: at most 2x the average over any one-second window.
         let bytes = CFNumber::new_i64(i64::from(cfg.bitrate_bps) / 8 * 2);
         let seconds = CFNumber::new_f64(1.0);

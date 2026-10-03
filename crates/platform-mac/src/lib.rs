@@ -4,9 +4,12 @@
 
 pub mod capture;
 pub mod clock;
+pub mod cursor;
 pub mod decoder;
 pub mod encoder;
 pub mod gpu;
+pub mod inject;
+pub mod keys;
 mod nal;
 pub mod system;
 pub mod permissions;
