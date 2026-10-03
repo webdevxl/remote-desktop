@@ -8,6 +8,12 @@ name = "lankvm_core"
 # staticlib: linked into the SwiftUI app. rlib: for `cargo test`.
 crate-type = ["staticlib", "rlib"]
 
+# `cargo test` only builds examples unless told otherwise; the probe's tests check the e2e
+# scenario scripts, so they run with everything else.
+[[example]]
+name = "probe"
+test = true
+
 [dependencies]
 protocol.workspace = true
 transport.workspace = true

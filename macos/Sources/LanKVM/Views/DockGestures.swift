@@ -116,7 +116,8 @@ enum DockGestures {
         owner.dockSwipe(sample)
     }
 
-    /// From the tap: it lost track of the gesture it was taking for the window of `generation`.
+    /// From the tap: the gesture it was taking for the window of `generation` sends that window
+    /// nothing more (the tap lost track of it, or that window stopped taking gestures).
     fileprivate static func lost(_ generation: Int) {
         guard generation == self.generation, let owner else { return }
         owner.cancelDockSwipe()
@@ -156,13 +157,13 @@ struct DockGestureClaim: Sendable {
 
     /// Who made an event.
     enum Source: Equatable {
-        /// This Mac's trackpad.
-        case trackpad
+        /// Made on this Mac: its trackpad, or an app that turns other input into Dock gestures
+        /// (Mac Mouse Fix, BetterTouchTool). While controlling, that goes to the remote Mac too.
+        case local
         /// LanKVM's host on this Mac, for a Mac controlling this one: passed on, one host further.
         case relayed(depth: UInt8)
-        /// Another app's synthetic gesture, or the window's own remote Mac when that is this Mac:
-        /// the Dock here acts on it.
-        case other
+        /// The window's own remote Mac, when that is this Mac (test mode): the Dock here acts on it.
+        case echo
     }
 
     enum Verdict: Equatable {
@@ -180,8 +181,8 @@ struct DockGestureClaim: Sendable {
         var send: Int?
         /// ...as relayed through this many LanKVM hosts.
         var depth: UInt8 = 0
-        /// The gesture before never ended (its end was missed): cancel it in the window of this
-        /// generation first.
+        /// A gesture taken for the window of this generation sends it nothing more (its end was
+        /// missed, or that window stopped taking gestures): cancel it there first.
         var cancel: Int?
     }
 
@@ -190,6 +191,9 @@ struct DockGestureClaim: Sendable {
     static let changed: Int64 = 2
     static let ended: Int64 = 4
     static let cancelled: Int64 = 8
+    /// The motions the remote Mac can replay (LK_DOCK_*: horizontal, vertical, pinch). The Dock
+    /// knows others (from a screen edge...): those gestures stay on this Mac.
+    static let motions: ClosedRange<Int64> = 1...3
 
     /// Taking the gesture in progress: its events don't reach this Mac's Dock until it ends.
     private(set) var claimed = false
@@ -197,33 +201,32 @@ struct DockGestureClaim: Sendable {
     private(set) var target: Int?
     private var depth: UInt8 = 0
 
-    /// Who made an event, from its source process (field 41) and user data (field 42).
-    static func source(processId: Int64, userData: Int64, injectedTag: Int64) -> Source {
-        if userData >> 32 == InputForwarder.injectedTagPrefix {
-            if injectedTag != 0 && userData & ~InputForwarder.relayDepthMask == injectedTag { return .other }
-            return .relayed(depth: UInt8(clamping: ((userData & InputForwarder.relayDepthMask) >> 24) + 1))
-        }
-        // The trackpad's events come from the window server, not from a process.
-        return processId == 0 ? .trackpad : .other
+    /// Who made an event, from its user data (field 42): LanKVM tags everything its hosts post.
+    /// Not from its source process (field 41): the trackpad's are reported to come from process 0,
+    /// but only one source says so, and a gesture app's should go to the remote Mac as well.
+    static func source(userData: Int64, injectedTag: Int64) -> Source {
+        guard userData >> 32 == InputForwarder.injectedTagPrefix else { return .local }
+        if injectedTag != 0 && userData & ~InputForwarder.relayDepthMask == injectedTag { return .echo }
+        return .relayed(depth: UInt8(clamping: ((userData & InputForwarder.relayDepthMask) >> 24) + 1))
     }
 
-    /// A Dock swipe event (CGS type 30, subtype 23) in `phase`. At Began, `arm` (who takes gestures
-    /// now) and `pointer` (where it is, global display coordinates) decide; later events follow
-    /// that decision, and go to the same window as long as `arm` is still that window's.
-    /// `stillEnd`: the Dock gets a taken gesture's Ended without its motion (macOS 27) instead of
-    /// nothing.
-    mutating func dockSwipe(phase: Int64, processId: Int64, userData: Int64, arm: Arm?, pointer: CGPoint?,
+    /// A Dock swipe event (CGS type 30, subtype 23) in `phase`. At Began, `motion` (one the remote
+    /// Mac can replay), `arm` (who takes gestures now) and `pointer` (where it is, global display
+    /// coordinates) decide; later events follow that decision, and go to the same window as long
+    /// as `arm` is still that window's. `stillEnd`: the Dock gets a taken gesture's Ended without
+    /// its motion (macOS 27) instead of nothing.
+    mutating func dockSwipe(phase: Int64, motion: Int64, userData: Int64, arm: Arm?, pointer: CGPoint?,
                             stillEnd: Bool) -> Step {
         var step = Step()
         if phase == Self.began {
             if claimed { step.cancel = target }
             claimed = false
             target = nil
-            guard let arm, let pointer, arm.area.contains(pointer) else { return step }
-            switch Self.source(processId: processId, userData: userData, injectedTag: arm.injectedTag) {
-            case .trackpad: depth = 0
+            guard let arm, let pointer, Self.motions.contains(motion), arm.area.contains(pointer) else { return step }
+            switch Self.source(userData: userData, injectedTag: arm.injectedTag) {
+            case .local: depth = 0
             case .relayed(let relayed): depth = relayed
-            case .other: return step
+            case .echo: return step
             }
             claimed = true
             target = arm.generation
@@ -233,9 +236,13 @@ struct DockGestureClaim: Sendable {
             return step
         }
         guard claimed else { return step }
-        // That window stopped taking gestures (released, lost the focus...): the rest of this one
-        // goes nowhere, but still not to this Mac's Dock.
-        if target != arm?.generation { target = nil }
+        // That window stopped taking gestures (released, lost the focus...), or the main thread
+        // stalled: the rest of this one goes nowhere, but still not to this Mac's Dock. Cancelled
+        // there, as what was sent of it may still arrive, and nothing else would end it.
+        if let old = target, old != arm?.generation {
+            step.cancel = old
+            target = nil
+        }
         let ends = phase == Self.ended || phase == Self.cancelled
         if ends || phase == Self.changed {
             step.send = target
@@ -445,15 +452,15 @@ private enum GestureTap {
         let pass = Unmanaged.passUnretained(event)
         guard event.getIntegerValueField(DockEvent.subtype) == DockEvent.dockSwipe else { return pass }
         let phase = event.getIntegerValueField(DockEvent.phase)
+        let motion = event.getIntegerValueField(DockEvent.motion)
         // Where the pointer is as a gesture begins (read the way Instant Space Switcher does).
         let pointer = phase == DockGestureClaim.began ? CGEvent(source: nil)?.location : nil
-        let processId = event.getIntegerValueField(.eventSourceUnixProcessID)
         let userData = event.getIntegerValueField(.eventSourceUserData)
         let now = ProcessInfo.processInfo.systemUptime
         let (step, claimed) = tapState.withLock { state in
             // A stalled main thread couldn't send it: leave the gesture to this Mac.
             let arm = now - state.lastTick < mainStallLimit ? state.arm : nil
-            let step = state.claim.dockSwipe(phase: phase, processId: processId, userData: userData, arm: arm,
+            let step = state.claim.dockSwipe(phase: phase, motion: motion, userData: userData, arm: arm,
                                              pointer: pointer, stillEnd: stillEnd)
             if step.verdict != .pass { state.lastClaimedEvent = now }
             return (step, state.claim.claimed)
@@ -461,7 +468,7 @@ private enum GestureTap {
         if let lost = step.cancel { reportLost(lost) }
         if let target = step.send {
             let sample = DockSwipeSample(
-                axis: UInt8(clamping: event.getIntegerValueField(DockEvent.motion)), phase: UInt8(clamping: phase),
+                axis: UInt8(clamping: motion), phase: UInt8(clamping: phase),
                 progress: event.getDoubleValueField(DockEvent.progress),
                 velocityX: event.getDoubleValueField(DockEvent.velocityX),
                 velocityY: event.getDoubleValueField(DockEvent.velocityY),

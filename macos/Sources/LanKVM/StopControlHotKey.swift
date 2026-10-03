@@ -1,7 +1,8 @@
 import Carbon.HIToolbox
 
-/// ⌃⌥⌘. (period), anywhere: takes control back from every viewer controlling this Mac.
-/// Registered only while someone controls it, so the shortcut is otherwise free.
+/// ⌃⌥⌘. (period), anywhere: takes control back from every viewer controlling this Mac, and
+/// removes the displays made for other Macs (so this Mac's own screen is back). Registered only
+/// while someone controls it or such a display exists, so the shortcut is otherwise free.
 @MainActor
 final class StopControlHotKey {
     static let shared = StopControlHotKey()

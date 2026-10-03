@@ -57,8 +57,80 @@ enum Snapshot {
                    to: dir.appendingPathComponent("ended-\(suffix).png"))
             renderSessionControls(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
             renderGestureHint(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
+            renderDisplays(stats: sample, appearance: appearance, suffix: suffix, into: dir)
         }
         NSApp.terminate(nil)
+    }
+
+    /// Virtual displays: the banners while switching and when it went wrong, the dimmed screen
+    /// while switching, the Custom Size sheet, connecting with a display to set up, the
+    /// statistics at a display's size, and the host's list of displays made for other Macs.
+    private static func renderDisplays(stats: SessionStats, appearance: NSAppearance.Name, suffix: String, into dir: URL) {
+        let core = CoreModel.shared
+        let display = RemoteDisplay(kind: .virtual, width: 6144, height: 2560, hidpi: true, refreshHz: 60, arrangement: .only)
+        let info = SessionInfo(hostName: "Studio", hostId: "9f12:0ab3:77c1:e402", address: "192.168.1.31:47800", width: 6144, height: 2560,
+                               fps: 60, codec: "Hevc", display: display)
+        let switching = sampleSession(info: info)
+        switching.display = .switching(request: 2, label: display.sizeText, fromConnect: false)
+        let failed = sampleSession(info: info)
+        failed.display = .failed(DisplayReason.failed,
+                                 "“Studio” couldn't add the display: macOS refused to make it. Try again in a moment.", retry: display)
+        let removed = sampleSession(info: info)
+        removed.display = .failed(DisplayReason.removedByHost,
+                                  "Someone on “Studio” removed its LanKVM display, so this window shows its own screen.", retry: display)
+        let offered = sampleSession(info: info)
+        offered.display = .offered(display)
+        let undecodable = sampleSession(info: info)
+        undecodable.streamError = "This Mac can't decode the 6144×2560 picture (the decoder refused the size)."
+        render(
+            ZStack(alignment: .top) {
+                LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                VStack(spacing: 12) {
+                    ForEach(Array([switching, failed, removed, offered, undecodable].enumerated()), id: \.offset) { _, session in
+                        DisplayBanner(session: session, controls: session.sessionControl, info: info)
+                    }
+                }
+                .padding(.top, 14)
+            },
+            size: CGSize(width: 640, height: 330), appearance: appearance,
+            to: dir.appendingPathComponent("display-banners-\(suffix).png"))
+
+        // The whole screen while switching: dimmed, with the banner, the statistics and the
+        // session control.
+        let session = sampleSession(info: info)
+        session.control = .active
+        session.display = .switching(request: 2, label: display.sizeText, fromConnect: false)
+        session.sessionControl.showSample(forwarding: true)
+        render(
+            ZStack {
+                LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                ScreenOverlays(session: session, controls: session.sessionControl, info: info, sampleStats: stats)
+            }
+            .padding(.top, 28)
+            .environmentObject(core),
+            size: CGSize(width: 1000, height: 480), appearance: appearance,
+            to: dir.appendingPathComponent("display-switching-\(suffix).png"))
+
+        for (name, draft) in [("custom-display", DisplayDraft(width: 6144, height: 2560, hidpi: true, refreshHz: 60)),
+                              ("custom-display-invalid", DisplayDraft(width: 9001, height: 2560, hidpi: true, refreshHz: 120))] {
+            render(CustomDisplaySheet(draft: draft, hostName: "Studio", apply: { _ in }, cancel: {}),
+                   size: CGSize(width: 460, height: 330), appearance: appearance,
+                   to: dir.appendingPathComponent("\(name)-\(suffix).png"))
+        }
+        render(ConnectingView(target: "Studio", detail: "Setting up a \(display.sizeText) display…", cancel: {}),
+               size: CGSize(width: 640, height: 420), appearance: appearance,
+               to: dir.appendingPathComponent("connecting-display-\(suffix).png"))
+        render(
+            ZStack(alignment: .topLeading) {
+                LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                StatsHUD(sessionId: 0, info: info, sample: stats).padding(12)
+            }.environmentObject(core),
+            size: CGSize(width: 520, height: 320), appearance: appearance,
+            to: dir.appendingPathComponent("hud-display-\(suffix).png"))
+
+        core.loadSampleState(screenAllowed: true, displays: true)
+        render(ContentView(selection: .thisMac).environmentObject(core), size: CGSize(width: 900, height: 940),
+               appearance: appearance, to: dir.appendingPathComponent("thisMac-displays-\(suffix).png"))
     }
 
     /// While controlling without Accessibility here: the hint that Dock gestures still act on this

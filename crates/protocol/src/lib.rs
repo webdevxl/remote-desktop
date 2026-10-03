@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const DEFAULT_PORT: u16 = 47800;
 pub const ALPN: &[u8] = b"lankvm/1";
 /// Upper bound for a single control message; protects against garbage length prefixes.
@@ -55,6 +55,9 @@ pub enum ClientMsg {
     /// While controlling: whether the client is forwarding input right now (its window has the
     /// focus). When it isn't, the host draws its cursor into the video again.
     Focus { forwarding: bool },
+    /// Which of the host's displays to watch. The host answers with [`HostMsg::Display`] carrying
+    /// the same `request` (1, 2, 3... per session, like [`ClientMsg::SetControl`]).
+    SetDisplay { request: u32, display: DisplayChoice },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -82,6 +85,146 @@ pub enum HostMsg {
     /// Input stream progress: `seq` counts [`InputMsg`]s received, from 1. Times are host clock.
     /// Sent at most every [`INPUT_ACK_INTERVAL_US`], for the latency overlay.
     InputAck { seq: u64, received_us: u64, injected_us: u64 },
+    /// The display the client watches now, answering [`ClientMsg::SetDisplay`] or because it
+    /// changed on the host's side. Frames of the new stream follow.
+    Display(DisplayState),
+}
+
+/// Which of the host's displays a client watches.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayChoice {
+    /// The host's main display, as on connecting.
+    Main,
+    /// A display the host creates for the client, which exists only in software.
+    Virtual(VirtualDisplaySpec),
+}
+
+/// A virtual display a client asks the host for, usually its own screen's size, so the host's
+/// desktop fills it pixel for pixel.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualDisplaySpec {
+    /// Size in pixels; also the size of the stream.
+    pub width: u32,
+    pub height: u32,
+    /// Drawn at 2x (Retina): the desktop is laid out in half as many points each way, as sharp as
+    /// the pixels allow. Otherwise one point is one pixel.
+    pub hidpi: bool,
+    /// How often the host draws it, per second.
+    pub refresh_hz: u32,
+    pub arrangement: Arrangement,
+}
+
+/// How a virtual display sits among the host's own displays. A number rather than an enum, so a
+/// client can ask for one a host doesn't know yet; that host says no.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Arrangement(pub u8);
+
+impl Arrangement {
+    /// An extra display next to the host's own.
+    pub const EXTEND: Self = Self(0);
+    /// Next to them, and the main display: menu bar, Dock and new windows go to it.
+    pub const MAIN: Self = Self(1);
+    /// The host's own displays mirror it, so every window is on it.
+    pub const ONLY: Self = Self(2);
+
+    /// Whether this version knows the arrangement.
+    pub fn is_known(self) -> bool {
+        self.0 <= 2
+    }
+}
+
+impl VirtualDisplaySpec {
+    pub const MIN_WIDTH: u32 = 640;
+    pub const MIN_HEIGHT: u32 = 480;
+    /// Largest size per side. Hardware HEVC goes further, but not at 30 fps any more.
+    pub const MAX_SIDE: u32 = 8192;
+    /// Largest size in all: 8K, the most HEVC (level 6.2) encodes in one picture.
+    pub const MAX_PIXELS: u64 = 8192 * 4320;
+    /// Widest (or tallest) shape, as width to height.
+    pub const MAX_ASPECT: u32 = 4;
+    pub const MIN_REFRESH_HZ: u32 = 24;
+    pub const MAX_REFRESH_HZ: u32 = 120;
+
+    /// The spec with its refresh rate in range, or why a host can't make it (in words for the
+    /// client to show). Sizes must be even: the encoder needs that, and a Retina display's size in
+    /// points is half of it.
+    pub fn validated(self) -> Result<Self, String> {
+        let (w, h) = (self.width, self.height);
+        if !(Self::MIN_WIDTH..=Self::MAX_SIDE).contains(&w) || !(Self::MIN_HEIGHT..=Self::MAX_SIDE).contains(&h) {
+            return Err(format!(
+                "A virtual display can be {}×{} to {max}×{max} pixels, not {w}×{h}.",
+                Self::MIN_WIDTH,
+                Self::MIN_HEIGHT,
+                max = Self::MAX_SIDE
+            ));
+        }
+        if u64::from(w) * u64::from(h) > Self::MAX_PIXELS {
+            return Err(format!("A virtual display can have up to 8K pixels (8192×4320), not {w}×{h}."));
+        }
+        if w > h * Self::MAX_ASPECT || h > w * Self::MAX_ASPECT {
+            return Err(format!("A virtual display can be up to {} times as wide as it is high, not {w}×{h}.", Self::MAX_ASPECT));
+        }
+        if w % 2 != 0 || h % 2 != 0 {
+            return Err(format!("A virtual display needs an even number of pixels each way, not {w}×{h}."));
+        }
+        if !self.arrangement.is_known() {
+            return Err("That host doesn't know this way of arranging a display. Update LanKVM there.".into());
+        }
+        Ok(Self { refresh_hz: self.refresh_hz.clamp(Self::MIN_REFRESH_HZ, Self::MAX_REFRESH_HZ), ..self })
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DisplayState {
+    /// The [`ClientMsg::SetDisplay`] request this answers; 0 when the host changed it on its own
+    /// (its user removed the virtual display, another device took over the main display...).
+    pub request: u32,
+    /// What the client watches now (for a virtual display, as it is now).
+    pub display: DisplayChoice,
+    /// The stream now, as in [`HostMsg::Welcome`].
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// Why the request wasn't done, or why the display changed on the host's side
+    /// ([`DisplayReason::NONE`] when the request was done).
+    pub reason: DisplayReason,
+    /// The reason (or news) in words, naming the host, for the client to show. May be set with
+    /// [`DisplayReason::NONE`] too (e.g. another device took over the main display).
+    pub message: String,
+    /// Why the client can't ask for a virtual display now ([`DisplayReason::NONE`] if it can), and
+    /// in words, for its menus.
+    pub available: DisplayReason,
+    pub unavailable: String,
+}
+
+/// Why a client doesn't get the display it asked for, or lost it. A number rather than an enum,
+/// so a reason added later still decodes; a client shows the message of a code it doesn't know.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct DisplayReason(pub u16);
+
+impl DisplayReason {
+    pub const NONE: Self = Self(0);
+    /// The request asked for something no host makes (size, shape, arrangement).
+    pub const INVALID: Self = Self(1);
+    /// The host's "Let paired Macs control this Mac" setting is off (or it no longer trusts the
+    /// client).
+    pub const NOT_ALLOWED: Self = Self(2);
+    /// The host's macOS can't make virtual displays.
+    pub const UNSUPPORTED: Self = Self(3);
+    /// Making or showing the display failed; trying again may work.
+    pub const FAILED: Self = Self(4);
+    /// The host's user removed the virtual display (or stopped remote use of the Mac).
+    pub const REMOVED_BY_HOST: Self = Self(5);
+    /// The display went away on its own.
+    pub const DISPLAY_GONE: Self = Self(6);
+    /// The client runs on the host's own Mac: only an extended display is possible.
+    pub const SAME_MAC: Self = Self(7);
+    /// Another device controls the host, so the main display isn't the client's to take.
+    pub const IN_USE: Self = Self(8);
+    /// The host doesn't stream its screen (tests).
+    pub const NO_VIDEO: Self = Self(9);
+    /// The host has as many virtual displays as it makes.
+    pub const TOO_MANY: Self = Self(10);
 }
 
 /// Minimum spacing between [`HostMsg::InputAck`]s.
@@ -627,6 +770,25 @@ mod tests {
         let state = ControlState { request: 0, active: false, reason: ControlReason::NONE, message: String::new(), injected_tag: 0, host_pid: 0 };
         assert_eq!(encode(&HostMsg::Control(state)).unwrap()[0], 5);
         assert_eq!(encode(&HostMsg::InputAck { seq: 0, received_us: 0, injected_us: 0 }).unwrap()[0], 8);
+        assert_eq!(encode(&ClientMsg::SetDisplay { request: 1, display: DisplayChoice::Main }).unwrap(), [7, 1, 0]);
+        let state = DisplayState {
+            request: 0,
+            display: DisplayChoice::Main,
+            width: 0,
+            height: 0,
+            fps: 0,
+            reason: DisplayReason::NONE,
+            message: String::new(),
+            available: DisplayReason::NONE,
+            unavailable: String::new(),
+        };
+        assert_eq!(encode(&HostMsg::Display(state)).unwrap()[0], 9);
+        // Field order is the wire format too: varint sizes, then flags and the arrangement.
+        let spec = VirtualDisplaySpec { width: 6144, height: 2560, hidpi: true, refresh_hz: 60, arrangement: Arrangement::ONLY };
+        assert_eq!(
+            encode(&ClientMsg::SetDisplay { request: 1, display: DisplayChoice::Virtual(spec) }).unwrap(),
+            [7, 1, 1, 0x80, 0x30, 0x80, 0x14, 1, 60, 2]
+        );
         assert_eq!(encode(&InputMsg::MouseMove { x: 1, y: 2 }).unwrap(), [0, 1, 2]);
         assert_eq!(encode(&InputMsg::Key { code: 0, down: true, repeat: false }).unwrap(), [3, 0, 1, 0]);
         assert_eq!(encode(&InputMsg::ReleaseAll).unwrap(), [5]);
@@ -811,6 +973,53 @@ mod tests {
         let wheel = ScrollInput { lines_y: 1, fixed_y: 1.0, ..Default::default() };
         assert!(InputMsg::Scroll(wheel).coalesce(&InputMsg::Scroll(wheel)));
         assert!(!InputMsg::Scroll(wheel).coalesce(&InputMsg::Scroll(ScrollInput { x: 1, ..wheel })));
+    }
+
+    fn ultrawide() -> VirtualDisplaySpec {
+        VirtualDisplaySpec { width: 6144, height: 2560, hidpi: true, refresh_hz: 60, arrangement: Arrangement::ONLY }
+    }
+
+    #[test]
+    fn display_messages_round_trip() {
+        let virt = DisplayChoice::Virtual(ultrawide());
+        for m in [ClientMsg::SetDisplay { request: 3, display: virt }, ClientMsg::SetDisplay { request: 4, display: DisplayChoice::Main }] {
+            assert_eq!(decode::<ClientMsg>(&encode(&m).unwrap()).unwrap(), m);
+        }
+        let state = HostMsg::Display(DisplayState {
+            request: 3,
+            display: virt,
+            width: 6144,
+            height: 2560,
+            fps: 60,
+            reason: DisplayReason::FAILED,
+            message: "Studio couldn't make the display.".into(),
+            available: DisplayReason::NOT_ALLOWED,
+            unavailable: "Studio doesn't let paired Macs control it.".into(),
+        });
+        assert_eq!(decode::<HostMsg>(&encode(&state).unwrap()).unwrap(), state);
+        for arrangement in [Arrangement::EXTEND, Arrangement::MAIN, Arrangement::ONLY, Arrangement(9)] {
+            let m = ClientMsg::SetDisplay { request: 1, display: DisplayChoice::Virtual(VirtualDisplaySpec { arrangement, ..ultrawide() }) };
+            assert_eq!(decode::<ClientMsg>(&encode(&m).unwrap()).unwrap(), m);
+        }
+    }
+
+    #[test]
+    fn virtual_display_specs_are_checked() {
+        assert_eq!(ultrawide().validated(), Ok(ultrawide()));
+        let fast = VirtualDisplaySpec { refresh_hz: 500, ..ultrawide() }.validated().unwrap();
+        assert_eq!(fast.refresh_hz, 120);
+        assert_eq!(VirtualDisplaySpec { refresh_hz: 0, ..ultrawide() }.validated().unwrap().refresh_hz, 24);
+        for (width, height) in [(0, 0), (639, 480), (640, 479), (8194, 2560), (6144, u32::MAX), (6143, 2560), (6144, 2561)] {
+            let err = VirtualDisplaySpec { width, height, ..ultrawide() }.validated().unwrap_err();
+            assert!(err.contains(&format!("{width}×{height}")), "{err}");
+        }
+        assert!(VirtualDisplaySpec { width: 8192, height: 4320, ..ultrawide() }.validated().is_ok());
+        assert!(VirtualDisplaySpec { width: 7680, height: 2160, ..ultrawide() }.validated().is_ok(), "32:9");
+        assert!(VirtualDisplaySpec { width: 640, height: 480, hidpi: false, ..ultrawide() }.validated().is_ok());
+        assert!(VirtualDisplaySpec { width: 8192, height: 8192, ..ultrawide() }.validated().unwrap_err().contains("8K"));
+        assert!(VirtualDisplaySpec { width: 4096, height: 1000, ..ultrawide() }.validated().unwrap_err().contains("4 times"));
+        assert!(VirtualDisplaySpec { width: 1000, height: 4096, ..ultrawide() }.validated().unwrap_err().contains("4 times"));
+        assert!(VirtualDisplaySpec { arrangement: Arrangement(3), ..ultrawide() }.validated().unwrap_err().contains("Update LanKVM"));
     }
 
     #[test]

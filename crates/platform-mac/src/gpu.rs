@@ -72,6 +72,12 @@ pub fn import_nv12(device: &wgpu::Device, pixel_buffer: CFRetained<CVPixelBuffer
 /// Mean brightness (0-255) of a region of an NV12 frame's luma plane, for tests that watch the
 /// video for a change. The region is normalized (0...1, top-left origin). Reads the frame on the
 /// CPU, so only for diagnostics.
+/// A decoded frame's size in pixels.
+pub fn frame_size(pixel_buffer: &objc2_core_video::CVPixelBuffer) -> (u32, u32) {
+    use objc2_core_video::{CVPixelBufferGetHeightOfPlane, CVPixelBufferGetWidthOfPlane};
+    (CVPixelBufferGetWidthOfPlane(pixel_buffer, 0) as u32, CVPixelBufferGetHeightOfPlane(pixel_buffer, 0) as u32)
+}
+
 pub fn mean_luma(pixel_buffer: &objc2_core_video::CVPixelBuffer, x0: f64, y0: f64, x1: f64, y1: f64) -> Option<f64> {
     use objc2_core_video::{
         CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane,

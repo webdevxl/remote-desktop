@@ -24,14 +24,20 @@ final class CoreModel: ObservableObject {
     private init() {}
 
     /// Sample state for UI snapshots (`--snapshot`), without starting the network core.
-    func loadSampleState(screenAllowed: Bool) {
+    /// `displays`: two Macs added displays here, one of them still connected.
+    func loadSampleState(screenAllowed: Bool, displays: Bool = false) {
         thisMac = ThisMac(name: "Alex's MacBook Pro", addresses: ["192.168.1.23", "10.0.0.7"], port: 47800, deviceId: "724e:b7c8:8a63:ada8")
         host = HostStatus(
-            viewers: [Viewer(id: 1, name: "Studio", address: "192.168.1.31", deviceId: "9f12:0ab3:77c1:e402", controlling: screenAllowed)],
+            viewers: [Viewer(id: 1, name: "Studio", address: "192.168.1.31", deviceId: "9f12:0ab3:77c1:e402", controlling: screenAllowed,
+                             displayId: displays ? 5 : 1, virtualDisplay: displays)],
             pairing: [],
             screenCaptureAllowed: screenAllowed,
             allowControl: true,
-            controlPermission: screenAllowed
+            controlPermission: screenAllowed,
+            virtualDisplays: displays ? [
+                VirtualDisplay(displayId: 5, owner: "Studio", width: 6144, height: 2560, hidpi: true, arrangement: .only, inUse: true),
+                VirtualDisplay(displayId: 6, owner: "Mac mini", width: 3840, height: 2160, hidpi: true, arrangement: .extend, inUse: false),
+            ] : []
         )
         paired = PairedDevices(
             viewers: [PairedDevice(fingerprint: "aa", deviceId: "9f12:0ab3:77c1:e402", name: "Studio")],
@@ -64,6 +70,19 @@ final class CoreModel: ObservableObject {
             // Shows the system prompt the first time; macOS ignores later requests.
             _ = lk_request_screen_capture()
         }
+        // Another user takes this Mac's screen (fast user switching): the displays made for other
+        // Macs hold this user's windows, and must not stay on the screen with the next user.
+        // While another user has the screen, viewers can't add one either (until this user is back).
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.sessionDidResignActiveNotification, object: nil, queue: .main
+        ) { _ in
+            lk_set_console_active(false)
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main
+        ) { _ in
+            lk_set_console_active(true)
+        }
     }
 
     // MARK: Events
@@ -79,8 +98,10 @@ final class CoreModel: ObservableObject {
             }
         case .trustChanged:
             refreshPaired()
-        case .pinNeeded, .connected, .ended, .control, .cursorShape, .cursor:
+        case .pinNeeded, .connected, .ended, .control, .cursorShape, .cursor, .display, .streamError:
             guard let id = event.session, let session = sessions[id] else { return }
+            // Each kind of a session's event has its own case: a kind missing here must not end
+            // the session.
             switch event.type {
             case .pinNeeded: session.phase = .needsPin
             case .connected:
@@ -93,8 +114,14 @@ final class CoreModel: ObservableObject {
                     if UserDefaults.standard.string(forKey: Self.modeKey(info.hostId)) == "control" {
                         setControl(true, for: id, remember: false)
                     }
+                    restoreDisplay(for: session, info: info)
                 }
                 refreshRecents()
+            case .ended:
+                session.phase = .ended(event.error)
+                session.control = .off
+                session.mode = .view
+                session.display = .idle
             case .control:
                 let request = event.request ?? 0
                 // The core already drops answers to replaced requests; this is the UI's own guard.
@@ -128,10 +155,19 @@ final class CoreModel: ObservableObject {
                 case "hidden": session.cursor.hostReported(.hidden)
                 default: session.cursor.hostReported(.inVideo)
                 }
-            default:
-                session.phase = .ended(event.error)
-                session.control = .off
-                session.mode = .view
+            case .display:
+                // Only what the session shows changes here: none of `connected`'s side effects run
+                // again, and an ended session stays ended.
+                guard let info = event.info, case .connected(let before) = session.phase else { return }
+                session.phase = .connected(info)
+                displayChanged(session, from: before.display, to: info, request: event.request ?? 0,
+                               reason: event.reason ?? DisplayReason.none, message: event.message ?? "")
+            case .streamError:
+                guard case .connected = session.phase else { return }
+                session.streamError = event.message ?? "This Mac can't show the picture “\(session.hostName)” sends."
+                session.streamErrorSize = event.width.flatMap { w in event.height.map { (UInt32(w), UInt32($0)) } }
+            case .hostChanged, .trustChanged:
+                break
             }
         }
     }
@@ -139,8 +175,9 @@ final class CoreModel: ObservableObject {
     func refreshHost() {
         if let status = decode(HostStatus.self, lk_host_status()), status != host {
             host = status
-            // ⌃⌥⌘. takes control back, but only claims the shortcut while someone controls.
-            StopControlHotKey.shared.setEnabled(status.controller != nil) { [weak self] in
+            // ⌃⌥⌘. takes control back and removes the displays made for other Macs, but only claims
+            // the shortcut while someone controls this Mac or such a display exists.
+            StopControlHotKey.shared.setEnabled(status.controller != nil || !status.virtualDisplays.isEmpty) { [weak self] in
                 self?.stopAllControl()
             }
             // The Mac now controlling this one can't also be controlled from here: input would
@@ -222,6 +259,137 @@ final class CoreModel: ObservableObject {
 
     private static func modeKey(_ hostId: String) -> String { "mode.\(hostId)" }
 
+    // MARK: Displays
+
+    /// The host gets this long to show a display asked for; then the session stops waiting.
+    private static let displayTimeout: TimeInterval = 15
+
+    /// Asks a session's host to show `display`: its own screen (kind main), or a display it makes
+    /// for this Mac (virtual). The session shows the new picture once the host answers; meanwhile
+    /// it's switching, and the pointer rests. `matchedScreen`: the size of this Mac's screen it was
+    /// picked to fill, remembered with it. `fromConnect`: put back on connecting, not the user's
+    /// choice (it's already remembered).
+    func showDisplay(_ display: RemoteDisplay, for id: UInt64, matchedScreen: CGSize? = nil, fromConnect: Bool = false) {
+        guard let session = sessions[id], case .connected(let info) = session.phase else { return }
+        // The user wants the host's own screen: not a display next time either (even when it
+        // shows that already, a display offered or refused on connecting).
+        if display.kind == .main, !fromConnect { RememberedDisplay.forget(session.hostId) }
+        // Asking for what's shown, or about to be, changes nothing. A request the window stopped
+        // waiting for is still answered later, and that answer applies: any pick then asks again,
+        // so its answer comes last and the late one only brings the picture.
+        let outstanding = session.requestedDisplay?.display
+        let target: RemoteDisplay? = session.display.isSwitching ? outstanding : (outstanding == nil ? info.display : nil)
+        if let target, display.matches(target) {
+            if !session.display.isSwitching { session.display = .idle }
+            return
+        }
+        // A new picture: what this Mac couldn't show was the old one.
+        session.streamError = nil
+        let request = switch display.kind {
+        case .main: lk_show_main_display(id)
+        case .virtual: lk_show_virtual_display(id, display.width, display.height, display.hidpi, display.refreshHz,
+                                               display.arrangement.code)
+        }
+        session.latestDisplayRequest = request
+        session.requestedDisplay = SessionModel.RequestedDisplay(display: display, matchedScreen: matchedScreen,
+                                                                 remember: !fromConnect)
+        session.display = .switching(request: request, label: display.kind == .main ? "its own screen" : display.sizeText,
+                                     fromConnect: fromConnect)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.displayTimeout) { [weak session] in
+            MainActor.assumeIsolated {
+                guard let session, session.latestDisplayRequest == request, session.display.isSwitching else { return }
+                // A late answer still applies (`displayChanged`); the window stops waiting for it.
+                session.display = .failed(DisplayReason.failed, "“\(session.hostName)” didn't answer.", retry: display)
+            }
+        }
+    }
+
+    /// A `display` event: the session shows `info` now. Ends the switch it answers, and says how it
+    /// went; otherwise it's the host's own change, with news to tell or a display taken away.
+    private func displayChanged(_ session: SessionModel, from before: RemoteDisplay, to info: SessionInfo, request: UInt32,
+                                reason: Int, message: String) {
+        let host = "“\(info.hostName)”"
+        // A stream error about a picture of another size is about the picture before this one.
+        if session.streamError != nil, let size = session.streamErrorSize, size != (info.width, info.height) {
+            session.streamError = nil
+        }
+        guard request != 0, request == session.latestDisplayRequest else {
+            // Answers to replaced requests only bring the picture (applied above).
+            guard request == 0 else { return }
+            if reason == DisplayReason.none {
+                if !message.isEmpty { session.showToast(message) }
+            } else if session.display.isSwitching {
+                // The answer to the user's request comes next; this is only news meanwhile.
+                if !message.isEmpty { session.showToast(message) }
+            } else {
+                session.display = .failed(reason, message.isEmpty ? Self.displayProblem(reason, host: host) : message,
+                                          retry: before.kind == .virtual ? before : RememberedDisplay.load(session.hostId)?.display)
+            }
+            return
+        }
+        let asked = session.requestedDisplay
+        session.requestedDisplay = nil
+        guard reason == DisplayReason.none else {
+            // The host can't make displays: don't ask again on every connection.
+            if reason == DisplayReason.unsupported { RememberedDisplay.forget(session.hostId) }
+            session.display = .failed(reason, message.isEmpty ? Self.displayProblem(reason, host: host) : message,
+                                      retry: asked?.display)
+            return
+        }
+        session.display = .idle
+        // Shown, but this Mac can't decode it: not worth keeping (the banner offers a way back).
+        guard session.streamError == nil else { return }
+        if let asked, asked.remember, asked.display.kind == .virtual {
+            RememberedDisplay(display: asked.display, matchedScreen: asked.matchedScreen).save(session.hostId)
+        }
+        if info.display.kind == .main {
+            session.showToast(message.isEmpty ? "\(host) shows its own screen again" : message)
+            return
+        }
+        // The host's words when it has some (it changed something else to make room).
+        guard message.isEmpty else { return session.showToast(message) }
+        var text = "\(host) now uses \(info.display.sizeText)"
+        if info.display.hidpi { text += " · looks like \(info.display.looksLikeText)" }
+        // Fitted to this window's screen: in full screen it's shown pixel for pixel.
+        // (Put back on connecting, the window shows no picture yet, so its screen isn't known:
+        // the one in front.)
+        let controls = session.sessionControl
+        if let fit = controls.thisScreen ?? ScreenFit.main(), asked?.matchedScreen == fit.size, !controls.isFullScreen {
+            // While controlling, ⌃⌘F goes to the remote Mac: release first.
+            text += controls.isForwarding ? " · ⌃⌥⌘, then ⌃⌘F, shows it full screen pixel for pixel"
+                : " · Enter Full Screen (⌃⌘F) to see it pixel for pixel"
+        }
+        session.showToast(text)
+    }
+
+    /// On connecting: the display last used with this host, unless it shows that already (it keeps
+    /// a display a minute for a Mac whose connection was lost). Asked for right away, so the
+    /// window never shows the host's own screen in between. One fitted to a screen of this Mac
+    /// that isn't attached now is only offered.
+    private func restoreDisplay(for session: SessionModel, info: SessionInfo) {
+        guard let remembered = RememberedDisplay.load(info.hostId), !info.display.matches(remembered.display) else { return }
+        if let screen = remembered.matchedScreen, !ScreenFit.all().contains(where: { $0.size == screen }) {
+            session.display = .offered(remembered.display)
+            return
+        }
+        showDisplay(remembered.display, for: session.id, matchedScreen: remembered.matchedScreen, fromConnect: true)
+    }
+
+    /// What to say when the host gave a reason without words.
+    private static func displayProblem(_ reason: Int, host: String) -> String {
+        switch reason {
+        case DisplayReason.invalid: "\(host) can't make a display of that size."
+        case DisplayReason.notAllowed: "\(host) lets this Mac only view it, so it can't add a display for it."
+        case DisplayReason.unsupported: "\(host) can't add displays: its macOS doesn't support them."
+        case DisplayReason.removedByHost: "Someone on \(host) removed the display made for this Mac."
+        case DisplayReason.gone: "The display made for this Mac on \(host) is gone."
+        case DisplayReason.sameMac: "On this same Mac, a display can only go next to its own screens."
+        case DisplayReason.inUse: "Another Mac controls \(host), so a display here can only go next to its screens."
+        case DisplayReason.tooMany: "\(host) already has as many displays for other Macs as it can make."
+        default: "\(host) couldn't add the display. Try again in a moment."
+        }
+    }
+
     /// Before quitting: releases keys held on remote Macs and for remote viewers.
     func shutdown() {
         guard thisMac != nil else { return }
@@ -235,8 +403,15 @@ final class CoreModel: ObservableObject {
     /// Takes control back from a viewer; it keeps viewing.
     func stopControl(_ viewer: Viewer) { lk_stop_control(viewer.id) }
 
+    /// Takes control back from everyone, and removes the displays made for other Macs (⌃⌥⌘.).
     func stopAllControl() {
         lk_stop_all_control()
+    }
+
+    /// Removes a display made for another Mac (nil: all of them). Its viewer goes back to this
+    /// Mac's own screen; the host status follows.
+    func removeVirtualDisplay(_ display: VirtualDisplay?) {
+        lk_remove_virtual_display(display?.displayId ?? 0)
     }
 
     func setAllowControl(_ allow: Bool) {
@@ -329,6 +504,35 @@ final class SessionModel: ObservableObject, Identifiable {
         case refused(Int, String)
     }
 
+    /// Where a change of the display the session shows is at. What it shows is in its info.
+    enum DisplayStatus: Equatable {
+        case idle
+        /// Asked the host for another display ("6144 × 2560", "its own screen") and waiting for
+        /// its picture. `fromConnect`: put back on connecting; the window shows no picture until
+        /// it's there.
+        case switching(request: UInt32, label: String, fromConnect: Bool)
+        /// The host didn't show what was asked for, or took a display away: a `DisplayReason`
+        /// code, its words, and what asking again would ask for (nil: asking again won't help).
+        case failed(Int, String, retry: RemoteDisplay?)
+        /// Remembered for this host, but fitted to a screen of this Mac that isn't attached now:
+        /// offered rather than asked for.
+        case offered(RemoteDisplay)
+
+        var isSwitching: Bool {
+            if case .switching = self { return true }
+            return false
+        }
+    }
+
+    /// A display request waiting for its answer.
+    struct RequestedDisplay {
+        var display: RemoteDisplay
+        /// The size of the screen of this Mac it was picked to fill, if it was.
+        var matchedScreen: CGSize?
+        /// The user's choice: remembered for this host once the host shows it.
+        var remember: Bool
+    }
+
     let id: UInt64
     let target: String
     @Published var phase: Phase = .connecting
@@ -345,6 +549,18 @@ final class SessionModel: ObservableObject, Identifiable {
     var sameMachine = false
     /// Id of the latest control request; answers to older ones are ignored.
     var latestRequest: UInt32 = 0
+    /// Changing the display shown, or why it didn't change.
+    @Published var display: DisplayStatus = .idle
+    /// Id of the latest display request (they're numbered apart from control's): only its answer
+    /// ends a switch.
+    var latestDisplayRequest: UInt32 = 0
+    /// What that request asked for, until it's answered.
+    var requestedDisplay: RequestedDisplay?
+    /// Why this Mac can't show the session's video (e.g. it can't decode that size), until the
+    /// picture changes or the user closes the banner.
+    @Published var streamError: String?
+    /// The size of the picture it is about.
+    var streamErrorSize: (UInt32, UInt32)?
     let cursor = RemoteCursor()
     /// The floating control over the remote screen (and the Control menu's actions).
     private(set) lazy var sessionControl = SessionControlModel(session: self)

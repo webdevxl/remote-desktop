@@ -26,6 +26,39 @@ void lk_submit_pin(uint64_t session, const char *pin);
 void lk_disconnect(uint64_t session);
 char *lk_session_stats(uint64_t session);
 
+// Which of the host's displays a session shows. Both return the request id that the answering
+// `display` event carries (0 if there's no such session: nothing will answer). That event also
+// says what the session shows now and whether it may ask for a virtual display; `connected`
+// already says both for the start.
+// The host's own (main) screen:
+uint32_t lk_show_main_display(uint64_t session);
+// A display the host makes for this Mac, width × height pixels (even). Retina (hidpi) draws it at
+// 2x, so its desktop looks like width/2 × height/2. refresh_hz: how often the host draws it.
+#define LK_ARRANGE_EXTEND 0 // next to the host's own displays
+#define LK_ARRANGE_MAIN 1   // and the main display: menu bar, Dock and new windows go to it
+#define LK_ARRANGE_ONLY 2   // the host's own displays mirror it, so every window is on it
+uint32_t lk_show_virtual_display(uint64_t session, uint32_t width, uint32_t height, bool hidpi,
+                                 uint32_t refresh_hz, uint8_t arrangement);
+// Sizes a host makes (it refuses others with LK_DISPLAY_INVALID).
+#define LK_DISPLAY_MIN_WIDTH 640
+#define LK_DISPLAY_MIN_HEIGHT 480
+#define LK_DISPLAY_MAX_SIDE 8192
+#define LK_DISPLAY_MAX_PIXELS 35389440 // 8192 × 4320
+#define LK_DISPLAY_MAX_ASPECT 4        // width : height, either way
+// Why a session doesn't show the display it asked for (the `display` event's `reason`), or can't
+// ask for a virtual display (its info's `displayAvailable`). The event's message says it in words.
+#define LK_DISPLAY_NONE 0
+#define LK_DISPLAY_INVALID 1
+#define LK_DISPLAY_NOT_ALLOWED 2     // the host lets paired Macs only view it
+#define LK_DISPLAY_UNSUPPORTED 3     // the host's macOS can't make virtual displays
+#define LK_DISPLAY_FAILED 4          // trying again may work
+#define LK_DISPLAY_REMOVED_BY_HOST 5 // the host's user removed it
+#define LK_DISPLAY_GONE 6
+#define LK_DISPLAY_SAME_MAC 7        // only an extended display, on the host's own Mac
+#define LK_DISPLAY_IN_USE 8          // another device controls the host: no main or only display
+#define LK_DISPLAY_NO_VIDEO 9
+#define LK_DISPLAY_TOO_MANY 10
+
 // Rendering into a CAMetalLayer, sized in pixels. The layer is retained until detach.
 void lk_attach_view(uint64_t session, void *metal_layer, uint32_t width, uint32_t height);
 void lk_resize_view(uint64_t session, uint32_t width, uint32_t height);
@@ -106,6 +139,12 @@ void lk_stop_all_control(void);
 void lk_set_allow_control(bool allow);
 // Whether macOS lets LanKVM post input (Privacy & Security → Accessibility).
 bool lk_control_permission(void);
+// Removes a virtual display made for a viewer (0: all of them); its viewers go back to this Mac's
+// own screen. Returns at once; a `hostChanged` event follows.
+void lk_remove_virtual_display(uint32_t display_id);
+// Whether this user's session has the screen (fast user switching). While it doesn't, viewers lose
+// their virtual displays (they hold this user's windows) and can't add one.
+void lk_set_console_active(bool active);
 
 // Screen Recording permission.
 bool lk_screen_capture_allowed(void);

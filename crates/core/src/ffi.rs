@@ -6,7 +6,7 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, OnceLock};
 
-use protocol::{DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction};
+use protocol::{Arrangement, DisplayChoice, DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction, VirtualDisplaySpec};
 use serde::Serialize;
 
 use crate::{Core, Event};
@@ -200,6 +200,22 @@ pub extern "C" fn lk_request_screen_capture() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn lk_screen_capture_allowed() -> bool {
     core().is_some_and(|c| c.screen_capture_allowed())
+}
+
+// MARK: Host displays (viewer side)
+
+/// Shows the host's own (main) screen. Returns the request id the answering `display` event carries.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_show_main_display(session: u64) -> u32 {
+    core().map_or(0, |c| c.set_display(session, DisplayChoice::Main))
+}
+
+/// Asks the host for a virtual display of `width` × `height` pixels, drawn at 2x if `hidpi`,
+/// arranged as `LK_ARRANGE_*` says. Returns the request id the answering `display` event carries.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_show_virtual_display(session: u64, width: u32, height: u32, hidpi: bool, refresh_hz: u32, arrangement: u8) -> u32 {
+    let spec = VirtualDisplaySpec { width, height, hidpi, refresh_hz, arrangement: Arrangement(arrangement) };
+    core().map_or(0, |c| c.set_display(session, DisplayChoice::Virtual(spec)))
 }
 
 // MARK: Remote control (viewer side). Called for every input event, so no JSON here.
@@ -416,9 +432,27 @@ pub extern "C" fn lk_control_permission() -> bool {
     core().is_some_and(|c| c.control_permission())
 }
 
+/// Whether this user's session has the screen (fast user switching): while it doesn't, viewers
+/// lose their virtual displays and can't add one. Returns at once.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_set_console_active(active: bool) {
+    if let Some(c) = core() {
+        c.set_console_active(active);
+    }
+}
+
+/// Removes a virtual display made for a viewer (0: all of them). Returns at once.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_remove_virtual_display(display_id: u32) {
+    if let Some(c) = core() {
+        c.remove_virtual_display((display_id != 0).then_some(display_id));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::DisplayReason;
 
     #[test]
     fn positions_quantize_and_clamp() {
@@ -432,9 +466,41 @@ mod tests {
 
     /// The value of `#define name` in lankvm.h, which Swift passes through as it is.
     fn header_code(name: &str) -> u16 {
+        u16::try_from(header_value(name)).unwrap_or_else(|_| panic!("{name} isn't a u16"))
+    }
+
+    fn header_value(name: &str) -> u64 {
         let header = include_str!("../../../macos/Sources/CLanKVM/include/lankvm.h");
         let line = header.lines().find(|l| l.split_whitespace().nth(1) == Some(name)).unwrap_or_else(|| panic!("no {name} in lankvm.h"));
         line.split_whitespace().nth(2).and_then(|v| v.parse().ok()).unwrap_or_else(|| panic!("bad {line:?}"))
+    }
+
+    #[test]
+    fn header_display_codes_and_limits_match_the_protocol() {
+        for (name, arrangement) in [("LK_ARRANGE_EXTEND", Arrangement::EXTEND), ("LK_ARRANGE_MAIN", Arrangement::MAIN), ("LK_ARRANGE_ONLY", Arrangement::ONLY)] {
+            assert_eq!(Arrangement(header_code(name) as u8), arrangement, "{name}");
+        }
+        let reasons = [
+            ("LK_DISPLAY_NONE", DisplayReason::NONE),
+            ("LK_DISPLAY_INVALID", DisplayReason::INVALID),
+            ("LK_DISPLAY_NOT_ALLOWED", DisplayReason::NOT_ALLOWED),
+            ("LK_DISPLAY_UNSUPPORTED", DisplayReason::UNSUPPORTED),
+            ("LK_DISPLAY_FAILED", DisplayReason::FAILED),
+            ("LK_DISPLAY_REMOVED_BY_HOST", DisplayReason::REMOVED_BY_HOST),
+            ("LK_DISPLAY_GONE", DisplayReason::DISPLAY_GONE),
+            ("LK_DISPLAY_SAME_MAC", DisplayReason::SAME_MAC),
+            ("LK_DISPLAY_IN_USE", DisplayReason::IN_USE),
+            ("LK_DISPLAY_NO_VIDEO", DisplayReason::NO_VIDEO),
+            ("LK_DISPLAY_TOO_MANY", DisplayReason::TOO_MANY),
+        ];
+        for (name, reason) in reasons {
+            assert_eq!(DisplayReason(header_code(name)), reason, "{name}");
+        }
+        assert_eq!(header_value("LK_DISPLAY_MIN_WIDTH"), u64::from(VirtualDisplaySpec::MIN_WIDTH));
+        assert_eq!(header_value("LK_DISPLAY_MIN_HEIGHT"), u64::from(VirtualDisplaySpec::MIN_HEIGHT));
+        assert_eq!(header_value("LK_DISPLAY_MAX_SIDE"), u64::from(VirtualDisplaySpec::MAX_SIDE));
+        assert_eq!(header_value("LK_DISPLAY_MAX_PIXELS"), VirtualDisplaySpec::MAX_PIXELS);
+        assert_eq!(header_value("LK_DISPLAY_MAX_ASPECT"), u64::from(VirtualDisplaySpec::MAX_ASPECT));
     }
 
     #[test]

@@ -58,7 +58,64 @@ struct ThisMacView: View {
                     }
                 }
             }
+
+            if !core.host.virtualDisplays.isEmpty {
+                VirtualDisplaysSection()
+            }
         }
+    }
+}
+
+/// Displays this Mac made for the Macs viewing it, each removable: its viewer goes back to this
+/// Mac's own screen.
+private struct VirtualDisplaysSection: View {
+    @EnvironmentObject private var core: CoreModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(title: "Displays Added by Other Macs")
+            Card {
+                ForEach(Array(core.host.virtualDisplays.enumerated()), id: \.element.id) { index, display in
+                    if index > 0 { CardDivider() }
+                    CardRow(icon: "display", tint: display.inUse ? .lkAccent : .lkSecondary, title: "For “\(display.owner)”",
+                            detail: detail(display)) {
+                        Button("Remove") { core.removeVirtualDisplay(display) }
+                            .buttonStyle(SecondaryButtonStyle(destructive: true))
+                            .help("Remove this display; “\(display.owner)” goes back to this Mac’s own screen")
+                    }
+                }
+            }
+            Text(explanation)
+                .font(.system(size: 12))
+                .foregroundStyle(Color.lkSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.leading, 2)
+        }
+    }
+
+    private func detail(_ display: VirtualDisplay) -> String {
+        guard display.inUse else { return "Not in use · removed in about a minute" }
+        var text = display.display.sizeText
+        if display.hidpi { text += " · looks like \(display.display.looksLikeText)" }
+        switch display.arrangement {
+        case .only: text += " · this screen shows a copy"
+        case .main: text += " · main display"
+        case .extend: text += " · next to this screen"
+        }
+        return text
+    }
+
+    /// Where this Mac's windows are, and that it's temporary.
+    private var explanation: String {
+        let displays = core.host.virtualDisplays
+        let owners = Array(Set(displays.map(\.owner)))
+        guard owners.count == 1, let owner = owners.first else {
+            return "Other Macs added displays to this Mac. Each goes away when its Mac disconnects."
+        }
+        if displays.allSatisfy({ $0.arrangement == .extend }) {
+            return "“\(owner)” added a display next to this Mac’s screen. It goes away when “\(owner)” disconnects."
+        }
+        return "“\(owner)” added a display to this Mac. Your windows are on it; it goes away when “\(owner)” disconnects."
     }
 }
 

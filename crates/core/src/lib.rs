@@ -4,6 +4,7 @@
 
 mod client;
 pub mod control;
+mod displays;
 pub mod ffi;
 mod host;
 mod render;
@@ -19,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use platform_mac::{permissions, system};
-use protocol::{CursorState, DEFAULT_PORT, InputMsg};
+use protocol::{CursorState, DEFAULT_PORT, DisplayChoice, InputMsg};
 use quinn::Endpoint;
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
@@ -61,6 +62,13 @@ pub enum Event {
     },
     /// How to show the host's cursor: `shape` with `id`, `hidden`, or `inVideo`.
     Cursor { session: u64, state: &'static str, id: Option<u32> },
+    /// What the session shows now (`info`), answering `request` (0: the host changed it on its
+    /// own). `reason` (a `DisplayReason` code) and `message` say why it isn't what was asked for, or
+    /// what happened. Sent once the new picture is on screen.
+    Display { session: u64, request: u32, info: SessionInfo, reason: u16, message: String },
+    /// The session's video of `width` × `height` pixels can't be shown (e.g. this Mac can't
+    /// decode that size).
+    StreamError { session: u64, message: String, width: u32, height: u32 },
 }
 
 /// Serializes bytes as standard base64 (what Swift's `JSONDecoder` expects for `Data`).
@@ -205,7 +213,9 @@ impl Core {
         if backend != control::Backend::Hid {
             tracing::warn!(?backend, "injected input is redirected (LANKVM_INJECT)");
         }
-        let host = Arc::new(host::HostCtx {
+        let host = Arc::new_cyclic(|weak| host::HostCtx {
+            displays: displays::Displays::new(weak.clone(), identity.fingerprint, Box::new(displays::RealScreens::default())),
+            console_active: std::sync::atomic::AtomicBool::new(true),
             status: Mutex::new(host::HostStatus::default()),
             events: events.clone(),
             trust: trust.clone(),
@@ -227,6 +237,16 @@ impl Core {
         if guard_pid.is_some() || control_ttl.is_some() {
             tracing::warn!(?guard_pid, ?control_ttl, "test limits on remote control");
         }
+        if video {
+            // Lid, cables, Displays settings: the virtual displays' arrangement may need repair, and
+            // sessions may need to follow. (Tests without video never touch displays.)
+            let weak = Arc::downgrade(&host);
+            platform_mac::virtual_display::on_reconfiguration(move || {
+                if let Some(host) = weak.upgrade() {
+                    host.displays.reconfigured();
+                }
+            });
+        }
         rt.spawn(host::run(endpoint.clone(), host.clone()));
 
         let this_mac = ThisMac { name: system::device_name(), addresses: local_addresses(), port, device_id };
@@ -247,6 +267,8 @@ impl Core {
     /// Before the app quits: lets go of everything held on this Mac for a remote viewer, and of
     /// everything this Mac holds on remote Macs, so no key stays down anywhere. Blocks briefly.
     pub fn shutdown(&self) {
+        // First, so sessions ending below don't start removing displays: quitting removes them.
+        self.host.displays.shutdown();
         self.host.release_all_input(std::time::Duration::from_millis(300));
         let sessions: Vec<_> = self.sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
         for s in &sessions {
@@ -325,6 +347,8 @@ impl Core {
                     };
                     Event::Cursor { session: id, state, id: shape }
                 }
+                SessionEvent::Display { request, info, reason, message } => Event::Display { session: id, request, info, reason, message },
+                SessionEvent::StreamError { message, width, height } => Event::StreamError { session: id, message, width, height },
             };
             (core.events)(event);
         });
@@ -355,6 +379,12 @@ impl Core {
     /// request id the answer will carry (0 if there's no such session).
     pub fn set_control(&self, id: u64, on: bool, take_over: bool) -> u32 {
         self.session(id).map_or(0, |s| s.set_control(on, take_over))
+    }
+
+    /// Asks the session's host to show `display`. Returns the request id the answering
+    /// [`Event::Display`] carries (0 if there's no such session).
+    pub fn set_display(&self, id: u64, display: DisplayChoice) -> u32 {
+        self.session(id).map_or(0, |s| s.set_display(display))
     }
 
     /// While controlling: whether the session's window has the focus.
@@ -419,9 +449,21 @@ impl Core {
         self.host.stop_control(id);
     }
 
-    /// Takes control back from whoever has it.
+    /// Takes this Mac back from remote use: control from whoever has it, and the virtual displays
+    /// made for viewers (menu, stop hotkey).
     pub fn stop_all_control(&self) {
         self.host.stop_all_control();
+        self.host.remove_virtual_display(None);
+    }
+
+    /// Removes a virtual display made for a viewer (`None`: all of them). Never waits.
+    pub fn remove_virtual_display(&self, display_id: Option<u32>) {
+        self.host.remove_virtual_display(display_id);
+    }
+
+    /// Whether this user's session has the screen (fast user switching). Never waits.
+    pub fn set_console_active(&self, active: bool) {
+        self.host.set_console_active(active);
     }
 
     /// Whether paired Macs may control this one.
@@ -447,6 +489,7 @@ impl Core {
         }
         if kind != "host" {
             self.host.close_viewers_with(&fp);
+            self.host.displays.forget(fp, format!("{} forgot this Mac.", system::device_name()));
         }
         (self.events)(Event::TrustChanged);
     }

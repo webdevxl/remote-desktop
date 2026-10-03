@@ -63,3 +63,42 @@ pub fn is_main_thread() -> bool {
     }
     unsafe { pthread_main_np() != 0 }
 }
+
+/// Keeps this Mac's displays from sleeping after its idle time while it lives. A virtual display
+/// stops being drawn (or goes away) when the displays sleep, and a viewer only watching it sends
+/// no input that would count as activity.
+pub struct DisplaysAwake(u32);
+
+impl DisplaysAwake {
+    pub fn new(reason: &str) -> Option<Self> {
+        #[link(name = "IOKit", kind = "framework")]
+        unsafe extern "C" {
+            fn IOPMAssertionCreateWithName(
+                kind: &objc2_core_foundation::CFString,
+                level: u32,
+                name: &objc2_core_foundation::CFString,
+                id: *mut u32,
+            ) -> i32;
+        }
+        const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
+        let kind = objc2_core_foundation::CFString::from_static_str("PreventUserIdleDisplaySleep");
+        let name = objc2_core_foundation::CFString::from_str(reason);
+        let mut id = 0;
+        let status = unsafe { IOPMAssertionCreateWithName(&kind, K_IOPM_ASSERTION_LEVEL_ON, &name, &mut id) };
+        if status != 0 {
+            tracing::warn!(status, "can't keep the displays awake");
+            return None;
+        }
+        Some(Self(id))
+    }
+}
+
+impl Drop for DisplaysAwake {
+    fn drop(&mut self) {
+        #[link(name = "IOKit", kind = "framework")]
+        unsafe extern "C" {
+            fn IOPMAssertionRelease(id: u32) -> i32;
+        }
+        unsafe { IOPMAssertionRelease(self.0) };
+    }
+}

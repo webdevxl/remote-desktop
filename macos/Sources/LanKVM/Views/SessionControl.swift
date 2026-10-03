@@ -1,6 +1,7 @@
 import Accessibility
 import AppKit
 import CLanKVM
+import Combine
 import SwiftUI
 
 /// Something to do on the remote Mac as a whole, from the session control's menu or the Control
@@ -68,6 +69,15 @@ final class SessionControlModel: ObservableObject {
     /// it is or may expand to.
     @Published private(set) var screenSize = CGSize.zero
     @Published private(set) var expandedSize = CGSize(width: 340, height: SessionControl.pillHeight)
+    /// This window's screen, and this Mac's other screens, as displays the host could make to fill
+    /// them (the Display menu). Kept current as the window moves and screens come and go.
+    @Published private(set) var thisScreen: ScreenFit?
+    @Published private(set) var otherScreens: [ScreenFit] = []
+    /// Set to open the Custom Size sheet over the window (from the Display menu, wherever it is).
+    @Published var customDisplay: DisplayDraft?
+    /// The arrangement picked while the session shows the host's own screen: the next display
+    /// picked goes there.
+    @Published var nextArrangement: RemoteDisplay.Arrangement?
 
     /// The control's frame on the remote screen (points, top-left origin), null while hidden.
     private(set) var frame = CGRect.null
@@ -77,6 +87,10 @@ final class SessionControlModel: ObservableObject {
     private weak var window: NSWindow?
     private var windowObservers: [NSObjectProtocol] = []
     private var pendingInput: (forwarding: Bool, released: Bool)?
+    /// Forwarding started since control did: later starts (the focus coming back, Resume, another
+    /// Space) aren't control starting.
+    private var forwardedSinceControlStarted = false
+    private var controlWatch: AnyCancellable?
     private var flashGeneration = 0
     /// Bumped whenever the pointer comes near, which cancels a pending fade.
     private var peekGeneration = 0
@@ -84,6 +98,11 @@ final class SessionControlModel: ObservableObject {
 
     init(session: SessionModel) {
         self.session = session
+        // Viewing again, refused, or the session over: the next grant starts control afresh.
+        controlWatch = session.$control.sink { [weak self] control in
+            guard control != .active else { return }
+            MainActor.assumeIsolated { self?.forwardedSinceControlStarted = false }
+        }
     }
 
     deinit {
@@ -151,6 +170,87 @@ final class SessionControlModel: ObservableObject {
         session?.showToast("Session control hidden · ⌃⌥⌘ still releases; Control → Show Session Control brings it back")
     }
 
+    // MARK: Displays
+
+    func showMainDisplay() {
+        if let session { CoreModel.shared.showDisplay(RemoteDisplay(), for: session.id) }
+    }
+
+    /// A display that fills a screen of this Mac, placed as the menu's arrangement says.
+    func showVirtualDisplay(_ screen: ScreenFit) {
+        guard let session, case .connected(let info) = session.phase else { return }
+        showDisplay(screen.display(preferredArrangement(info)))
+    }
+
+    /// Asks for `display` (the host's own screen, or a virtual one: a size picked, a retry). A
+    /// size that fills a screen attached here is remembered as fitted to it, and so is one that
+    /// was fitted to a screen before (an offer accepted while that screen is away).
+    func showDisplay(_ display: RemoteDisplay) {
+        guard let session else { return }
+        guard display.kind == .virtual else { return showMainDisplay() }
+        let sameSize = { (size: CGSize) in size == CGSize(width: Int(display.width), height: Int(display.height)) }
+        let matched = ScreenFit.all().first { sameSize($0.size) }?.size
+            ?? RememberedDisplay.load(session.hostId)?.matchedScreen.flatMap { sameSize($0) ? $0 : nil }
+        CoreModel.shared.showDisplay(display, for: session.id, matchedScreen: matched)
+    }
+
+    /// The display shown, or the one the session is switching to: a pick made meanwhile builds on
+    /// that, so it keeps what was just picked.
+    private func current(_ session: SessionModel, _ info: SessionInfo) -> RemoteDisplay {
+        session.display.isSwitching ? (session.requestedDisplay?.display ?? info.display) : info.display
+    }
+
+    /// The same display, placed differently among the host's own. On the host's own screen, where
+    /// the next display picked goes.
+    func arrange(_ arrangement: RemoteDisplay.Arrangement) {
+        guard let session, case .connected(let info) = session.phase else { return }
+        var display = current(session, info)
+        guard display.kind == .virtual else {
+            nextArrangement = arrangement
+            return
+        }
+        display.arrangement = arrangement
+        showDisplay(display)
+    }
+
+    /// Opens the Custom Size sheet with the display shown, or this screen's size.
+    func editCustomDisplay() {
+        guard let session, case .connected(let info) = session.phase else { return }
+        let shown = current(session, info)
+        if shown.kind == .virtual {
+            customDisplay = DisplayDraft(width: shown.width, height: shown.height, hidpi: shown.hidpi, refreshHz: shown.refreshHz)
+        } else if let screen = thisScreen ?? ScreenFit.main() {
+            customDisplay = DisplayDraft(width: screen.width, height: screen.height, hidpi: screen.hidpi, refreshHz: screen.refreshHz)
+        } else {
+            customDisplay = DisplayDraft(width: 2560, height: 1440, hidpi: false, refreshHz: 60)
+        }
+    }
+
+    /// From the Custom Size sheet.
+    func applyCustomDisplay(_ display: RemoteDisplay) {
+        customDisplay = nil
+        guard let session, case .connected(let info) = session.phase else { return }
+        var display = display
+        display.arrangement = preferredArrangement(info)
+        showDisplay(display)
+    }
+
+    /// Where a display picked now goes: where the one shown is, or the one last used with this
+    /// host; only next to the host's own screens on the same Mac.
+    func preferredArrangement(_ info: SessionInfo) -> RemoteDisplay.Arrangement {
+        if info.displayAvailable == DisplayReason.sameMac || info.sameMachine { return .extend }
+        let shown = session.map { current($0, info) } ?? info.display
+        if shown.kind == .virtual { return shown.arrangement }
+        return nextArrangement ?? RememberedDisplay.load(info.hostId)?.display.arrangement ?? .only
+    }
+
+    /// Whether the session shows a display that fills this window's screen: in full screen it's
+    /// pixel for pixel, so the toolbar stays out of the way.
+    func fillsThisScreen(_ display: RemoteDisplay) -> Bool {
+        guard display.kind == .virtual, let thisScreen else { return false }
+        return display.width == thisScreen.width && display.height == thisScreen.height
+    }
+
     // MARK: Placement
 
     private var placementKey: String? {
@@ -191,15 +291,35 @@ final class SessionControlModel: ObservableObject {
                 MainActor.assumeIsolated { self?.syncFullScreen() }
             }
         }
+        // The window moved to another screen, or screens came, went or changed resolution: the
+        // Display menu's sizes follow.
+        for (name, object) in [(NSWindow.didChangeScreenNotification, window as AnyObject?),
+                               (NSApplication.didChangeScreenParametersNotification, nil)] {
+            let observer = NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.syncScreens() }
+            }
+            windowObservers.append(observer)
+        }
         // Called while SwiftUI updates the view: publish afterwards.
         DispatchQueue.main.async { [weak self] in
-            MainActor.assumeIsolated { self?.syncFullScreen() }
+            MainActor.assumeIsolated {
+                self?.syncFullScreen()
+                self?.syncScreens()
+            }
         }
     }
 
     private func syncFullScreen() {
         let fullScreen = window?.styleMask.contains(.fullScreen) == true
         if fullScreen != isFullScreen { isFullScreen = fullScreen }
+    }
+
+    private func syncScreens() {
+        let all = ScreenFit.all()
+        let screen = window?.screen.map(ScreenFit.init)
+        let others = all.filter { $0.id != screen?.id }
+        if screen != thisScreen { thisScreen = screen }
+        if others != otherScreens { otherScreens = others }
     }
 
     /// From InputForwarder whenever forwarding starts or stops or the user releases or resumes.
@@ -227,12 +347,15 @@ final class SessionControlModel: ObservableObject {
     /// Says how to get out: opens briefly each time control starts in full screen, where nothing
     /// else says it, and the first few times in a window.
     private func forwardingStarted() {
+        let controlStarted = !forwardedSinceControlStarted
+        forwardedSinceControlStarted = true
         let defaults = UserDefaults.standard
         guard defaults.object(forKey: Self.visibleKey) as? Bool ?? true else { return }
         if window?.styleMask.contains(.fullScreen) == true {
             flash()
             return
         }
+        guard controlStarted else { return }
         let shown = defaults.integer(forKey: Self.windowedFlashesKey)
         guard shown < Self.windowedFlashLimit else { return }
         defaults.set(shown + 1, forKey: Self.windowedFlashesKey)
@@ -373,11 +496,14 @@ enum Docking {
         return high > low ? low + fraction * (high - low) : length / 2
     }
 
-    /// The placement nearest to a control dropped with its centre here: the closest edge, at that
-    /// position along it.
-    static func snap(_ centre: CGPoint, in screen: CGSize) -> Placement {
+    /// The placement nearest to a control of this size dropped with its centre here: the edge its
+    /// own side comes closest to, at that position along it. (From its centre, a pill wider than
+    /// the screen is tall could never reach the left or right edge.)
+    static func snap(_ centre: CGPoint, size: CGSize, in screen: CGSize) -> Placement {
+        let (w, h) = (size.width / 2, size.height / 2)
         let distances: [(Placement.Edge, CGFloat)] = [
-            (.top, centre.y), (.bottom, screen.height - centre.y), (.left, centre.x), (.right, screen.width - centre.x),
+            (.top, centre.y - h), (.bottom, screen.height - centre.y - h),
+            (.left, centre.x - w), (.right, screen.width - centre.x - w),
         ]
         let edge = distances.reduce(distances[0]) { $1.1 < $0.1 ? $1 : $0 }.0
         let horizontal = edge == .top || edge == .bottom
@@ -666,6 +792,8 @@ struct SessionControl: View {
         }
         .disabled(!session.isControlling)
         Divider()
+        DisplayMenu(session: session, controls: model)
+        Divider()
         Toggle("Send System Shortcuts to Remote Mac", isOn: $sendSystemShortcuts)
         Toggle("Send Trackpad Gestures to Remote Mac", isOn: $sendTrackpadGestures)
         Divider()
@@ -710,7 +838,7 @@ struct SessionControl: View {
 
     private var ghostPlacement: Placement? {
         guard let drag, model.screenSize.width > 0 else { return nil }
-        return Docking.snap(drag.centre, in: model.screenSize)
+        return Docking.snap(drag.centre, size: model.frame.size, in: model.screenSize)
     }
 
     /// Where it will snap to when dropped.
@@ -832,7 +960,7 @@ struct SessionControl: View {
             }
             .onEnded { _ in
                 guard let finished = drag else { return click() }
-                land(at: Docking.snap(finished.centre, in: model.screenSize))
+                land(at: Docking.snap(finished.centre, size: model.frame.size, in: model.screenSize))
                 NSCursor.arrow.set()
             }
     }

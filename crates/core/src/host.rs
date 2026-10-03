@@ -3,18 +3,21 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use platform_mac::capture::{CaptureConfig, CapturedFrame, Capturer, main_display};
+use platform_mac::capture::{CaptureConfig, CapturedFrame, Capturer, DisplayInfo, main_display};
 use platform_mac::cursor::{CursorMonitor, CursorUpdate};
 use platform_mac::encoder::{EncodedFrame, Encoder, EncoderConfig};
-use platform_mac::{clock, permissions, system};
-use protocol::{ClientMsg, Codec, ControlReason, ControlState, CursorState, HostMsg, PROTOCOL_VERSION, VideoFrame};
-use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream};
+use platform_mac::{clock, permissions, system, virtual_display};
+use protocol::{
+    Arrangement, ClientMsg, Codec, ControlReason, ControlState, CursorState, DisplayChoice, DisplayReason, DisplayState, HostMsg,
+    PROTOCOL_VERSION, VideoFrame, VirtualDisplaySpec,
+};
+use quinn::{Connection, ConnectionError, Endpoint, Incoming, RecvStream, SendStream};
 use tokio::sync::mpsc;
 use transport::endpoint::peer_fingerprint;
 use transport::framing::{read_msg, write_msg};
@@ -25,6 +28,7 @@ use serde::Serialize;
 use transport::video::Packetizer;
 
 use crate::control::{Backend, HostSettings, InputCmdSender, InputConfig, InputFailure, InputShared, InputThread, RateLimit};
+use crate::displays::{Acquired, DisplayNotice, Displays, VirtualDisplayView};
 use crate::{Event, EventSink, Trust};
 
 /// Minimum spacing between keyframes produced on request; a client that keeps losing packets
@@ -57,6 +61,12 @@ const MAX_CONTROL_REQUESTS_PER_SEC: u32 = 50;
 /// Input threads a session may start per second. A viewer gets one per grant at most (another
 /// only after the host gave up on its stream, which also ends control).
 const MAX_INPUT_THREADS_PER_SEC: u32 = 5;
+/// Display requests a viewer may send per second. Each can rearrange the Mac's displays; people
+/// pick one from a menu now and then. (Changes are spaced out anyway, see `displays`.)
+const MAX_DISPLAY_REQUESTS_PER_SEC: u32 = 10;
+/// The longest a session waits before restarting a capture that stopped by itself; it waits
+/// longer each time in a row, starting from a quarter second.
+const MAX_CAPTURE_RESTART_DELAY: Duration = Duration::from_secs(8);
 
 #[derive(Clone)]
 pub struct Viewer {
@@ -67,6 +77,8 @@ pub struct Viewer {
     pub conn: Connection,
     /// Whether this viewer controls the Mac right now (rather than only viewing it).
     pub controlling: Arc<AtomicBool>,
+    /// The display it watches.
+    pub watching: Arc<AtomicU32>,
     /// Reaches the viewer's session, e.g. to stop its control from the host UI.
     pub(crate) session: mpsc::UnboundedSender<SessionEvt>,
 }
@@ -89,6 +101,10 @@ pub struct HostStatus {
 }
 
 pub struct HostCtx {
+    /// Virtual displays made for viewers.
+    pub(crate) displays: Displays,
+    /// This user's session has the screen (not switched out by fast user switching).
+    pub(crate) console_active: AtomicBool,
     pub status: Mutex<HostStatus>,
     pub events: EventSink,
     pub trust: Arc<Trust>,
@@ -132,6 +148,8 @@ pub struct HostStatusView {
     pub allow_control: bool,
     /// Whether macOS lets LanKVM post input here (Accessibility).
     pub control_permission: bool,
+    /// Displays made for viewers, watched or waiting for their viewer to come back.
+    pub virtual_displays: Vec<VirtualDisplayView>,
 }
 
 #[derive(Serialize)]
@@ -142,6 +160,9 @@ pub struct ViewerView {
     pub address: String,
     pub device_id: String,
     pub controlling: bool,
+    /// The display it watches, and whether that is one made for a viewer.
+    pub display_id: u32,
+    pub virtual_display: bool,
 }
 
 #[derive(Serialize)]
@@ -163,17 +184,23 @@ impl HostCtx {
         let screen_capture_allowed = permissions::screen_capture_allowed();
         let control_permission = self.backend.permitted();
         let allow_control = self.settings.lock().unwrap().allow_control;
+        let virtual_displays = self.displays.summary();
         let status = self.status.lock().unwrap();
         HostStatusView {
             viewers: status
                 .viewers
                 .iter()
-                .map(|v| ViewerView {
-                    id: v.id,
-                    name: v.name.clone(),
-                    address: v.addr.ip().to_string(),
-                    device_id: short_hex(&v.fingerprint),
-                    controlling: v.controlling.load(Ordering::Acquire),
+                .map(|v| {
+                    let display_id = v.watching.load(Ordering::Acquire);
+                    ViewerView {
+                        id: v.id,
+                        name: v.name.clone(),
+                        address: v.addr.ip().to_string(),
+                        device_id: short_hex(&v.fingerprint),
+                        controlling: v.controlling.load(Ordering::Acquire),
+                        display_id,
+                        virtual_display: virtual_displays.iter().any(|d| d.display_id == display_id),
+                    }
                 })
                 .collect(),
             pairing: status
@@ -184,6 +211,7 @@ impl HostCtx {
             screen_capture_allowed,
             allow_control,
             control_permission,
+            virtual_displays,
         }
     }
 
@@ -201,8 +229,40 @@ impl HostCtx {
             for v in self.status.lock().unwrap().viewers.iter() {
                 let _ = v.session.send(SessionEvt::Revoke(ControlReason::TURNED_OFF, message.clone()));
             }
+            // Virtual displays come with control: they move this Mac's windows around.
+            self.displays.remove(None, format!("Remote control was turned off on {}, so its virtual display was removed.", system::device_name()));
+        }
+        for v in self.status.lock().unwrap().viewers.iter() {
+            let _ = v.session.send(SessionEvt::Availability);
         }
         self.changed();
+    }
+
+    /// Whether this user's session has the screen. While another user has it, the displays made
+    /// for viewers (holding this user's windows) go, and viewers can't add one.
+    pub fn set_console_active(&self, active: bool) {
+        if self.console_active.swap(active, Ordering::AcqRel) == active {
+            return;
+        }
+        if !active {
+            let host = system::device_name();
+            self.displays.remove(None, format!("{host} switched to another user, so its virtual display was removed."));
+        }
+        for v in self.status.lock().unwrap().viewers.iter() {
+            let _ = v.session.send(SessionEvt::Availability);
+        }
+    }
+
+    /// The virtual displays changed: the UI shows them.
+    pub(crate) fn displays_changed(&self) {
+        self.changed();
+    }
+
+    /// Removes a virtual display made for a viewer (`None`: all of them); its viewers go back to
+    /// this Mac's own screen. Never waits.
+    pub fn remove_virtual_display(&self, display_id: Option<u32>) {
+        let host = system::device_name();
+        self.displays.remove(display_id, format!("{host} went back to its own screen: its user removed the virtual display."));
     }
 
     /// Releases every key and button held for remote viewers and waits (up to `timeout`).
@@ -322,27 +382,48 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
         pair(&conn, &mut send, &mut recv, &ctx, client_fp, &device_name).await?;
     }
 
-    let display = if ctx.video { tokio::task::spawn_blocking(main_display).await?? } else { platform_mac::capture::main_display_bounds() };
-    let (width, height) = fit_within(display.width, display.height, max_width, max_height);
-    let fps = choose_fps(fps, width, height);
-    // The bit budget stays at 60 fps worth, so bandwidth doesn't double at 120.
-    let bitrate_bps = bitrate_for(width, height, fps.min(60));
-    let stream = if ctx.video {
-        let capture = CaptureConfig { display_id: display.id, width, height, fps, show_cursor: true };
-        let encoder = EncoderConfig { width, height, fps, bitrate_bps, codec: Codec::Hevc };
-        let stream_conn = conn.clone();
-        let stream = tokio::task::spawn_blocking(move || StreamSession::start(stream_conn, &capture, &encoder))
-            .await?
-            .context("start screen stream")?;
-        Some(SessionGuard(Some(stream)))
-    } else {
-        None
+    let session_id = conn.stable_id() as u64;
+    let same_mac = crate::is_this_mac(conn.remote_address().ip());
+    // Everything else about the session (this Mac's user, the input thread, the cursor monitor,
+    // displays) comes here and goes first, so stopping control never waits behind the viewer's
+    // traffic.
+    let (evt_tx, mut events) = mpsc::unbounded_channel::<SessionEvt>();
+    // The session counts among the virtual displays' viewers from here on, until this drops (last).
+    let _lease = Lease { ctx: ctx.clone(), session_id, conn: conn.clone() };
+    // A device that comes back finds its virtual display (kept a while after a lost connection).
+    let adopted = ctx.displays.join(session_id, client_fp, &device_name, evt_tx.clone()).await;
+    let adopted_seq = adopted.map_or(0, |a| a.seq);
+    let streamer = Streamer {
+        ctx: ctx.clone(),
+        conn: conn.clone(),
+        session_id,
+        viewer_max: (max_width, max_height),
+        viewer_fps: fps,
+        video: ctx.video,
+        stream: Arc::default(),
+        packetizer: Arc::default(),
+        input: Arc::new(InputShared::default()),
+        cursor: CursorWish::default(),
+        generation: Arc::default(),
+        events: evt_tx.clone(),
     };
-    let codec = stream.as_ref().map_or(Codec::Hevc, |s| s.codec());
+    let showing = match adopted {
+        Some(acquired) => match streamer.show_virtual(acquired).await {
+            Ok(showing) => showing,
+            Err(e) => {
+                tracing::warn!("show the virtual display: {e:#}");
+                ctx.displays.release(session_id).await;
+                streamer.show_main().await.context("start screen stream")?
+            }
+        },
+        None => streamer.show_main().await.context("start screen stream")?,
+    };
+    let codec = streamer.stream.codec().unwrap_or(Codec::Hevc);
+    let Showing { width, height, fps, .. } = showing;
 
     write_msg(&mut send, &HostMsg::Welcome { device_name: system::device_name(), width, height, fps, codec }).await?;
 
-    tracing::info!(viewer = %device_name, addr = %conn.remote_address(), fingerprint = %short_hex(&client_fp), width, height, fps, bitrate_bps, video = ctx.video, "streaming");
+    tracing::info!(viewer = %device_name, addr = %conn.remote_address(), fingerprint = %short_hex(&client_fp), width, height, fps, display = showing.display_id, video = ctx.video, "streaming");
 
     // From here on several parties talk to the viewer (pongs, control state, cursor shapes,
     // input acks), so one task owns the send side of the control stream.
@@ -369,9 +450,6 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
             }
         }
     }));
-    // Everything else about the session (this Mac's user, the input thread, the cursor monitor)
-    // comes here and goes first, so stopping control never waits behind the viewer's traffic.
-    let (evt_tx, mut events) = mpsc::unbounded_channel::<SessionEvt>();
     // The viewer opens its input stream with its first input, and a new one if the host gave up
     // on the old one.
     let _acceptor = AbortOnDrop(tokio::spawn({
@@ -386,7 +464,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
     }));
 
     let controlling = Arc::new(AtomicBool::new(false));
-    let session_id = conn.stable_id() as u64;
+    let watching = Arc::new(AtomicU32::new(showing.display_id));
     let _registration = Registration::new(
         Viewer {
             id: session_id,
@@ -395,6 +473,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
             fingerprint: client_fp,
             conn: conn.clone(),
             controlling: controlling.clone(),
+            watching: watching.clone(),
             session: evt_tx.clone(),
         },
         ctx.clone(),
@@ -411,26 +490,29 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
         session_id,
         viewer_name: device_name,
         client_fp,
-        same_mac: crate::is_this_mac(conn.remote_address().ip()),
-        display_id: display.id,
-        shared: Arc::new(InputShared::default()),
+        same_mac,
+        shared: streamer.input.clone(),
         input: None,
         input_starts: RateLimit::default(),
         controlling,
         cursor: None,
         cursor_unknown: true,
-        cursor_in_video: Arc::new(AtomicBool::new(true)),
-        cursor_apply: Arc::new(Mutex::new(())),
+        cursor_wish: streamer.cursor.clone(),
         forwarding: false,
-        capturer: stream.as_ref().and_then(|s| s.capturer()),
+        stream: streamer.stream.clone(),
         out: out.clone(),
         events: evt_tx,
         ttl: None,
     };
+    let mut screen = Screen::new(streamer, showing, out.clone(), client_fp, same_mac, watching);
+    screen.seq_seen = adopted_seq;
+    // What it shows, and whether it may ask for a virtual display.
+    screen.announce(0, DisplayReason::NONE, String::new());
 
     // While controlled, notice within a second if the Accessibility permission is withdrawn.
     let mut permission_check = tokio::time::interval(PERMISSION_CHECK);
     let mut requests = RateLimit::default();
+    let mut display_requests = RateLimit::default();
     loop {
         let evt = tokio::select! {
             biased;
@@ -442,17 +524,18 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
             }
         };
         let Some(evt) = evt else { break };
-        if let SessionEvt::Client(ClientMsg::SetControl { .. } | ClientMsg::Focus { .. }) = evt
+        if let SessionEvt::Client(ClientMsg::SetControl { .. } | ClientMsg::Focus { .. } | ClientMsg::SetDisplay { .. }) = evt
             && !requests.allow(Instant::now(), MAX_CONTROL_REQUESTS_PER_SEC)
         {
             bail!("more than {MAX_CONTROL_REQUESTS_PER_SEC} control requests a second");
         }
+        if let SessionEvt::Client(ClientMsg::SetDisplay { .. }) = evt
+            && !display_requests.allow(Instant::now(), MAX_DISPLAY_REQUESTS_PER_SEC)
+        {
+            bail!("more than {MAX_DISPLAY_REQUESTS_PER_SEC} display requests a second");
+        }
         match evt {
-            SessionEvt::Client(ClientMsg::RequestKeyframe) => {
-                if let Some(stream) = &stream {
-                    stream.request_keyframe();
-                }
-            }
+            SessionEvt::Client(ClientMsg::RequestKeyframe) => control.stream.request_keyframe(),
             SessionEvt::Client(ClientMsg::Ping { client_time_us }) => {
                 let now = clock::now_us();
                 control.shared.last_ping_us.store(now, Ordering::Release);
@@ -461,12 +544,22 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
             }
             SessionEvt::Client(ClientMsg::SetControl { on, request, take_over }) => control.set(on, take_over, request),
             SessionEvt::Client(ClientMsg::Focus { forwarding }) => control.focus(forwarding),
+            SessionEvt::Client(ClientMsg::SetDisplay { request, display }) => screen.request(request, display),
             SessionEvt::Client(other) => bail!("unexpected message {other:?}"),
             SessionEvt::Closed(None) => break,
             SessionEvt::Closed(Some(e)) => return Err(e),
             SessionEvt::InputStream(recv) => control.attach_input(recv),
             SessionEvt::Revoke(reason, message) => control.revoke(reason, message),
             SessionEvt::Cursor(update) => control.cursor(update),
+            SessionEvt::Display(notice) => screen.notice(notice),
+            SessionEvt::Switched(done) => {
+                if let Err(e) = screen.switched(*done) {
+                    conn.close(7u32.into(), b"no display to show");
+                    return Err(e);
+                }
+            }
+            SessionEvt::Availability => screen.availability_changed(),
+            SessionEvt::CaptureStopped(generation) => screen.capture_stopped(generation),
         }
     }
     Ok(())
@@ -596,6 +689,14 @@ pub(crate) enum SessionEvt {
     /// message to show on the viewer.
     Revoke(ControlReason, String),
     Cursor(CursorUpdate),
+    /// News about the virtual display the session watches, or about the Mac's displays.
+    Display(DisplayNotice),
+    /// A display switch is done (see [`Screen`]).
+    Switched(Box<Switched>),
+    /// Whether the viewer may have a virtual display may have changed (a setting).
+    Availability,
+    /// ScreenCaptureKit stopped the capture of this generation of the stream by itself.
+    CaptureStopped(u64),
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -624,7 +725,7 @@ struct SessionControl {
     client_fp: Fingerprint,
     /// The viewer runs on this Mac (a second copy of LanKVM).
     same_mac: bool,
-    display_id: u32,
+    /// Shared with the input thread, which also reads which display pointer input goes to.
     shared: Arc<InputShared>,
     input: Option<InputThread>,
     input_starts: RateLimit,
@@ -633,14 +734,13 @@ struct SessionControl {
     /// The monitor hasn't reported the cursor yet, or can't read its shape: the viewer can't
     /// draw ours, so it stays in the video.
     cursor_unknown: bool,
-    /// Whether the captured video should include the cursor. Applied off the runtime by one
-    /// update at a time (`cursor_apply`), each applying the latest wish.
-    cursor_in_video: Arc<AtomicBool>,
-    cursor_apply: Arc<Mutex<()>>,
+    /// Whether the captured video should include the cursor.
+    cursor_wish: CursorWish,
     /// The viewer's window has the focus (it draws our cursor only then). It says so after each
     /// grant; until then the cursor stays in the video.
     forwarding: bool,
-    capturer: Option<Arc<Capturer>>,
+    /// The stream sent now (replaced when the viewer switches displays).
+    stream: Arc<StreamSlot>,
     out: mpsc::Sender<HostMsg>,
     events: mpsc::UnboundedSender<SessionEvt>,
     /// Ends control after a test-chosen time (`LANKVM_TEST_CONTROL_TTL`).
@@ -844,7 +944,6 @@ impl SessionControl {
         let events = self.events.clone();
         let viewer = self.viewer_name.clone();
         let config = InputConfig {
-            display_id: self.display_id,
             backend: self.ctx.backend.clone(),
             tag: self.ctx.injected_tag,
             guard_pid: self.ctx.guard_pid,
@@ -905,21 +1004,37 @@ impl SessionControl {
     /// While the viewer draws the cursor itself, the video leaves it out (or it would show twice,
     /// the video one trailing behind).
     fn set_cursor_in_video(&self, show: bool) {
-        let Some(capturer) = self.capturer.clone() else { return };
-        if self.cursor_in_video.swap(show, Ordering::AcqRel) == show {
+        // The wish is kept even while no stream runs: the next stream starts with it.
+        if self.cursor_wish.wanted.swap(show, Ordering::AcqRel) == show || !self.ctx.video {
             return;
         }
-        let (wanted, apply) = (self.cursor_in_video.clone(), self.cursor_apply.clone());
-        // ScreenCaptureKit can take a while to apply it: never wait for that on the runtime.
+        let (wish, stream) = (self.cursor_wish.clone(), self.stream.clone());
+        // ScreenCaptureKit can take a while to apply it: never wait for that on the runtime. One
+        // update at a time, each applying the latest wish to the stream there is then (a display
+        // switch holds the same lock while it replaces the stream).
         tokio::task::spawn_blocking(move || {
-            let _one_at_a_time = apply.lock().unwrap();
-            let show = wanted.load(Ordering::Acquire);
+            let _one_at_a_time = wish.apply.lock().unwrap();
+            let Some(capturer) = stream.capturer() else { return };
+            let show = wish.wanted.load(Ordering::Acquire);
             let started = std::time::Instant::now();
             match capturer.set_shows_cursor(show) {
                 Ok(()) => tracing::debug!(show, ms = started.elapsed().as_secs_f64() * 1000.0, "cursor in video"),
                 Err(e) => tracing::warn!("show cursor in video: {e:#}"),
             }
         });
+    }
+}
+
+/// Whether the video should show the cursor, and the lock that applies it one change at a time.
+#[derive(Clone)]
+struct CursorWish {
+    wanted: Arc<AtomicBool>,
+    apply: Arc<Mutex<()>>,
+}
+
+impl Default for CursorWish {
+    fn default() -> Self {
+        Self { wanted: Arc::new(AtomicBool::new(true)), apply: Arc::default() }
     }
 }
 
@@ -1059,8 +1174,16 @@ struct EncodeState {
 }
 
 impl StreamSession {
-    fn start(conn: Connection, capture: &CaptureConfig, encoder: &EncoderConfig) -> Result<Self> {
-        let packetizer = Mutex::new(Packetizer::new());
+    /// Frames go out through `packetizer`, the connection's one: frame ids keep counting up when
+    /// a new stream replaces an old one, or the viewer would drop the new frames as late.
+    /// `on_stopped` is told if ScreenCaptureKit stops the capture by itself.
+    fn start(
+        conn: Connection,
+        packetizer: Arc<Mutex<Packetizer>>,
+        capture: &CaptureConfig,
+        encoder: &EncoderConfig,
+        on_stopped: impl Fn(String) + Send + Sync + 'static,
+    ) -> Result<Self> {
         let (width, height) = (encoder.width, encoder.height);
         let encoder = Encoder::new(encoder, move |frame| send_frame(&conn, &packetizer, frame, width, height))?;
         let shared = Arc::new(Shared {
@@ -1075,7 +1198,7 @@ impl StreamSession {
         })?;
         let mut session = Self { capturer: None, shared, encode_thread: Some(encode_thread) };
         let on_frame = session.shared.clone();
-        session.capturer = Some(Arc::new(Capturer::start(capture, move |frame| on_frame.on_captured(frame))?));
+        session.capturer = Some(Arc::new(Capturer::start(capture, move |frame| on_frame.on_captured(frame), on_stopped)?));
         Ok(session)
     }
 
@@ -1186,22 +1309,559 @@ fn send_frame(conn: &Connection, packetizer: &Mutex<Packetizer>, frame: EncodedF
     }
 }
 
-/// Drops the stream on a blocking thread: stopping ScreenCaptureKit waits for a completion
-/// handler, which must not stall the async runtime.
-struct SessionGuard(Option<StreamSession>);
+/// The stream a session sends. A display switch replaces it, always stopping the old one before
+/// starting the new one (two encoders would mix their frames), and never on the async runtime.
+#[derive(Default)]
+struct StreamSlot(Mutex<Option<StreamSession>>);
 
-impl std::ops::Deref for SessionGuard {
-    type Target = StreamSession;
-    fn deref(&self) -> &StreamSession {
-        self.0.as_ref().expect("present until drop")
+impl StreamSlot {
+    fn request_keyframe(&self) {
+        if let Some(stream) = self.0.lock().unwrap().as_ref() {
+            stream.request_keyframe();
+        }
+    }
+
+    fn capturer(&self) -> Option<Arc<Capturer>> {
+        self.0.lock().unwrap().as_ref().and_then(|s| s.capturer())
+    }
+
+    fn codec(&self) -> Option<Codec> {
+        self.0.lock().unwrap().as_ref().map(|s| s.codec())
     }
 }
 
-impl Drop for SessionGuard {
+impl Drop for StreamSlot {
     fn drop(&mut self) {
-        if let Some(stream) = self.0.take() {
-            tokio::task::spawn_blocking(move || drop(stream));
+        // Stopping ScreenCaptureKit waits for a completion handler, which must not stall the
+        // async runtime.
+        if let Some(stream) = self.0.get_mut().unwrap().take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(rt) => drop(rt.spawn_blocking(move || drop(stream))),
+                Err(_) => drop(stream),
+            }
         }
+    }
+}
+
+/// What a session shows now.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Showing {
+    /// As the viewer knows it: the main display, or its virtual display as it is.
+    display: DisplayChoice,
+    display_id: u32,
+    /// The stream.
+    width: u32,
+    height: u32,
+    fps: u32,
+}
+
+/// Starts a session's stream on a display. Cheap to clone: switches run in tasks of their own.
+#[derive(Clone)]
+struct Streamer {
+    ctx: Arc<HostCtx>,
+    conn: Connection,
+    session_id: u64,
+    /// The viewer's screen (from `Hello`): the main display is streamed at most this size.
+    viewer_max: (u32, u32),
+    viewer_fps: u32,
+    video: bool,
+    stream: Arc<StreamSlot>,
+    packetizer: Arc<Mutex<Packetizer>>,
+    input: Arc<InputShared>,
+    cursor: CursorWish,
+    /// Counts streams, so a stop reported by an old one is ignored.
+    generation: Arc<AtomicU64>,
+    events: mpsc::UnboundedSender<SessionEvt>,
+}
+
+impl Streamer {
+    /// Shows this Mac's main display, scaled to fit the viewer's screen.
+    async fn show_main(&self) -> Result<Showing> {
+        let video = self.video;
+        let display = tokio::task::spawn_blocking(move || -> Result<DisplayInfo> {
+            if !video {
+                return Ok(platform_mac::capture::main_display_bounds());
+            }
+            platform_mac::capture::display(main_display_now())
+        })
+        .await??;
+        let (width, height) = fit_within(display.width, display.height, self.viewer_max.0, self.viewer_max.1);
+        let fps = choose_fps(self.viewer_fps, width, height);
+        self.swap(display.id, width, height, fps).await?;
+        Ok(Showing { display: DisplayChoice::Main, display_id: display.id, width, height, fps })
+    }
+
+    /// Shows the device's virtual display pixel for pixel: the viewer asked for its size.
+    async fn show_virtual(&self, acquired: Acquired) -> Result<Showing> {
+        let Acquired { display_id, spec, .. } = acquired;
+        // As macOS draws it now (normally the size asked for), once ScreenCaptureKit lists it.
+        let display = tokio::task::spawn_blocking(move || platform_mac::capture::display(display_id)).await??;
+        let (width, height) = (display.width & !1, display.height & !1);
+        if (width, height) != (spec.width, spec.height) {
+            tracing::warn!(display = display_id, width, height, ?spec, "the virtual display isn't the size asked for");
+        }
+        let fps = choose_fps(spec.refresh_hz, width, height);
+        self.swap(display_id, width, height, fps).await?;
+        Ok(Showing { display: DisplayChoice::Virtual(spec), display_id, width, height, fps })
+    }
+
+    /// Replaces the stream with one of `display_id`, and sends pointer input there.
+    async fn swap(&self, display_id: u32, width: u32, height: u32, fps: u32) -> Result<()> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.swap_now(display_id, width, height, fps)).await?
+    }
+
+    fn swap_now(&self, display_id: u32, width: u32, height: u32, fps: u32) -> Result<()> {
+        // No cursor change applies to the old stream while it goes, or gets lost while the new one
+        // starts: they wait for this lock.
+        let _cursor = self.cursor.apply.lock().unwrap();
+        let old = self.stream.0.lock().unwrap().take();
+        drop(old);
+        if self.video {
+            let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            let show_cursor = self.cursor.wanted.load(Ordering::Acquire);
+            let capture = CaptureConfig { display_id, width, height, fps, show_cursor };
+            // The bit budget stays at 60 fps worth, so bandwidth doesn't double at 120.
+            let encoder = EncoderConfig { width, height, fps, bitrate_bps: bitrate_for(width, height, fps.min(60)), codec: Codec::Hevc };
+            let events = self.events.clone();
+            let stream = StreamSession::start(self.conn.clone(), self.packetizer.clone(), &capture, &encoder, move |why| {
+                tracing::warn!(display = display_id, "capture stopped: {why}");
+                let _ = events.send(SessionEvt::CaptureStopped(generation));
+            })?;
+            *self.stream.0.lock().unwrap() = Some(stream);
+            // The wish may have changed while the stream started.
+            let wanted = self.cursor.wanted.load(Ordering::Acquire);
+            if wanted != show_cursor
+                && let Some(capturer) = self.stream.capturer()
+                && let Err(e) = capturer.set_shows_cursor(wanted)
+            {
+                tracing::warn!("show cursor in video: {e:#}");
+            }
+        }
+        self.input.set_display(display_id);
+        Ok(())
+    }
+
+    /// Runs one display change; the result goes back to the session as [`SessionEvt::Switched`].
+    async fn run(self, job: Job, before: Showing) -> Switched {
+        let host = system::device_name();
+        match job {
+            Job::Request(request, DisplayChoice::Main, _) => {
+                // Gone (unless another window of the device watches it) before the main display is
+                // chosen: it may have been the main one. (A no-op if the session watches none.)
+                self.ctx.displays.release(self.session_id).await;
+                self.main(request, DisplayReason::NONE, String::new()).await
+            }
+            Job::Request(request, DisplayChoice::Virtual(spec), epoch) => match self.ctx.displays.acquire(self.session_id, spec, epoch).await {
+                // Nothing changed: the stream goes on as it was.
+                Err((reason, message)) => Switched { request, showing: before, reason, message, fatal: None, seq: 0 },
+                Ok(acquired) => self.virtual_or_main(request, acquired, String::new(), &host).await,
+            },
+            Job::Main { reason, message, seq } => {
+                // After whatever the display worker is still doing (giving the main role back).
+                self.ctx.displays.release(self.session_id).await;
+                Switched { seq, ..self.main(0, reason, message).await }
+            }
+            Job::Virtual { acquired, message } => self.virtual_or_main(0, acquired, message, &host).await,
+            Job::Restart { delay } => {
+                tokio::time::sleep(delay).await;
+                match before.display {
+                    DisplayChoice::Virtual(spec) if virtual_display::online_displays().contains(&before.display_id) => {
+                        let acquired = Acquired { display_id: before.display_id, spec, seq: 0 };
+                        self.virtual_or_main(0, acquired, String::new(), &host).await
+                    }
+                    DisplayChoice::Virtual(_) => {
+                        self.ctx.displays.release(self.session_id).await;
+                        self.main(0, DisplayReason::DISPLAY_GONE, format!("{host}'s virtual display went away.")).await
+                    }
+                    DisplayChoice::Main => self.main(0, DisplayReason::NONE, String::new()).await,
+                }
+            }
+        }
+    }
+
+    async fn main(&self, request: u32, reason: DisplayReason, message: String) -> Switched {
+        match self.show_main().await {
+            Ok(showing) => Switched { request, showing, reason, message, fatal: None, seq: 0 },
+            Err(e) => Switched { request, showing: Showing::NONE, reason, message, fatal: Some(format!("{e:#}")), seq: 0 },
+        }
+    }
+
+    /// Shows the virtual display, or, if that fails, the main display again.
+    async fn virtual_or_main(&self, request: u32, acquired: Acquired, message: String, host: &str) -> Switched {
+        match self.show_virtual(acquired).await {
+            Ok(showing) => Switched { request, showing, reason: DisplayReason::NONE, message, fatal: None, seq: acquired.seq },
+            Err(e) => {
+                tracing::warn!("show the virtual display: {e:#}");
+                self.ctx.displays.release(self.session_id).await;
+                let message = format!("{host} couldn't show the virtual display ({e:#}), so it shows its own screen.");
+                self.main(request, DisplayReason::FAILED, message).await
+            }
+        }
+    }
+}
+
+impl Showing {
+    /// Nothing (a session that failed to show anything ends).
+    const NONE: Self = Self { display: DisplayChoice::Main, display_id: 0, width: 0, height: 0, fps: 0 };
+}
+
+/// Whether a session watching "the main display" still does: its display shows its own picture,
+/// and if it's a virtual display (another device's, which took the main role), it still has it.
+fn still_main(display_id: u32) -> bool {
+    virtual_display::is_active(display_id) && (!virtual_display::is_lankvm(display_id) || virtual_display::main_display() == display_id)
+}
+
+/// The main display, or if macOS hasn't settled on one after a change, the first display that
+/// shows its own picture.
+fn main_display_now() -> u32 {
+    let main = virtual_display::main_display();
+    if virtual_display::is_active(main) {
+        return main;
+    }
+    virtual_display::online_displays().into_iter().find(|&d| virtual_display::is_active(d)).unwrap_or(main)
+}
+
+/// A display change for a session to make.
+enum Job {
+    /// The viewer asked for a display; the session decided it may at the displays' `epoch`.
+    Request(u32, DisplayChoice, u64),
+    /// Show the main display, saying why (the session's display went away or stopped showing);
+    /// `seq` is the news that said so.
+    Main { reason: DisplayReason, message: String, seq: u64 },
+    /// Show the device's virtual display as it is now (another session of the device changed it).
+    Virtual { acquired: Acquired, message: String },
+    /// The capture stopped by itself: start it again after `delay`, on the same display if it's
+    /// still there.
+    Restart { delay: Duration },
+}
+
+/// What a display change did.
+pub(crate) struct Switched {
+    request: u32,
+    showing: Showing,
+    reason: DisplayReason,
+    message: String,
+    /// Nothing could be shown: the session ends with this.
+    fatal: Option<String>,
+    /// The display worker's news this follows (see `DisplayNotice`), 0 if none.
+    seq: u64,
+}
+
+/// What a session shows, and switching it: one change at a time, in a task of its own (each takes
+/// up to a couple of seconds), with the latest request waiting for its turn. The viewer hears
+/// about every change, in order.
+struct Screen {
+    streamer: Streamer,
+    out: mpsc::Sender<HostMsg>,
+    showing: Showing,
+    client_fp: Fingerprint,
+    same_mac: bool,
+    /// The display id the host's UI shows for this viewer.
+    watching: Arc<AtomicU32>,
+    /// The change in progress (aborted if the session ends).
+    switching: Option<AbortOnDrop>,
+    /// What the viewer asked for meanwhile (the latest wins), and news that came meanwhile.
+    next_request: Option<NextRequest>,
+    next_notice: Option<DisplayNotice>,
+    /// The displays changed meanwhile: look again after.
+    recheck: bool,
+    available: (DisplayReason, String),
+    /// Captures in a row that stopped by themselves (each restart waits longer).
+    restarts: u32,
+    /// The capture stopped during a change, which may not replace it: the stream generation then.
+    stopped: Option<u64>,
+    /// The display worker's newest news this session follows: older news is stale.
+    seq_seen: u64,
+}
+
+enum NextRequest {
+    Switch(u32, DisplayChoice),
+    /// A request refused at once, answered in turn (after the change before it).
+    Refuse(u32, DisplayReason, String),
+}
+
+impl Screen {
+    fn new(streamer: Streamer, showing: Showing, out: mpsc::Sender<HostMsg>, client_fp: Fingerprint, same_mac: bool, watching: Arc<AtomicU32>) -> Self {
+        let mut screen = Self {
+            streamer,
+            out,
+            showing,
+            client_fp,
+            same_mac,
+            watching,
+            switching: None,
+            next_request: None,
+            next_notice: None,
+            recheck: false,
+            available: (DisplayReason::NONE, String::new()),
+            restarts: 0,
+            stopped: None,
+            seq_seen: 0,
+        };
+        screen.available = screen.availability();
+        screen
+    }
+
+    /// Tells the viewer what it watches now.
+    fn announce(&self, request: u32, reason: DisplayReason, message: String) {
+        let Showing { display, width, height, fps, .. } = self.showing;
+        let (available, unavailable) = self.available.clone();
+        let state = DisplayState { request, display, width, height, fps, reason, message, available, unavailable };
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.out.try_send(HostMsg::Display(state)) {
+            tracing::warn!("viewer isn't reading its control stream; disconnecting");
+            self.streamer.conn.close(4u32.into(), b"viewer not reading");
+        }
+    }
+
+    /// Whether the viewer may ask for a virtual display, and if not why, naming this Mac.
+    fn availability(&self) -> (DisplayReason, String) {
+        let ctx = &self.streamer.ctx;
+        let host = system::device_name();
+        if !ctx.video {
+            return (DisplayReason::NO_VIDEO, format!("{host} doesn't stream its screen, so it can't show a virtual display."));
+        }
+        if !virtual_display::supported() {
+            return (DisplayReason::UNSUPPORTED, format!("{host}'s version of macOS can't make virtual displays."));
+        }
+        if !ctx.settings.lock().unwrap().allow_control {
+            let message = format!("{host} lets paired Macs only view it. Virtual displays, like control, can be turned on under This Mac in LanKVM there.");
+            return (DisplayReason::NOT_ALLOWED, message);
+        }
+        if !ctx.console_active.load(Ordering::Acquire) {
+            return (DisplayReason::NOT_ALLOWED, format!("{host} switched to another user, so it can't show a virtual display now."));
+        }
+        if !ctx.trust.viewers.lock().unwrap().contains(&self.client_fp) {
+            return (DisplayReason::NOT_ALLOWED, format!("{host} no longer trusts this Mac. Connect again to pair."));
+        }
+        if self.client_fp == ctx.trust.fingerprint {
+            return (DisplayReason::NOT_ALLOWED, "This LanKVM is connected to itself.".into());
+        }
+        if self.same_mac && !ctx.allow_same_mac_control {
+            let message = format!("That's this Mac ({host}): a virtual display can only go next to its screen, not replace it.");
+            return (DisplayReason::SAME_MAC, message);
+        }
+        (DisplayReason::NONE, String::new())
+    }
+
+    /// Whether the viewer may have this virtual display, as the host will make it.
+    fn check(&self, spec: VirtualDisplaySpec) -> Result<VirtualDisplaySpec, (DisplayReason, String)> {
+        let (reason, message) = self.availability();
+        if reason != DisplayReason::NONE && reason != DisplayReason::SAME_MAC {
+            return Err((reason, message));
+        }
+        let spec = spec.validated().map_err(|m| (DisplayReason::INVALID, m))?;
+        if spec.arrangement == Arrangement::EXTEND {
+            return Ok(spec);
+        }
+        if reason == DisplayReason::SAME_MAC {
+            return Err((reason, message));
+        }
+        // The main display is where the controlling device works: not another's to take.
+        let ctx = &self.streamer.ctx;
+        if let Some(name) = ctx.controller.lock().unwrap().as_ref().filter(|s| s.fingerprint != self.client_fp).map(|s| s.name.clone()) {
+            let host = system::device_name();
+            let message = format!("{name} is controlling {host}, so its main display isn't this Mac's to take. A display next to its screen is possible.");
+            return Err((DisplayReason::IN_USE, message));
+        }
+        Ok(spec)
+    }
+
+    fn request(&mut self, request: u32, display: DisplayChoice) {
+        let next = match display {
+            DisplayChoice::Main => NextRequest::Switch(request, DisplayChoice::Main),
+            DisplayChoice::Virtual(spec) => match self.check(spec) {
+                Ok(spec) => NextRequest::Switch(request, DisplayChoice::Virtual(spec)),
+                Err((reason, message)) => NextRequest::Refuse(request, reason, message),
+            },
+        };
+        if self.switching.is_some() {
+            self.next_request = Some(next);
+        } else {
+            self.next_request = Some(next);
+            self.run_next();
+        }
+    }
+
+    /// News from the virtual displays: follow it now, or after the change in progress.
+    fn notice(&mut self, notice: DisplayNotice) {
+        if self.switching.is_some() {
+            match notice {
+                DisplayNotice::Layout => self.recheck = true,
+                notice => self.next_notice = Some(notice),
+            }
+            return;
+        }
+        if let Some(job) = self.follow(notice) {
+            self.start(job);
+        }
+    }
+
+    /// What to do about `notice`, if anything. News about a display the session doesn't watch, or
+    /// older than what it follows (it came while a request of its own was answered), is stale.
+    fn follow(&self, notice: DisplayNotice) -> Option<Job> {
+        let watches = |id: u32| matches!(self.showing.display, DisplayChoice::Virtual(_)) && self.showing.display_id == id;
+        match notice {
+            DisplayNotice::Changed { display_id, spec, message, seq } if seq > self.seq_seen && watches(display_id) => {
+                Some(Job::Virtual { acquired: Acquired { display_id, spec, seq }, message })
+            }
+            DisplayNotice::Removed { display_id, reason, message, seq } if seq > self.seq_seen && watches(display_id) => {
+                Some(Job::Main { reason, message, seq })
+            }
+            DisplayNotice::Changed { .. } | DisplayNotice::Removed { .. } => None,
+            DisplayNotice::Layout => self.check_layout(),
+        }
+    }
+
+    /// After the Mac's displays changed: whether this session's display still shows, at its size.
+    fn check_layout(&self) -> Option<Job> {
+        if !self.streamer.video {
+            return None;
+        }
+        let id = self.showing.display_id;
+        match self.showing.display {
+            // Watching the main display that now mirrors another (a viewer chose "only"), is gone, or
+            // was another device's display that isn't main any more.
+            DisplayChoice::Main if !still_main(id) => Some(Job::Main { reason: DisplayReason::NONE, message: String::new(), seq: 0 }),
+            DisplayChoice::Main => None,
+            DisplayChoice::Virtual(spec) => {
+                if !virtual_display::online_displays().contains(&id) {
+                    let message = format!("{}'s virtual display went away.", system::device_name());
+                    return Some(Job::Main { reason: DisplayReason::DISPLAY_GONE, message, seq: 0 });
+                }
+                // Drawn at another size than streamed (macOS changed its mode for a moment).
+                let size = virtual_display::pixel_size(id).map(|(w, h)| (w & !1, h & !1));
+                (size.is_some() && size != Some((self.showing.width, self.showing.height)))
+                    .then(|| Job::Virtual { acquired: Acquired { display_id: id, spec, seq: 0 }, message: String::new() })
+            }
+        }
+    }
+
+    fn start(&mut self, job: Job) {
+        let (streamer, before) = (self.streamer.clone(), self.showing);
+        let events = self.streamer.events.clone();
+        self.switching = Some(AbortOnDrop(tokio::spawn(async move {
+            let done = streamer.run(job, before).await;
+            let _ = events.send(SessionEvt::Switched(Box::new(done)));
+        })));
+    }
+
+    /// A change is done: tell the viewer, then go on with what waited.
+    fn switched(&mut self, done: Switched) -> Result<()> {
+        self.switching = None;
+        if let Some(why) = done.fatal {
+            bail!("no display to show: {why}");
+        }
+        if done.request != 0 {
+            // The viewer chose: a capture that stops from now on starts a new count.
+            self.restarts = 0;
+        }
+        self.seq_seen = self.seq_seen.max(done.seq);
+        self.showing = done.showing;
+        self.watching.store(self.showing.display_id, Ordering::Release);
+        self.streamer.ctx.changed();
+        self.announce(done.request, done.reason, done.message);
+        self.run_next();
+        Ok(())
+    }
+
+    fn run_next(&mut self) {
+        // The capture stopped during a change that didn't replace it (a refused request): start
+        // it again first.
+        if let Some(generation) = self.stopped.take()
+            && generation == self.streamer.generation.load(Ordering::Acquire)
+        {
+            self.capture_stopped(generation);
+        }
+        while self.switching.is_none() {
+            if let Some(next) = self.next_request.take() {
+                match next {
+                    NextRequest::Refuse(request, reason, message) => self.announce(request, reason, message),
+                    NextRequest::Switch(request, display) if display == self.showing.display && self.still_shown() => {
+                        // Already showing that (a viewer re-applying its choice): nothing to change.
+                        self.announce(request, DisplayReason::NONE, String::new());
+                    }
+                    NextRequest::Switch(request, display) => {
+                        // Allowed when asked, but maybe not any more (this Mac's user took its
+                        // screen back meanwhile): decide again, now. The display worker refuses it
+                        // if that happens while it waits there.
+                        let epoch = self.streamer.ctx.displays.epoch();
+                        if let DisplayChoice::Virtual(spec) = display
+                            && let Err((reason, message)) = self.check(spec)
+                        {
+                            self.announce(request, reason, message);
+                            continue;
+                        }
+                        // The viewer's choice decides; news about the display it leaves no longer matters.
+                        self.next_notice = None;
+                        self.recheck = true;
+                        self.start(Job::Request(request, display, epoch));
+                    }
+                }
+            } else if let Some(notice) = self.next_notice.take() {
+                if let Some(job) = self.follow(notice) {
+                    self.start(job);
+                }
+            } else if std::mem::take(&mut self.recheck) {
+                if let Some(job) = self.check_layout() {
+                    self.start(job);
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// Whether the display shown is still there to show (as the main display, if that's what the
+    /// viewer watches).
+    fn still_shown(&self) -> bool {
+        let id = self.showing.display_id;
+        !self.streamer.video
+            || match self.showing.display {
+                DisplayChoice::Main => still_main(id),
+                DisplayChoice::Virtual(_) => virtual_display::is_active(id),
+            }
+    }
+
+    fn availability_changed(&mut self) {
+        let available = self.availability();
+        if available != self.available {
+            self.available = available;
+            self.announce(0, DisplayReason::NONE, String::new());
+        }
+    }
+
+    /// ScreenCaptureKit stopped the capture by itself (the display changed or went away under it):
+    /// start it again, waiting longer each time in a row so a display that keeps failing can't
+    /// keep the Mac busy.
+    fn capture_stopped(&mut self, generation: u64) {
+        if generation != self.streamer.generation.load(Ordering::Acquire) {
+            return;
+        }
+        if self.switching.is_some() {
+            // The change in progress may replace the stream; if it doesn't, it restarts after.
+            self.stopped = Some(generation);
+            return;
+        }
+        let delay = (Duration::from_millis(250) * 2u32.saturating_pow(self.restarts)).min(MAX_CAPTURE_RESTART_DELAY);
+        self.restarts += 1;
+        self.start(Job::Restart { delay });
+    }
+}
+
+/// Counts the session among the virtual displays' viewers while it lives. When it ends, a
+/// virtual display only it watched goes: at once if the connection was closed, or a while later
+/// if it was lost (the viewer may come back for it).
+struct Lease {
+    ctx: Arc<HostCtx>,
+    session_id: u64,
+    conn: Connection,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let lost = matches!(self.conn.close_reason(), Some(ConnectionError::TimedOut | ConnectionError::Reset));
+        self.ctx.displays.leave(self.session_id, lost);
     }
 }
 

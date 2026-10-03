@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use platform_mac::decoder::Decoder;
 use platform_mac::{CFRetained, CVPixelBuffer, clock, system};
-use protocol::{ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, HostMsg, InputMsg, PROTOCOL_VERSION, VideoFrame};
+use protocol::{
+    Arrangement, ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, DisplayChoice, DisplayReason, DisplayState, HostMsg, InputMsg,
+    PROTOCOL_VERSION, VideoFrame,
+};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::sync::mpsc;
 use transport::endpoint::peer_fingerprint;
@@ -28,6 +31,13 @@ const PING_INTERVAL: Duration = Duration::from_millis(500);
 /// A frame missing packets for this long is considered lost even if no newer frame arrives.
 const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_millis(60);
 const KEYFRAME_RETRY: Duration = Duration::from_millis(200);
+/// While frames can't be decoded (a size this Mac's decoder doesn't take), ask for a keyframe only
+/// this often rather than flooding the host with requests that can't help.
+const UNDECODABLE_RETRY: Duration = Duration::from_secs(2);
+/// A display change is announced once its first frame is on screen, or after this long anyway.
+const DISPLAY_SHOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// The host says what it shows right after Welcome.
+const FIRST_DISPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +52,51 @@ pub struct SessionInfo {
     pub height: u32,
     pub fps: u32,
     pub codec: Codec,
+    /// The host display shown.
+    pub display: DisplayView,
+    /// Whether this session may ask for a virtual display (`DisplayReason`, 0 if it may), and why
+    /// not in words.
+    pub display_available: u16,
+    pub display_unavailable: String,
+}
+
+/// The host display a session shows, as the UI sees it.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayView {
+    /// "main" (the host's own screen) or "virtual" (a display it made for this Mac).
+    pub kind: &'static str,
+    /// Pixels; for a virtual display, its size (also the stream's).
+    pub width: u32,
+    pub height: u32,
+    pub hidpi: bool,
+    pub refresh_hz: u32,
+    /// "extend", "main" or "only" (virtual displays).
+    pub arrangement: &'static str,
+}
+
+impl DisplayView {
+    fn new(display: &DisplayChoice, stream: (u32, u32), fps: u32) -> Self {
+        match display {
+            DisplayChoice::Main => Self { kind: "main", width: stream.0, height: stream.1, hidpi: false, refresh_hz: fps, arrangement: "extend" },
+            DisplayChoice::Virtual(spec) => Self {
+                kind: "virtual",
+                width: spec.width,
+                height: spec.height,
+                hidpi: spec.hidpi,
+                refresh_hz: spec.refresh_hz,
+                arrangement: arrangement_name(spec.arrangement),
+            },
+        }
+    }
+}
+
+fn arrangement_name(arrangement: Arrangement) -> &'static str {
+    match arrangement {
+        Arrangement::MAIN => "main",
+        Arrangement::ONLY => "only",
+        _ => "extend",
+    }
 }
 
 #[derive(Debug)]
@@ -55,6 +110,12 @@ pub enum SessionEvent {
     /// A cursor image to draw locally while controlling (PNG at 2x; sizes in points).
     CursorShape { id: u32, png: Vec<u8>, width: f32, height: f32, hot_x: f32, hot_y: f32 },
     Cursor(CursorState),
+    /// What the session shows now (answering `request`, or 0 when the host changed it), sent once
+    /// the new picture is on screen. `reason` (a `DisplayReason`) and `message` say why it isn't
+    /// what was asked for, or what happened.
+    Display { request: u32, info: SessionInfo, reason: u16, message: String },
+    /// The video of this size can't be shown (e.g. this Mac can't decode it).
+    StreamError { message: String, width: u32, height: u32 },
 }
 
 /// Input written per batch at most; anything more waits for the next write.
@@ -85,6 +146,19 @@ pub struct Shared {
     latest_request: Mutex<(u32, bool)>,
     /// Test hook: sees every decoded frame before it's drawn.
     frame_probe: Mutex<Option<FrameProbe>>,
+    /// Id of our latest display request (they count apart from control requests).
+    latest_display_request: Mutex<u32>,
+    /// What the session shows, as the host last said.
+    info: Mutex<Option<SessionInfo>>,
+    /// A display change waiting for its first frame (see [`DISPLAY_SHOWN_TIMEOUT`]).
+    pending_display: Mutex<Option<PendingDisplay>>,
+}
+
+/// A `Display` event to send once a frame of `size` is decoded.
+struct PendingDisplay {
+    event: (u32, SessionInfo, u16, String),
+    size: (u32, u32),
+    since: Instant,
 }
 
 /// Called with each decoded frame and its timing (see [`Session::set_frame_probe`]).
@@ -156,6 +230,16 @@ impl Session {
             self.shared.controlling.store(false, Ordering::Release);
         }
         let _ = self.ctl_tx.send(ClientMsg::SetControl { on, request, take_over });
+        request
+    }
+
+    /// Asks the host to show `display`. The answer arrives as a [`SessionEvent::Display`] for the
+    /// returned request id.
+    pub fn set_display(&self, display: DisplayChoice) -> u32 {
+        let mut latest = self.shared.latest_display_request.lock().unwrap();
+        let request = latest.wrapping_add(1).max(1);
+        *latest = request;
+        let _ = self.ctl_tx.send(ClientMsg::SetDisplay { request, display });
         request
     }
 
@@ -282,6 +366,10 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
                     height,
                     fps,
                     codec,
+                    // The host says what it is right after (a reconnect may find its virtual display).
+                    display: DisplayView::new(&DisplayChoice::Main, (width, height), fps),
+                    display_available: DisplayReason::NONE.0,
+                    display_unavailable: String::new(),
                 };
             }
             HostMsg::PairingRequired => {
@@ -303,9 +391,28 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
             other => bail!("unexpected reply {other:?}"),
         }
     };
+    // Right after Welcome the host says what it shows (a device that comes back may find its
+    // virtual display) and whether it may ask for one: part of what "connected" means. Giving up
+    // waiting ends the session: a message cut off half-way would leave the stream unreadable.
+    let mut info = info;
+    let first = tokio::time::timeout(FIRST_DISPLAY_TIMEOUT, read_msg::<HostMsg>(&mut recv))
+        .await
+        .map_err(|_| anyhow!("{} didn't say what it shows", info.host_name))??
+        .context("host closed the connection")?;
+    let early = match first {
+        HostMsg::Display(state) => {
+            apply_display(&mut info, &state);
+            None
+        }
+        other => Some(other),
+    };
     let RunCtx { shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, .. } = ctx;
     tracing::info!(?info, "connected");
+    *shared.info.lock().unwrap() = Some(info.clone());
     events(SessionEvent::Connected(info));
+    if let Some(msg) = early {
+        handle_host_msg(msg, &shared, &events);
+    }
 
     // Control stream: one writer task fed by a channel (pings, keyframe requests and the app's
     // control requests), one reader task for everything the host sends.
@@ -345,7 +452,7 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
         }
     });
 
-    let result = receive_video(&conn, &shared, &ctl_tx).await;
+    let result = receive_video(&conn, &shared, &ctl_tx, &events).await;
     pinger.abort();
     reader.abort();
     writer.abort();
@@ -380,7 +487,63 @@ fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents) {
         }
         HostMsg::Cursor(state) => events(SessionEvent::Cursor(state)),
         HostMsg::InputAck { seq, received_us, injected_us } => shared.stats.lock().unwrap().on_input_ack(seq, received_us, injected_us),
+        HostMsg::Display(state) => on_display(state, shared, events),
         other => tracing::debug!("ignoring {other:?}"),
+    }
+}
+
+/// The host says what the session shows now. That is always the truth about the stream, even when
+/// it answers an older request (only the UI cares which request it answers), so it always applies.
+fn on_display(state: DisplayState, shared: &Shared, events: &SessionEvents) {
+    let (width, height) = (state.width, state.height);
+    let mut before = (width, height);
+    let Some(info) = ({
+        let mut current = shared.info.lock().unwrap();
+        current.as_mut().map(|info| {
+            before = (info.width, info.height);
+            apply_display(info, &state);
+            info.clone()
+        })
+    }) else {
+        return;
+    };
+    let DisplayState { request, display: shown, fps, reason, message, .. } = state;
+    tracing::info!(request, width, height, fps, ?shown, ?reason, "display");
+    let event = (request, info, reason.0, message);
+    let mut pending = shared.pending_display.lock().unwrap();
+    // A change still waiting for its picture is overtaken: say it now, in order.
+    if let Some(older) = pending.take() {
+        emit_display(older.event, events);
+    }
+    if before != (width, height) {
+        // Announce it with its first frame, so the window's idea of the picture (where clicks go)
+        // changes when the picture does.
+        *pending = Some(PendingDisplay { event, size: (width, height), since: Instant::now() });
+    } else {
+        emit_display(event, events);
+    }
+}
+
+/// Updates `info` with what the host says it shows.
+fn apply_display(info: &mut SessionInfo, state: &DisplayState) {
+    info.width = state.width;
+    info.height = state.height;
+    info.fps = state.fps;
+    info.display = DisplayView::new(&state.display, (state.width, state.height), state.fps);
+    info.display_available = state.available.0;
+    info.display_unavailable = state.unavailable.clone();
+}
+
+fn emit_display((request, info, reason, message): (u32, SessionInfo, u16, String), events: &SessionEvents) {
+    events(SessionEvent::Display { request, info, reason, message });
+}
+
+/// Sends a waiting display change once a frame of its size is shown, or once it waited too long.
+fn flush_display(shared: &Shared, events: &SessionEvents, shown: Option<(u32, u32)>) {
+    let mut pending = shared.pending_display.lock().unwrap();
+    let due = pending.as_ref().is_some_and(|p| shown == Some(p.size) || p.since.elapsed() >= DISPLAY_SHOWN_TIMEOUT);
+    if due && let Some(p) = pending.take() {
+        emit_display(p.event, events);
     }
 }
 
@@ -448,15 +611,20 @@ async fn receive_video(
     conn: &Connection,
     shared: &Arc<Shared>,
     ctl: &mpsc::UnboundedSender<ClientMsg>,
+    events: &SessionEvents,
 ) -> Result<()> {
     let mut reassembler = Reassembler::new();
     let mut decoder: Option<Decoder> = None;
     let mut need_keyframe = true;
     let mut last_request: Option<Instant> = None;
     let mut check = tokio::time::interval(Duration::from_millis(20));
+    // Parameter sets this Mac's decoder refused: their frames can't be shown, however often the
+    // host sends a keyframe.
+    let mut undecodable: Option<Vec<Vec<u8>>> = None;
 
-    let request_keyframe = |reassembler: &mut Reassembler, last_request: &mut Option<Instant>| {
-        if last_request.is_some_and(|t| t.elapsed() < KEYFRAME_RETRY) {
+    let request_keyframe = |reassembler: &mut Reassembler, last_request: &mut Option<Instant>, undecodable: bool| {
+        let retry = if undecodable { UNDECODABLE_RETRY } else { KEYFRAME_RETRY };
+        if last_request.is_some_and(|t| t.elapsed() < retry) {
             return;
         }
         *last_request = Some(Instant::now());
@@ -490,13 +658,35 @@ async fn receive_video(
 
                 if video.keyframe {
                     if !decoder.as_ref().is_some_and(|d| d.matches(video.codec, &video.param_sets)) {
-                        decoder = Some(new_decoder(&video, shared)?);
+                        decoder = None;
+                        if undecodable.as_ref() == Some(&video.param_sets) {
+                            continue;
+                        }
+                        match new_decoder(&video, shared) {
+                            Ok(d) => {
+                                decoder = Some(d);
+                                undecodable = None;
+                            }
+                            Err(e) => {
+                                // Keep the session: the host can still switch to something this
+                                // Mac decodes (its own screen, a smaller display).
+                                tracing::warn!(width = video.width, height = video.height, "decoder: {e:#}");
+                                events(SessionEvent::StreamError {
+                                    message: format!("This Mac can't decode the {}×{} picture ({e:#}).", video.width, video.height),
+                                    width: video.width,
+                                    height: video.height,
+                                });
+                                undecodable = Some(video.param_sets.clone());
+                                need_keyframe = true;
+                                continue;
+                            }
+                        }
                     }
                     need_keyframe = false;
                     last_request = None;
                 }
                 if need_keyframe {
-                    request_keyframe(&mut reassembler, &mut last_request);
+                    request_keyframe(&mut reassembler, &mut last_request, undecodable.is_some());
                     continue;
                 }
                 let Some(dec) = decoder.as_ref() else {
@@ -511,12 +701,15 @@ async fn receive_video(
                 if let Err(e) = dec.decode(&video.data, 0) {
                     tracing::warn!("decode: {e:#}");
                     need_keyframe = true;
+                } else {
+                    flush_display(shared, events, Some((video.width, video.height)));
                 }
             }
             _ = check.tick() => {
+                flush_display(shared, events, None);
                 if need_keyframe || reassembler.has_stale_partial(PARTIAL_FRAME_TIMEOUT) {
                     need_keyframe = true;
-                    request_keyframe(&mut reassembler, &mut last_request);
+                    request_keyframe(&mut reassembler, &mut last_request, undecodable.is_some());
                 }
             }
         }

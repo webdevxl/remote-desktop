@@ -57,13 +57,20 @@ private struct ViewerContent: View {
                     )
                 }
             case .connected(let info):
-                RemoteScreen(session: session, info: info, toggleControl: toggleControl)
-                    .background(Color.black)
-                    .overlay {
-                        ScreenOverlays(session: session, controls: controls, info: info,
-                                       retry: { core.setControl(true, for: session.id) },
-                                       takeOver: { core.setControl(true, for: session.id, takeOver: true) })
-                    }
+                if case .switching(_, let label, fromConnect: true) = session.display {
+                    // The display used last time is being set up: the host's own screen would only
+                    // flash by meanwhile.
+                    ConnectingView(target: info.hostName, detail: "Setting up a \(label) display…", cancel: close)
+                } else {
+                    RemoteScreen(session: session, info: info, fillsScreen: controls.fillsThisScreen(info.display),
+                                 toggleControl: toggleControl)
+                        .background(Color.black)
+                        .overlay {
+                            ScreenOverlays(session: session, controls: controls, info: info,
+                                           retry: { core.setControl(true, for: session.id) },
+                                           takeOver: { core.setControl(true, for: session.id, takeOver: true) })
+                        }
+                }
             case .ended(let error):
                 EndedView(target: session.target, error: error, wasConnected: session.wasConnected,
                           reconnect: { reconnect(session.target) }, close: close)
@@ -74,9 +81,14 @@ private struct ViewerContent: View {
         // The Control menu acts on the viewer window in front.
         .focusedSceneObject(session)
         .focusedSceneObject(controls)
+        // A real sheet: while it's open, typing goes to its fields, not to the remote Mac.
+        .sheet(item: $controls.customDisplay) { draft in
+            CustomDisplaySheet(draft: draft, hostName: session.hostName, apply: controls.applyCustomDisplay,
+                               cancel: { controls.customDisplay = nil })
+        }
         .toolbar {
-            if case .connected = session.phase {
-                ToolbarItem(placement: .principal) {
+            if case .connected(let info) = session.phase {
+                ToolbarItemGroup(placement: .principal) {
                     Picker("Mode", selection: Binding(get: { session.mode }, set: { setMode($0) })) {
                         Label("View", systemImage: "eye").tag(SessionModel.Mode.view)
                         Label("Control", systemImage: "cursorarrow.rays").tag(SessionModel.Mode.control)
@@ -84,6 +96,8 @@ private struct ViewerContent: View {
                     .pickerStyle(.segmented)
                     .labelStyle(.titleAndIcon)
                     .help("View only, or control this Mac with your mouse and keyboard. While controlling, ⌃⌥⌘ releases your keyboard and mouse and takes them back.")
+                    DisplayMenu(session: session, controls: controls, inToolbar: true)
+                        .help("Show “\(info.hostName)” at the size of this screen")
                 }
                 ToolbarItemGroup(placement: .primaryAction) {
                     Toggle(isOn: $showStats) {
@@ -155,6 +169,14 @@ struct ScreenOverlays: View {
         let toast = CGRect(x: (screen.width - toastSize.width) / 2, y: screen.height - 28 - toastSize.height,
                            width: toastSize.width, height: toastSize.height)
         Color.clear
+            .overlay {
+                // The picture is about to change: dimmed meanwhile (the pointer rests too).
+                if session.display.isSwitching {
+                    Color.black.opacity(0.35)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
             .overlay(alignment: .topLeading) {
                 if showStats {
                     // Never in the way of the remote Mac's menu bar.
@@ -168,6 +190,7 @@ struct ScreenOverlays: View {
             }
             .overlay(alignment: .top) {
                 VStack(spacing: Self.gap) {
+                    DisplayBanner(session: session, controls: controls, info: info)
                     ControlBanner(session: session, hostName: info.hostName, retry: retry, takeOver: takeOver)
                     GestureAccessHint(session: session, hostName: info.hostName, sampleTrusted: sampleTrusted)
                 }
@@ -193,6 +216,7 @@ struct ScreenOverlays: View {
             }
             .animation(.easeOut(duration: 0.2), value: session.toast)
             .animation(.easeOut(duration: 0.18), value: controls.placement)
+            .animation(.easeOut(duration: 0.2), value: session.display.isSwitching)
     }
 
     /// The banners, centred at the top, below the session control when it's there.
@@ -264,6 +288,73 @@ struct ControlBanner: View {
     }
 }
 
+/// Says what's happening to the display the session shows: switching (with a spinner), why the
+/// host didn't show what was asked for or took it away, a display offered instead of put back,
+/// and video this Mac can't show, each with the action that helps when there is one.
+struct DisplayBanner: View {
+    @ObservedObject var session: SessionModel
+    let controls: SessionControlModel
+    let info: SessionInfo
+
+    var body: some View {
+        Group {
+            status
+            if let error = session.streamError {
+                BannerPill(icon: "exclamationmark.triangle", text: error, tint: Self.warning, action: ownScreen,
+                           dismiss: { session.streamError = nil })
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: session.display)
+        .animation(.easeOut(duration: 0.15), value: session.streamError)
+    }
+
+    private var host: String { "“\(info.hostName)”" }
+
+    /// Video this Mac can't show: the host's own screen may do (one of its displays won't).
+    private var ownScreen: (String, () -> Void)? {
+        guard info.display.kind == .virtual else { return nil }
+        return ("Use \(host)’s Own Screen", controls.showMainDisplay)
+    }
+
+    private static let warning = Color(hex: 0xE5B45A)
+
+    @ViewBuilder private var status: some View {
+        switch session.display {
+        case .switching(_, let label, _):
+            BannerPill(icon: "display", text: "Switching \(host) to \(label)…", tint: .white, busy: true)
+        case .failed(let reason, let message, let retry):
+            BannerPill(icon: "exclamationmark.triangle", text: message, tint: Self.warning, action: action(for: reason, retry: retry),
+                       dismiss: { session.display = .idle })
+        case .offered(let display):
+            BannerPill(icon: "display", text: "Use \(display.sizeText) on \(host)?", tint: .white,
+                       action: ("Use", { controls.showDisplay(display) }), dismiss: { session.display = .idle })
+        case .idle:
+            EmptyView()
+        }
+    }
+
+    private func action(for reason: Int, retry: RemoteDisplay?) -> (String, () -> Void)? {
+        guard let retry else { return nil }
+        switch reason {
+        case DisplayReason.failed: return ("Try Again", { controls.showDisplay(retry) })
+        case DisplayReason.removedByHost, DisplayReason.gone:
+            guard retry.kind == .virtual else { return nil }
+            return ("Use \(retry.sizeText) Again", { controls.showDisplay(retry) })
+        case DisplayReason.inUse:
+            // Another Mac controls the host: the main display isn't this Mac's, but one next to the
+            // host's screen is.
+            guard retry.kind == .virtual, retry.arrangement != .extend else { return nil }
+            var extended = retry
+            extended.arrangement = .extend
+            return ("Put It Next to “\(info.hostName)”’s Screen", {
+                controls.nextArrangement = .extend
+                controls.showDisplay(extended)
+            })
+        default: return nil
+        }
+    }
+}
+
 /// While controlling, Mission Control and Spaces swipes still act on this Mac until LanKVM may
 /// take them (Accessibility, here on this Mac). Says so, with the way to fix it, until fixed or
 /// dismissed for this window. The other gestures need nothing.
@@ -298,12 +389,13 @@ struct GestureAccessHint: View {
             }
         }
         .animation(.easeOut(duration: 0.15), value: relevant && !trusted)
-        // macOS reports a grant while LanKVM runs: the hint goes as soon as it's given.
+        // macOS reports a grant while LanKVM runs, and a revocation: the hint goes as soon as it's
+        // given, and comes back if it's taken away (DockGestures lets go of the swipes then).
         .task(id: relevant) {
             guard relevant, sampleTrusted == nil else { return }
             while !Task.isCancelled {
-                trusted = AXIsProcessTrusted()
-                if trusted { return }
+                let now = AXIsProcessTrusted()
+                if now != trusted { trusted = now }
                 try? await Task.sleep(for: .seconds(1))
             }
         }
@@ -322,10 +414,20 @@ struct BannerPill: View {
     let tint: Color
     var action: (String, () -> Void)?
     var dismiss: (() -> Void)?
+    /// Something is under way: a small spinner instead of the icon.
+    var busy = false
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: icon).foregroundStyle(tint)
+            if busy {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.8)
+                    .frame(width: 14, height: 14)
+                    .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
+            } else {
+                Image(systemName: icon).foregroundStyle(tint)
+            }
             Text(text)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.white)
@@ -356,6 +458,8 @@ struct BannerPill: View {
 
 struct ConnectingView: View {
     let target: String
+    /// A second line: what's being set up once connected.
+    var detail: String?
     let cancel: () -> Void
 
     var body: some View {
@@ -363,9 +467,16 @@ struct ConnectingView: View {
             Color.lkBackground
             VStack(spacing: 14) {
                 ProgressView().controlSize(.large)
-                Text("Connecting to \(target)…")
-                    .font(.system(size: 15, design: .serif))
-                    .foregroundStyle(Color.lkText)
+                VStack(spacing: 4) {
+                    Text("Connecting to \(target)…")
+                        .font(.system(size: 15, design: .serif))
+                        .foregroundStyle(Color.lkText)
+                    if let detail {
+                        Text(detail)
+                            .font(.system(size: 13))
+                            .foregroundStyle(Color.lkSecondary)
+                    }
+                }
                 Button("Cancel", action: cancel)
                     .buttonStyle(SecondaryButtonStyle())
                     .keyboardShortcut(.cancelAction)
@@ -504,6 +615,8 @@ struct StatsHUD: View {
 private struct RemoteScreen: NSViewRepresentable {
     @ObservedObject var session: SessionModel
     let info: SessionInfo
+    /// It shows a display that fills this window's screen.
+    let fillsScreen: Bool
     let toggleControl: () -> Void
 
     func makeNSView(context: Context) -> MetalHostView {
@@ -511,7 +624,8 @@ private struct RemoteScreen: NSViewRepresentable {
     }
 
     func updateNSView(_ view: MetalHostView, context: Context) {
-        view.configure(session: session, frameSize: CGSize(width: Int(info.width), height: Int(info.height)), toggleControl: toggleControl)
+        view.configure(session: session, frameSize: CGSize(width: Int(info.width), height: Int(info.height)),
+                       fillsScreen: fillsScreen, toggleControl: toggleControl)
     }
 
     static func dismantleNSView(_ view: MetalHostView, coordinator: ()) {
@@ -544,8 +658,8 @@ final class MetalHostView: NSView {
 
     override func makeBackingLayer() -> CALayer { metalLayer }
 
-    /// Called whenever SwiftUI updates the view (mode or control state changed).
-    func configure(session: SessionModel, frameSize: CGSize, toggleControl: @escaping () -> Void) {
+    /// Called whenever SwiftUI updates the view (mode, control or display state changed).
+    func configure(session: SessionModel, frameSize: CGSize, fillsScreen: Bool, toggleControl: @escaping () -> Void) {
         if self.session !== session {
             self.session = session
             input.attach(to: session)
@@ -558,10 +672,12 @@ final class MetalHostView: NSView {
             }
         }
         session.sessionControl.attach(forwarder: input, window: window)
+        // The new picture's size first: the pointer goes back to work over it.
         input.frameSize = frameSize
+        input.pointerSuspended = session.display.isSwitching
         input.onEscape = toggleControl
         input.update()
-        presentation?.update(immersive: input.isForwarding)
+        presentation?.update(immersive: input.isForwarding, fillsScreen: fillsScreen)
         window?.invalidateCursorRects(for: self)
         showRemoteCursor()
     }
@@ -695,7 +811,8 @@ final class MetalHostView: NSView {
 
     func detach() {
         input.detach()
-        presentation?.update(immersive: false)
+        // The toolbar comes back with whatever the window shows next.
+        presentation?.update(immersive: false, fillsScreen: false)
         presentation = nil
         guard attached else { return }
         attached = false
@@ -725,12 +842,15 @@ final class MetalHostView: NSView {
 }
 
 /// In full screen while controlling, hides this Mac's menu bar and Dock (and the window's
-/// toolbar) so the pointer reaching the top or bottom edge uses the remote Mac's instead.
+/// toolbar) so the pointer reaching the top or bottom edge uses the remote Mac's instead. The
+/// toolbar also stays hidden in full screen while the session shows a display that fills this
+/// screen, so it's shown pixel for pixel.
 @MainActor
 final class ImmersivePresentation {
     private weak var window: NSWindow?
     private var saved: NSApplication.PresentationOptions?
     private var wanted = false
+    private var fillsScreen = false
     private var observers: [NSObjectProtocol] = []
 
     init(window: NSWindow) {
@@ -746,8 +866,9 @@ final class ImmersivePresentation {
         observers.forEach(NotificationCenter.default.removeObserver)
     }
 
-    func update(immersive: Bool) {
+    func update(immersive: Bool, fillsScreen: Bool? = nil) {
         wanted = immersive
+        if let fillsScreen { self.fillsScreen = fillsScreen }
         apply()
     }
 
@@ -755,7 +876,7 @@ final class ImmersivePresentation {
         guard let window else { return }
         let fullScreen = window.styleMask.contains(.fullScreen) && window.isKeyWindow
         let on = wanted && fullScreen
-        window.toolbar?.isVisible = !on
+        window.toolbar?.isVisible = !(fullScreen && (wanted || fillsScreen))
         if on {
             if saved == nil { saved = NSApp.presentationOptions }
             // hideMenuBar needs hideDock; autoHideToolbar is not allowed with hideMenuBar.

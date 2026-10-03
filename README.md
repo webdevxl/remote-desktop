@@ -143,6 +143,43 @@ control back. One Mac controls at a time: another device has to choose to take o
 can't control each other at once: when the Mac you're controlling takes control of yours, your
 window on it switches to View (otherwise every key would bounce between the two).
 
+### Working on a big screen: virtual displays
+
+The Mac with the big monitor can be the other Mac's display. The other Mac makes a display that
+exists only in software, exactly the size of your screen, and LanKVM shows it pixel for pixel: a
+MacBook Pro whose own screen is 3456 × 2234 gets a 6144 × 2560 Retina display, say, which looks
+like 3072 × 1280.
+
+1. Connect, then choose **Display → This Screen's Size** in the viewer's toolbar (also in the
+   session control's **⋯** menu and the **Control** menu). Other screens of your Mac are listed
+   too. **Custom Size…** takes any size from 640 × 480 to 8K (8192 × 4320, at most 4:1);
+   **Retina** draws it at 2x, so it looks like half that.
+2. Go full screen (⌃⌘F) on that monitor: one pixel of the other Mac is one pixel of yours.
+3. Choose how the display sits on the other Mac:
+   - **Only It** (the default): its own screens show a copy, and every window is on the new
+     display.
+   - **As Main Display**: the menu bar, Dock and new windows go to it; its own screen stays
+     separate.
+   - **Next to *Mac*'s Screen**: an extra display; windows stay where they are.
+
+The window remembers the choice per Mac and sets it up again when you reconnect. **Its Own
+Screen** goes back.
+
+- The display goes away when you disconnect, and the other Mac's windows come back to its own
+  screen. If the connection drops, it stays for a minute, so reconnecting finds every window
+  where it was.
+- On the other Mac, **This Mac** lists the displays other Macs added, with **Remove**; the
+  menu-bar icon has **Use This Mac's Own Screen**, and **⌃⌥⌘.** removes them too. A paired Mac
+  can add one only while **Let paired Macs control this Mac** is on (turning it off removes them),
+  and only **Next to *Mac*'s Screen** while another Mac controls it. Switching to another user
+  removes them too, and none can be added until you're back.
+- Keep a MacBook's lid open: a Mac whose only other display is virtual sleeps when the lid closes.
+  Turn its brightness down instead.
+- 6144 × 2560 encodes in about 16 ms on an M3 Max, so it streams at up to 60 fps, at about
+  113 Mbit/s: use Ethernet. A Mac makes at most two virtual displays at once.
+- Both Macs need this version of LanKVM. Virtual displays use a private macOS interface (as
+  BetterDisplay and DeskPad do); LanKVM checks it's there, exactly as expected, before using it.
+
 Set `LANKVM_PORT` to change the UDP port (default 47800).
 
 ## Testing a connection on one Mac
@@ -171,7 +208,9 @@ cargo run --release -p lankvm-core --example probe -- 127.0.0.1:47800 --seconds 
 ```
 
 The first run asks for the PIN shown on the host. Later runs reconnect without one (the probe
-keeps its identity in `~/Library/Application Support/lankvm-probe`). `--max 1920x1200` limits
+keeps its identity in `~/Library/Application Support/lankvm-probe`). `--virtual 6144x2560@2x`
+asks the host for a virtual display and passes only if the decoded frames have that size; it is
+arranged next to the host's screen unless `--arrange main` or `--arrange only` says otherwise. `--max 1920x1200` limits
 the stream size, like a viewer with a smaller screen. Frames are only sent when the host's
 screen changes, so keep something moving there when you measure fps.
 
@@ -216,6 +255,10 @@ real QUIC on loopback while the host records what it would inject (`crates/core/
   pairs at a time, and after 5 tries without success pairing pauses for 30 s, doubling each
   time up to an hour, so the 6-digit PIN can't be guessed by brute force.
 - Trusted devices are stored in `trusted-viewers.txt` and `trusted-hosts.txt` in the same folder.
+- Adding a virtual display (and making it the main display, or mirroring the host's screens to it)
+  needs **Let paired Macs control this Mac**, but not Accessibility: it moves the host user's
+  windows, so it counts as control. The host user can always remove it (This Mac, the menu-bar
+  icon, **⌃⌥⌘.**); quitting or crashing removes it too, and macOS puts the screens back.
 - Only paired devices can view, and controlling needs more: the host's **Let paired Macs control
   this Mac** setting (stored in the data folder) and macOS Accessibility permission for LanKVM on
   the host. One device controls at a time. Input is ignored unless granted,
@@ -242,6 +285,12 @@ real QUIC on loopback while the host records what it would inject (`crates/core/
   rotate and page swipes work without it.
 - **Reset a permission:** `tccutil reset ScreenCapture dev.lankvm.LanKVM` (or `Accessibility`)
 - **Wi-Fi** adds jitter. For the lowest latency, put the viewed Macs on Ethernet.
+- **A virtual display looks soft:** go full screen (⌃⌘F) on the screen whose size it matches; in a
+  window the picture is scaled.
+- **Windows are on a display you can't see** (on the Mac that made a virtual display): click
+  **Use This Mac's Own Screen** in LanKVM's menu-bar icon, press **⌃⌥⌘.**, or quit LanKVM.
+- `cargo test -p platform-mac --test virtual_display -- --ignored` creates a virtual display for a
+  second (next to your screen) to check this macOS still supports them.
 
 ## Layout
 
@@ -249,8 +298,8 @@ real QUIC on loopback while the host records what it would inject (`crates/core/
 |---|---|
 | `crates/protocol` | Wire messages, video packet header |
 | `crates/transport` | QUIC endpoint, LAN congestion control, identity, pairing, packetizer/reassembler |
-| `crates/platform-mac` | ScreenCaptureKit capture, VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`) |
-| `crates/core` | Host service, viewer sessions, remote control (`control.rs`), render thread, C ABI (`ffi.rs`) for the app |
+| `crates/platform-mac` | ScreenCaptureKit capture, VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), virtual displays (`virtual_display.rs`) |
+| `crates/core` | Host service, viewer sessions, remote control (`control.rs`), virtual displays for viewers (`displays.rs`), render thread, C ABI (`ffi.rs`) for the app |
 | `macos/` | SwiftUI app (SwiftPM). `Sources/CLanKVM/include/lankvm.h` is the C interface |
 | `scripts/bundle.sh` | Builds and signs `LanKVM.app` |
 | `scripts/make-icon.swift` | Regenerates `macos/Resources/AppIcon.icns` |

@@ -39,6 +39,15 @@
 //!   {"system":"mission_control"}   also app_expose, show_desktop, launchpad, previous_space,
 //!       next_space
 //!
+//! A virtual display (the host makes a display this size and streams it instead of its own):
+//!
+//!   probe HOST --virtual 6144x2560@2x [--virtual 3840x2160 ...] [--then-main] [--arrange extend|main|only] [--refresh 60]
+//!
+//! WxH is in pixels; @2x makes it Retina (it looks like half that). Each size is asked for in turn
+//! (the host resizes its display in place) and watched for --seconds; --then-main goes back to the
+//! host's own screen at the end. The arrangement defaults to extend, which leaves the host's own
+//! screen alone. Passes if the decoded frames have the size of each step.
+//!
 //! `--input-latency N` clicks the middle of `--rect` (for example LanKVM Input Lab's patch,
 //! which flips between black and white on every click) N times and times each click until the
 //! decoded video shows the change: input → host → app redraw → capture → encode → network →
@@ -51,7 +60,9 @@ use std::time::{Duration, Instant};
 
 use lankvm_core::{Core, Event};
 use platform_mac::clock;
-use protocol::{DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction};
+use protocol::{
+    Arrangement, DisplayChoice, DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction, VirtualDisplaySpec,
+};
 use serde_json::Value;
 
 /// Long enough for someone to read the PIN off the host (which allows 120 s).
@@ -70,6 +81,20 @@ struct Args {
     fps: u32,
     /// LanKVM Input Lab's log: script positions may name its parts ("text", "patch", "scroll").
     lab: Option<String>,
+    /// Virtual displays to ask the host for, one after the other.
+    virtual_displays: Vec<VirtualDisplaySpec>,
+    /// Then go back to the host's own screen.
+    then_main: bool,
+}
+
+/// "6144x2560" or "6144x2560@2x".
+fn virtual_size(s: &str) -> Option<(u32, u32, bool)> {
+    let (size, hidpi) = match s.strip_suffix("@2x") {
+        Some(size) => (size, true),
+        None => (s, false),
+    };
+    let (w, h) = pair_of(size, 'x')?;
+    Some((w, h, hidpi))
 }
 
 fn pair_of<T: std::str::FromStr>(s: &str, sep: char) -> Option<(T, T)> {
@@ -90,8 +115,12 @@ fn parse_args() -> Result<Args, String> {
         display: None,
         lab: None,
         fps: 120,
+        virtual_displays: Vec::new(),
+        then_main: false,
     };
     let mut target = None;
+    let mut arrangement = Arrangement::EXTEND;
+    let mut refresh_hz = 60;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--seconds" => a.seconds = args.next().and_then(|s| s.parse().ok()).ok_or("--seconds needs a number")?,
@@ -109,16 +138,36 @@ fn parse_args() -> Result<Args, String> {
             "--display" => a.display = Some(args.next().and_then(|s| pair_of(&s, 'x')).ok_or("--display needs WIDTHxHEIGHT")?),
             "--lab" => a.lab = Some(args.next().ok_or("--lab needs Input Lab's log file")?),
             "--fps" => a.fps = args.next().and_then(|s| s.parse().ok()).ok_or("--fps needs a number")?,
+            "--virtual" => {
+                let (width, height, hidpi) = args.next().as_deref().and_then(virtual_size).ok_or("--virtual needs WIDTHxHEIGHT or WIDTHxHEIGHT@2x")?;
+                a.virtual_displays.push(VirtualDisplaySpec { width, height, hidpi, refresh_hz: 0, arrangement: Arrangement::EXTEND });
+            }
+            "--arrange" => {
+                arrangement = match args.next().as_deref() {
+                    Some("extend") => Arrangement::EXTEND,
+                    Some("main") => Arrangement::MAIN,
+                    Some("only") => Arrangement::ONLY,
+                    _ => return Err("--arrange needs extend, main or only".into()),
+                }
+            }
+            "--then-main" => a.then_main = true,
+            "--refresh" => refresh_hz = args.next().and_then(|s| s.parse().ok()).ok_or("--refresh needs a number")?,
             _ if target.is_none() && !arg.starts_with('-') => target = Some(arg),
             _ => return Err(format!("unexpected argument {arg}")),
         }
     }
-    a.target = target.ok_or("usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]]")?;
+    a.target = target.ok_or(
+        "usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--virtual WxH[@2x] [--arrange extend|main|only] [--refresh HZ]] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]]",
+    )?;
     if (a.script.is_some() || a.latency.is_some()) && !a.control {
         return Err("--script and --input-latency need --control".into());
     }
     if a.latency.is_some() && a.rect.is_none() && a.lab.is_none() {
         return Err("--input-latency needs --rect (or --lab, to use its patch)".into());
+    }
+    for spec in &mut a.virtual_displays {
+        spec.arrangement = arrangement;
+        spec.refresh_hz = refresh_hz;
     }
     Ok(a)
 }
@@ -157,6 +206,35 @@ fn main() -> ExitCode {
     std::process::exit(code)
 }
 
+/// What the host shows the probe.
+struct Shown {
+    kind: &'static str,
+    stream: (u32, u32, u32),
+    hidpi: bool,
+    arrangement: &'static str,
+    reason: u16,
+    message: String,
+    unavailable: String,
+}
+
+impl std::fmt::Display for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (w, h, fps) = self.stream;
+        write!(f, "display: {} ({w}x{h} @ {fps} fps", self.kind)?;
+        if self.kind == "virtual" {
+            write!(f, ", {}{}", self.arrangement, if self.hidpi { ", Retina" } else { "" })?;
+        }
+        write!(f, ")")?;
+        if self.reason != 0 || !self.message.is_empty() {
+            write!(f, " — reason {}: {}", self.reason, self.message)?;
+        }
+        if !self.unavailable.is_empty() {
+            write!(f, " [virtual displays: {}]", self.unavailable)?;
+        }
+        Ok(())
+    }
+}
+
 struct Probe {
     core: Arc<Core>,
     id: u64,
@@ -190,6 +268,20 @@ impl Probe {
     fn run(&mut self, args: &Args) -> i32 {
         if let Err(code) = self.connect() {
             return code;
+        }
+        if !args.virtual_displays.is_empty() {
+            let size = Arc::new(Mutex::new(None));
+            let sink = size.clone();
+            self.core.set_frame_probe(self.id, Some(Box::new(move |pb, _| *sink.lock().unwrap() = Some(platform_mac::gpu::frame_size(pb)))));
+            let steps = args.virtual_displays.iter().map(|spec| DisplayChoice::Virtual(*spec));
+            for choice in steps.chain(args.then_main.then_some(DisplayChoice::Main)) {
+                if let Err(code) = self.show(choice, args, &size) {
+                    return code;
+                }
+            }
+            if !args.control {
+                return 0;
+            }
         }
         if args.control {
             match self.request_control(true) {
@@ -233,6 +325,65 @@ impl Probe {
         self.watch_video(args)
     }
 
+    /// Asks the host to show `choice`, watches it, and checks the decoded frames have its size.
+    fn show(&mut self, choice: DisplayChoice, args: &Args, size: &Mutex<Option<(u32, u32)>>) -> Result<(), i32> {
+        // The newest frame decoded counts, from before the answer: the host announces the switch
+        // once the first new frame is decoded, and an idle display may send no more.
+        let started = Instant::now();
+        let request = self.core.set_display(self.id, choice);
+        let want = match self.display(request, Duration::from_secs(30)) {
+            Some(shown) if shown.reason == 0 => {
+                println!("{shown} after {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+                (shown.stream.0, shown.stream.1)
+            }
+            Some(shown) => {
+                println!("FAIL: {shown}");
+                return Err(1);
+            }
+            None => {
+                println!("FAIL: no answer about the display");
+                return Err(1);
+            }
+        };
+        let code = self.watch_video(args);
+        let got = *size.lock().unwrap();
+        if got != Some(want) {
+            println!("FAIL: decoded frames are {got:?}, not {want:?}");
+            return Err(1);
+        }
+        println!("PASS: decoded frames are {}x{}", want.0, want.1);
+        if code == 0 { Ok(()) } else { Err(code) }
+    }
+
+    /// Waits for the `display` event answering `request`.
+    fn display(&mut self, request: u32, timeout: Duration) -> Option<Shown> {
+        let answer = |e: &Event| matches!(e, Event::Display { request: r, .. } if *r == request);
+        let shown = |e: Event| match e {
+            Event::Display { info, reason, message, .. } => Shown {
+                kind: info.display.kind,
+                stream: (info.width, info.height, info.fps),
+                hidpi: info.display.hidpi,
+                arrangement: info.display.arrangement,
+                reason,
+                message,
+                unavailable: info.display_unavailable,
+            },
+            _ => unreachable!(),
+        };
+        if let Some(i) = self.pending.iter().position(answer) {
+            return Some(shown(self.pending.remove(i)));
+        }
+        let deadline = Instant::now() + timeout;
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match self.events.recv_timeout(left) {
+                Ok(e) if answer(&e) => return Some(shown(e)),
+                Ok(e) => self.pending.push(e),
+                Err(_) => break,
+            }
+        }
+        None
+    }
+
     fn connect(&mut self) -> Result<(), i32> {
         let started = Instant::now();
         loop {
@@ -261,6 +412,16 @@ impl Probe {
                         info.fps,
                         info.codec
                     );
+                    let shown = Shown {
+                        kind: info.display.kind,
+                        stream: (info.width, info.height, info.fps),
+                        hidpi: info.display.hidpi,
+                        arrangement: info.display.arrangement,
+                        reason: 0,
+                        message: String::new(),
+                        unavailable: info.display_unavailable,
+                    };
+                    println!("{shown}");
                     return Ok(());
                 }
                 Ok(Event::Ended { error, .. }) => {

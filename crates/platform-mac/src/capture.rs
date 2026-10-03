@@ -16,7 +16,7 @@ use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{CVPixelBuffer, kCVImageBufferYCbCrMatrix_ITU_R_709_2};
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate,
     SCStreamFrameInfoDisplayTime, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
 };
 
@@ -24,6 +24,9 @@ use crate::clock;
 
 const PIXEL_FORMAT_NV12_FULL: u32 = u32::from_be_bytes(*b"420f");
 const SC_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a display that just appeared (a new virtual display) may take to be listed by
+/// ScreenCaptureKit.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy)]
 pub struct DisplayInfo {
@@ -73,6 +76,31 @@ pub fn main_display_bounds() -> DisplayInfo {
     let id = CGMainDisplayID();
     let (width, height) = native_pixel_size(id).unwrap_or((1920, 1080));
     DisplayInfo { id, width, height }
+}
+
+/// The display `id` with its native pixel size, once ScreenCaptureKit lists it: a display that
+/// just appeared can take a moment.
+pub fn display(id: u32) -> Result<DisplayInfo> {
+    let (_content, display) = find_display(id)?;
+    let (width, height) = native_pixel_size(id).unwrap_or_else(|| unsafe { (display.width() as u32, display.height() as u32) });
+    Ok(DisplayInfo { id, width, height })
+}
+
+/// Looks `id` up among the displays ScreenCaptureKit can capture, asking again for a while if it
+/// isn't there yet.
+fn find_display(id: u32) -> Result<(SendRetained<SCShareableContent>, Retained<SCDisplay>)> {
+    let deadline = std::time::Instant::now() + LISTING_TIMEOUT;
+    loop {
+        let content = shareable_content()?;
+        let displays = unsafe { content.0.displays() };
+        if let Some(display) = displays.iter().find(|d| unsafe { d.displayID() } == id) {
+            return Ok((content, display));
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("display {id} not found");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn native_pixel_size(display_id: u32) -> Option<(u32, u32)> {
@@ -153,6 +181,36 @@ impl StreamOutput {
     }
 }
 
+type StoppedFn = dyn Fn(String) + Send + Sync;
+
+struct DelegateIvars {
+    on_stopped: Box<StoppedFn>,
+}
+
+define_class!(
+    // SAFETY: NSObject has no subclassing requirements; we don't implement Drop.
+    #[unsafe(super(NSObject))]
+    #[name = "LanKvmStreamDelegate"]
+    #[ivars = DelegateIvars]
+    struct StreamDelegate;
+
+    unsafe impl NSObjectProtocol for StreamDelegate {}
+
+    unsafe impl SCStreamDelegate for StreamDelegate {
+        #[unsafe(method(stream:didStopWithError:))]
+        fn did_stop(&self, _stream: &SCStream, error: &NSError) {
+            (self.ivars().on_stopped)(error.localizedDescription().to_string());
+        }
+    }
+);
+
+impl StreamDelegate {
+    fn new(on_stopped: Box<StoppedFn>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(DelegateIvars { on_stopped });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
 /// Extracts the pixel buffer and timing from a complete frame; idle frames (nothing changed on
 /// screen) carry no new pixels and are skipped.
 fn captured_frame(sample: &CMSampleBuffer) -> Option<CapturedFrame> {
@@ -179,6 +237,7 @@ pub struct Capturer {
     /// and a fresh one would silently fall back to 1080p video-range frames.
     config: Retained<SCStreamConfiguration>,
     _output: Retained<StreamOutput>,
+    _delegate: Retained<StreamDelegate>,
     _queue: DispatchRetained<DispatchQueue>,
 }
 
@@ -187,19 +246,17 @@ unsafe impl Send for Capturer {}
 unsafe impl Sync for Capturer {}
 
 impl Capturer {
+    /// `on_stopped` is told if ScreenCaptureKit stops the capture by itself (the display went away
+    /// or changed under it...), with the reason.
     pub fn start(
         cfg: &CaptureConfig,
         on_frame: impl Fn(CapturedFrame) + Send + Sync + 'static,
+        on_stopped: impl Fn(String) + Send + Sync + 'static,
     ) -> Result<Self> {
         if cfg.width == 0 || cfg.height == 0 || cfg.fps == 0 {
             bail!("invalid capture config {cfg:?}");
         }
-        let content = shareable_content()?;
-        let displays = unsafe { content.0.displays() };
-        let display = displays
-            .iter()
-            .find(|d| unsafe { d.displayID() } == cfg.display_id)
-            .context("display not found")?;
+        let (_content, display) = find_display(cfg.display_id)?;
 
         unsafe {
             let filter = SCContentFilter::initWithDisplay_excludingWindows(
@@ -225,11 +282,12 @@ impl Capturer {
             // outlives the config; SCStream copies it later.
             config.setColorMatrix(kCVImageBufferYCbCrMatrix_ITU_R_709_2);
 
+            let delegate = StreamDelegate::new(Box::new(on_stopped));
             let stream = SCStream::initWithFilter_configuration_delegate(
                 SCStream::alloc(),
                 &filter,
                 &config,
-                None,
+                Some(ProtocolObject::from_ref(&*delegate)),
             );
             let output = StreamOutput::new(Box::new(on_frame));
             let queue = DispatchQueue::new("lankvm.capture", None);
@@ -242,7 +300,7 @@ impl Capturer {
                 .map_err(|e| anyhow!("add stream output: {}", e.localizedDescription()))?;
             wait_completion(|block| stream.startCaptureWithCompletionHandler(Some(block)))
                 .context("start capture")?;
-            Ok(Self { stream, config, _output: output, _queue: queue })
+            Ok(Self { stream, config, _output: output, _delegate: delegate, _queue: queue })
         }
     }
 

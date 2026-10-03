@@ -20,6 +20,7 @@
 //! [`crate::gesture`].
 
 use std::collections::BTreeSet;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -289,6 +290,13 @@ impl InputState {
 
     pub fn modifiers(&self) -> u64 {
         self.mods
+    }
+
+    /// Starts over from `pos` (the pointer is now there, e.g. on another display): the next move
+    /// is measured from it.
+    pub fn rebase(&mut self, pos: Point) {
+        self.pos = pos;
+        self.delta_rem = (0.0, 0.0);
     }
 
     pub fn position(&self) -> Point {
@@ -629,8 +637,7 @@ pub struct Poster {
     tag: i64,
     /// Post to this process only (tests), instead of to the whole session.
     pid: Option<i32>,
-    /// The end of the last Dock swipe, due to go out once more.
-    resend: TerminalResend,
+    /// How long after the end of a Dock swipe it goes out once more (see [`TERMINAL_RESEND`]).
     resend_delay: Option<Duration>,
     dock_unavailable_warned: bool,
 }
@@ -641,6 +648,17 @@ pub struct Poster {
 #[derive(Debug, Default)]
 struct TerminalResend {
     pending: Option<(Instant, Synth, u8)>,
+}
+
+/// The end of the last Dock swipe posted in this process, due to go out once more. One for all
+/// posters, as there is one Dock: a swipe begun since through any of them (another session's,
+/// after a take-over) drops it, so a stale end never cuts into that swipe. A swipe the host's
+/// own user begins on the trackpad can't (posters don't see local input), so one begun within
+/// the delay may still get the old end.
+static TERMINAL_RESEND: Mutex<TerminalResend> = Mutex::new(TerminalResend { pending: None });
+
+fn terminal_resend() -> MutexGuard<'static, TerminalResend> {
+    TERMINAL_RESEND.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl TerminalResend {
@@ -657,6 +675,11 @@ impl TerminalResend {
     /// The end to post again, once it is due.
     fn take_due(&mut self, now: Instant) -> Option<(Synth, u8)> {
         self.pending.take_if(|(at, ..)| now >= *at).map(|(_, synth, depth)| (synth, depth))
+    }
+
+    /// When the pending end is due, if there is one.
+    fn due(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|(at, ..)| *at)
     }
 }
 
@@ -689,7 +712,6 @@ impl Poster {
             source,
             tag,
             pid: None,
-            resend: TerminalResend::default(),
             resend_delay: gesture::terminal_resend_delay(),
             dock_unavailable_warned: false,
         })
@@ -763,7 +785,7 @@ impl Poster {
             }
             Synth::DockSwipe { .. } => {
                 if self.post_dock_swipe(synth, depth) {
-                    self.resend.note(synth, depth, Instant::now(), self.resend_delay);
+                    terminal_resend().note(synth, depth, Instant::now(), self.resend_delay);
                 }
             }
             // Gestures go where mouse events go, so they can't overtake the move before them.
@@ -794,12 +816,27 @@ impl Poster {
         }
     }
 
-    /// Posts what has come due: the end of the last Dock swipe, once more. Call it regularly (the
-    /// input thread's 100 ms tick); nothing happens on its own, so recordings stay deterministic.
+    /// Posts what has come due: the end of the last Dock swipe, once more (whichever poster polls
+    /// first). Call it regularly (the input thread's 100 ms tick); nothing happens on its own, so
+    /// recordings stay deterministic.
     pub fn poll(&mut self, now: Instant) {
-        if let Some((synth, depth)) = self.resend.take_due(now) {
+        // One that posts no swipes (pid mode) would lose it.
+        if self.pid.is_some() {
+            return;
+        }
+        let due = terminal_resend().take_due(now);
+        if let Some((synth, depth)) = due {
             self.post_dock_swipe(&synth, depth);
         }
+    }
+
+    /// Like [`poll`](Self::poll), but waits until the pending end is due (at most the delay; not
+    /// at all if none is): for when nothing will poll any more, as the input thread or the app is
+    /// ending.
+    pub fn post_pending(&mut self) {
+        let Some(due) = terminal_resend().due() else { return };
+        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+        self.poll(Instant::now());
     }
 
     /// Posts a [`Synth::DockSwipe`] with this Mac's recipe for its axis, at the session tap where
@@ -1614,8 +1651,9 @@ mod tests {
         r.note(&swipe(Began), 0, t0, delay);
         r.note(&swipe(Ended), 2, at(10), delay);
         assert_eq!(r.take_due(at(100)), None);
+        assert_eq!(r.due(), Some(at(210)), "what an ending thread waits for");
         assert_eq!(r.take_due(at(210)), Some((swipe(Ended), 2)), "with its relay depth");
-        assert_eq!(r.take_due(at(500)), None, "once");
+        assert_eq!((r.take_due(at(500)), r.due()), (None, None), "once");
         r.note(&swipe(Cancelled), 0, at(600), delay);
         r.note(&swipe(Began), 0, at(700), delay);
         assert_eq!(r.take_due(at(900)), None, "a new swipe began");

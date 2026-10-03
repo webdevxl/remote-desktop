@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -31,9 +31,10 @@ const SILENCE_RELEASE: Duration = Duration::from_millis(protocol::INPUT_SILENCE_
 const SILENCE_CHECK: Duration = Duration::from_millis(100);
 /// How often remote activity keeps the host's display awake.
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(1);
-/// System actions (Mission Control, a Space left...) injected per second at most. Each one
-/// animates for a good part of a second, so faster ones would only queue up behind it or toggle
-/// it back; the rest of that second's are dropped.
+/// System actions (Mission Control, a Space left...) injected per second at most, whether the
+/// viewer asked for them or a discrete Dock swipe did. Each one animates for a good part of a
+/// second, so faster ones would only queue up behind it or toggle it back; the rest of that
+/// second's are dropped.
 const MAX_SYSTEM_ACTIONS_PER_SEC: u32 = 4;
 
 /// Host-wide settings, stored in the data directory (not in user defaults, which every copy of
@@ -138,6 +139,14 @@ impl Sink {
     fn poll(&mut self, now: Instant) {
         if let Sink::Hid(poster) = self {
             poster.poll(now);
+        }
+    }
+
+    /// Posts what the poster has pending once it comes due, waiting for it (at most 200 ms, and
+    /// only if something is pending): for when nothing will poll any more.
+    fn post_pending(&mut self) {
+        if let Sink::Hid(poster) = self {
+            poster.post_pending();
         }
     }
 }
@@ -290,16 +299,41 @@ pub struct InputShared {
     pub active: AtomicBool,
     /// Host clock (µs) of the viewer's last ping (kept for diagnostics).
     pub last_ping_us: AtomicU64,
+    /// The display the viewer sees, which pointer positions are on.
+    display_id: AtomicU32,
+    /// Counts display switches, so the input thread notices one even back to the same display.
+    display_epoch: AtomicU64,
 }
 
 impl Default for InputShared {
     fn default() -> Self {
-        Self { active: AtomicBool::new(false), last_ping_us: AtomicU64::new(clock::now_us()) }
+        Self {
+            active: AtomicBool::new(false),
+            last_ping_us: AtomicU64::new(clock::now_us()),
+            display_id: AtomicU32::new(0),
+            display_epoch: AtomicU64::new(0),
+        }
+    }
+}
+
+impl InputShared {
+    /// Pointer input goes to `display_id` from now on (the viewer switched displays).
+    pub fn set_display(&self, display_id: u32) {
+        self.display_id.store(display_id, Ordering::Release);
+        self.display_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn display(&self) -> (u32, u64) {
+        // The epoch first: a switch seen half-way is seen again next time.
+        let epoch = self.display_epoch.load(Ordering::Acquire);
+        (self.display_id.load(Ordering::Acquire), epoch)
     }
 }
 
 pub enum InputCmd {
-    /// Let go of everything held (control switched off). Signals the sender when done.
+    /// Let go of everything held (control switched off). Signals the sender when done, once the
+    /// end of a Dock swipe it cancelled has gone out once more too: the sender is about to quit
+    /// (see [`release_all_and_wait`]), and nothing would post it after that.
     ReleaseAll(Option<std::sync::mpsc::Sender<()>>),
 }
 
@@ -336,9 +370,8 @@ impl Drop for Finished {
     }
 }
 
-/// How an input thread is set up.
+/// How an input thread is set up. Pointer positions go to the display in [`InputShared`].
 pub struct InputConfig {
-    pub display_id: u32,
     pub backend: Backend,
     pub tag: i64,
     /// Tests: inject only into this process's windows (see `InjectGuard`).
@@ -364,7 +397,8 @@ impl InputThread {
         let (thread_stop, thread_finished) = (stop.clone(), Finished(finished.clone()));
         std::thread::Builder::new().name("lankvm-input".into()).spawn(move || {
             platform_mac::system::set_thread_interactive();
-            let InputConfig { display_id, backend, tag, guard_pid, on_failure } = config;
+            let InputConfig { backend, tag, guard_pid, on_failure } = config;
+            let (display_id, display_epoch) = shared.display();
             let sink = match backend.open(tag) {
                 Ok(s) => s,
                 Err(e) => {
@@ -394,6 +428,9 @@ impl InputThread {
                 guard: guard_pid.map(InjectGuard::new),
                 state,
                 display_id,
+                display_epoch,
+                recording,
+                bounds: None,
                 shared,
                 out,
                 synth: Vec::new(),
@@ -424,6 +461,10 @@ impl InputThread {
                 }
                 Err(Stop::Ended(e)) => tracing::info!("input stream ended: {e:#}"),
             }
+            // Nothing polls the poster once this thread is gone: the end of a swipe the release
+            // cancelled goes out once more first, when due. Nothing waits on this, and a swipe
+            // begun meanwhile (a new thread's) drops it.
+            worker.sink.post_pending();
         })?;
         Ok(Self { cmd, stop, finished })
     }
@@ -532,6 +573,12 @@ struct Worker {
     display_warned: bool,
     state: InputState,
     display_id: u32,
+    /// The [`InputShared`] display switch this thread last followed.
+    display_epoch: u64,
+    /// Recording (tests): the pointer is never really anywhere.
+    recording: bool,
+    /// The display's bounds at the last batch, to notice it moving.
+    bounds: Option<Bounds>,
     shared: Arc<InputShared>,
     out: mpsc::Sender<HostMsg>,
     synth: Vec<Synth>,
@@ -585,6 +632,8 @@ impl Worker {
                     Some(InputCmd::ReleaseAll(done)) => {
                         self.release_all();
                         if let Some(done) = done {
+                            // The app quits once told (see `InputCmd::ReleaseAll`).
+                            self.sink.post_pending();
                             let _ = done.send(());
                         }
                     }
@@ -606,7 +655,15 @@ impl Worker {
     }
 
     fn inject(&mut self, msgs: impl Iterator<Item = InputMsg>, received_us: u64) {
+        self.follow_display();
         let bounds = Bounds::of_display(self.display_id);
+        // The display moved in global coordinates (another display became main, or stopped being
+        // main): the pointer moved with it, so the next move mustn't carry the shift as a delta.
+        if let Some(before) = self.bounds.filter(|b| b.is_usable() && bounds.is_usable() && (b.x, b.y) != (bounds.x, bounds.y)) {
+            let at = self.state.position();
+            self.state.rebase(inject::Point { x: at.x + bounds.x - before.x, y: at.y + bounds.y - before.y });
+        }
+        self.bounds = Some(bounds);
         for msg in msgs {
             match msg {
                 InputMsg::Relayed { depth } => {
@@ -642,14 +699,21 @@ impl Worker {
                 continue;
             }
             if let InputMsg::System(action) = msg
-                && !self.system_actions.allow(Instant::now(), MAX_SYSTEM_ACTIONS_PER_SEC)
+                && !self.allow_system_action(action)
             {
-                if self.system_actions.first_refused(MAX_SYSTEM_ACTIONS_PER_SEC) {
-                    tracing::warn!(?action, "more than {MAX_SYSTEM_ACTIONS_PER_SEC} system actions a second; dropping the rest");
-                }
                 continue;
             }
+            let ends_swipe = matches!(msg, InputMsg::Gesture(GestureInput::DockSwipe { phase: GesturePhase::Ended, .. }));
+            let start = self.synth.len();
             apply(&mut self.state, msg, &bounds, self.host_caps_lock, &mut self.synth);
+            // A discrete Dock swipe ends as the action it asks for (see `InputState::gesture`),
+            // which counts against the same limit as one the viewer asks for itself.
+            if ends_swipe
+                && let [.., Synth::System(action)] = self.synth[start..]
+                && !self.allow_system_action(action)
+            {
+                self.synth.pop();
+            }
         }
         self.flush();
         let injected_us = clock::now_us();
@@ -662,6 +726,34 @@ impl Worker {
             self.last_activity = Some(Instant::now());
             platform_mac::system::declare_user_activity();
         }
+    }
+
+    /// Counts one system action against the limit; false if it is over it (said once a second).
+    fn allow_system_action(&mut self, action: impl std::fmt::Debug) -> bool {
+        let allowed = self.system_actions.allow(Instant::now(), MAX_SYSTEM_ACTIONS_PER_SEC);
+        if !allowed && self.system_actions.first_refused(MAX_SYSTEM_ACTIONS_PER_SEC) {
+            tracing::warn!(?action, "more than {MAX_SYSTEM_ACTIONS_PER_SEC} system actions a second; dropping the rest");
+        }
+        allowed
+    }
+
+    /// The viewer switched displays: what was pressed or pinched on the old one is let go (its
+    /// positions mean nothing on the new one), and moves start from where the pointer is now.
+    fn follow_display(&mut self) {
+        let (id, epoch) = self.shared.display();
+        if epoch == self.display_epoch {
+            return;
+        }
+        self.display_epoch = epoch;
+        tracing::info!(from = self.display_id, to = id, "input follows the viewer to another display");
+        self.state.cancel_positioned_gesture(&mut self.synth);
+        self.state.release_buttons(&mut self.synth);
+        self.flush();
+        self.display_id = id;
+        self.display_warned = false;
+        self.bounds = None;
+        let pos = if self.recording { Bounds::of_display(id).point_at(0.5, 0.5) } else { inject::cursor_position() };
+        self.state.rebase(pos);
     }
 
     fn release_all(&mut self) {
@@ -898,5 +990,75 @@ mod tests {
         assert!(!r.allow(t0 + Duration::from_millis(999), 50));
         assert!(!r.first_refused(50), "once a second");
         assert!(r.allow(t0 + Duration::from_secs(1), 50));
+    }
+
+    /// A worker that records to `path`, as an input thread does with `LANKVM_INJECT=record:`.
+    fn recording_worker(path: &Path, state: InputState) -> Worker {
+        let (out, _) = mpsc::channel(1);
+        Worker {
+            sink: Sink::Record(File::create(path).unwrap()),
+            guard: None,
+            flood: FloodGuard::default(),
+            system_actions: RateLimit::default(),
+            display_warned: false,
+            state,
+            display_id: 0,
+            display_epoch: 0,
+            recording: true,
+            bounds: None,
+            shared: Arc::new(InputShared::default()),
+            out,
+            synth: Vec::new(),
+            depth: 0,
+            host_caps_lock: || false,
+            seq: 0,
+            last_ack_us: 0,
+            // As if just declared, so a test doesn't keep this Mac's display awake.
+            last_activity: Some(Instant::now()),
+        }
+    }
+
+    /// An input state whose Dock swipes are all discrete, as on a Mac where no recipe works.
+    fn discrete() -> InputState {
+        let mut s = InputState::new(Default::default(), false, 0);
+        s.set_dock_modes(gesture::DockModes { recipes: [gesture::DockRecipe::Discrete; 3], ..Default::default() });
+        s
+    }
+
+    fn recorded_actions(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|e| e["type"] == "system")
+            .map(|e| e["action"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn discrete_swipes_count_against_the_system_action_limit() {
+        let path = std::env::temp_dir().join(format!("lankvm-discrete-rate-{}.jsonl", std::process::id()));
+        let mut w = recording_worker(&path, discrete());
+        let swipe_up: &[InputMsg] = &[dock(GesturePhase::Began, 0.0), dock(GesturePhase::Ended, 0.6)];
+        let asked: &[InputMsg] = &[InputMsg::System(protocol::SystemAction::MISSION_CONTROL)];
+        // Two swipes up and two asked for: the limit. One more of each in that second is dropped.
+        for msgs in [swipe_up, swipe_up, asked, asked, swipe_up, asked] {
+            w.inject(msgs.iter().copied(), 0);
+        }
+        assert_eq!(recorded_actions(&path), ["mission_control"; 4]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_discrete_swipe_past_the_relay_limit_starts_nothing() {
+        let path = std::env::temp_dir().join(format!("lankvm-discrete-relay-{}.jsonl", std::process::id()));
+        let mut w = recording_worker(&path, discrete());
+        let deep = InputMsg::Relayed { depth: MAX_RELAY_DEPTH + 1 };
+        w.inject([deep, dock(GesturePhase::Began, 0.0), dock(GesturePhase::Ended, 0.6)].into_iter(), 0);
+        assert!(recorded_actions(&path).is_empty());
+        // One that began nearer still ends, at any depth, as a fluid swipe does.
+        w.inject([InputMsg::Relayed { depth: 1 }, dock(GesturePhase::Began, 0.0), deep, dock(GesturePhase::Ended, 0.6)].into_iter(), 0);
+        assert_eq!(recorded_actions(&path), ["mission_control"]);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -15,6 +15,7 @@ mod nal;
 pub mod system;
 pub mod permissions;
 mod util;
+pub mod virtual_display;
 
 pub use objc2_core_foundation::CFRetained;
 pub use objc2_core_video::CVPixelBuffer;

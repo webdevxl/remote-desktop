@@ -32,6 +32,16 @@ final class InputForwarder {
     var frameSize = CGSize(width: 1, height: 1) {
         didSet { if frameSize != oldValue { pictureMoved() } }
     }
+    /// While the session switches displays, the picture is about to change size: the pointer
+    /// would land where things were. Moves, clicks, scrolls and gestures are dropped meanwhile
+    /// (keys still go); buttons held are let go and a gesture in progress is ended first, and
+    /// afterwards the remote pointer is put where this one is. Set it after `frameSize`.
+    var pointerSuspended = false {
+        didSet {
+            guard pointerSuspended != oldValue else { return }
+            pointerSuspended ? suspendPointer() : resumePointer()
+        }
+    }
     /// Called when the user presses the ⌃⌥⌘ chord while not controlling: asks for control (or,
     /// while asking, goes back to viewing).
     var onEscape: (() -> Void)?
@@ -133,6 +143,14 @@ final class InputForwarder {
                 guard let self else { return }
                 self.stop()
                 DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.update() } }
+            }
+        })
+        // A menu (the session control's, the menu bar's) tracks the keyboard itself while open: a
+        // modifier let go meanwhile is still held there.
+        observers.append(center.addObserver(forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.isForwarding else { return }
+                self.resyncModifiers(NSEvent.modifierFlags)
             }
         })
         // The Control menu's "Send System Shortcuts" and "Send Trackpad Gestures" apply right away.
@@ -291,6 +309,36 @@ final class InputForwarder {
     /// the session control.
     var holdsButtons: Bool { !downButtons.isEmpty }
 
+    /// The display is switching: nothing stays held under the pointer on the remote Mac.
+    private func suspendPointer() {
+        guard isForwarding else { return }
+        for button in downButtons.sorted() {
+            lk_input_mouse_button(sessionId, UInt8(button), false, 1, lastPosition.x, lastPosition.y)
+        }
+        downButtons.removeAll()
+        switch heldGesture {
+        case .magnify: lk_input_magnify(sessionId, lastPosition.x, lastPosition.y, UInt8(LK_PHASE_CANCELLED), 0)
+        case .rotate: lk_input_rotate(sessionId, lastPosition.x, lastPosition.y, UInt8(LK_PHASE_CANCELLED), 0)
+        case .dock: cancelDockSwipe()
+        case nil: break
+        }
+        heldGesture = nil
+    }
+
+    /// The new picture is there: the remote pointer goes where this one is over it (unless it's on
+    /// the session control, where moves stop anyway).
+    private func resumePointer() {
+        guard isForwarding, let view, let window = view.window else { return }
+        let point = view.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard view.bounds.contains(point),
+              session?.sessionControl.excludes(CGPoint(x: point.x, y: view.bounds.height - point.y)) != true else { return }
+        // Made here, not relayed.
+        sendDepth(0)
+        let p = position(at: point)
+        lastPosition = p
+        lk_input_mouse_move(sessionId, p.x, p.y)
+    }
+
     /// Lets the session control show what input does now (it publishes a moment later).
     private func publishState() {
         session?.sessionControl.inputChanged(forwarding: isForwarding, released: userReleased)
@@ -387,8 +435,9 @@ final class InputForwarder {
     }
 
     func mouseMoved(_ event: NSEvent) {
-        guard isForwarding else { return }
+        guard isForwarding, !pointerSuspended else { return }
         relay(event)
+        resyncModifiers(event.modifierFlags)
         let p = position(of: event)
         lastPosition = p
         lk_input_mouse_move(sessionId, p.x, p.y)
@@ -405,8 +454,9 @@ final class InputForwarder {
         if down {
             spoilChord(event)
             // A click well away from the picture (in a wide black bar) is not meant for the
-            // remote Mac; near its edge it lands on the edge (menu bar, Dock).
-            if distanceOutsidePicture(event) > Self.edgeSlop { return }
+            // remote Mac; near its edge it lands on the edge (menu bar, Dock). None while the
+            // picture changes (its release is dropped too: it isn't held).
+            if pointerSuspended || distanceOutsidePicture(event) > Self.edgeSlop { return }
             downButtons.insert(button)
             sentModifiers = nil  // as for key presses
         } else if downButtons.remove(button) == nil {
@@ -421,7 +471,7 @@ final class InputForwarder {
     }
 
     func scroll(_ event: NSEvent) {
-        guard isForwarding, let cg = event.cgEvent else { return }
+        guard isForwarding, !pointerSuspended, let cg = event.cgEvent else { return }
         relay(event)
         syncModifiers(event.modifierFlags)
         let p = position(of: event)
@@ -445,7 +495,7 @@ final class InputForwarder {
     /// may start here (the setting is on and the pointer isn't on the session control); one that
     /// started goes on to its end.
     func gesture(_ event: NSEvent, mayBegin: Bool) {
-        guard isForwarding else { return }
+        guard isForwarding, !pointerSuspended else { return }
         switch event.type {
         case .magnify, .rotate:
             guard let phase = Self.gesturePhase(event.phase) else { return }
@@ -485,7 +535,7 @@ final class InputForwarder {
 
     /// A Dock swipe or pinch that DockGestures took from this Mac's Dock for this window.
     func dockSwipe(_ sample: DockSwipeSample) {
-        guard isForwarding else { return }
+        guard isForwarding, !pointerSuspended else { return }
         // From the very Mac this window controls: it would bounce between the two (as in `filter`).
         if sample.depth > 0, let session, !session.hostId.isEmpty, CoreModel.shared.host.controller?.deviceId == session.hostId {
             return
@@ -591,6 +641,14 @@ final class InputForwarder {
         }
     }
 
+    /// `syncModifiers` where the last flagsChanged may have gone unseen: nested tracking loops
+    /// (menus, a window drag, toolbar controls) take it before the monitor does.
+    private func resyncModifiers(_ flags: NSEvent.ModifierFlags) {
+        // fn counts from its key alone: a missed release would keep it held.
+        if !flags.contains(.function) { fnHeld = false }
+        syncModifiers(flags)
+    }
+
     /// A key or click while chord modifiers are held means it was a shortcut, not the chord.
     /// (With nothing held there is no chord in progress to spoil.)
     private func spoilChord(_ event: NSEvent) {
@@ -623,8 +681,13 @@ final class InputForwarder {
     /// Where on the remote screen an event happened, 0...1 from its left/top edge. Uses the same
     /// letterbox math as the renderer (crates/core/src/render.rs), in drawable pixels.
     private func position(of event: NSEvent) -> CGPoint {
+        guard let view else { return lastPosition }
+        return position(at: view.convert(event.locationInWindow, from: nil))
+    }
+
+    /// The same for a point in the view (points, bottom-left origin).
+    private func position(at p: NSPoint) -> CGPoint {
         guard let view, let window = view.window, view.bounds.width > 0, view.bounds.height > 0 else { return lastPosition }
-        let p = view.convert(event.locationInWindow, from: nil)
         let scale = window.backingScaleFactor
         let tw = max(1, (view.bounds.width * scale).rounded())
         let th = max(1, (view.bounds.height * scale).rounded())

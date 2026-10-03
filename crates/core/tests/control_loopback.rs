@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +12,10 @@ use std::time::{Duration, Instant};
 use lankvm_core::control::Backend;
 use lankvm_core::{Core, CoreOptions, Event};
 use platform_mac::inject::Bounds;
-use protocol::{DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction};
+use protocol::{
+    Arrangement, DisplayChoice, DisplayReason, DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction,
+    VirtualDisplaySpec,
+};
 use serde_json::Value;
 use transport::identity::DeviceIdentity;
 
@@ -118,6 +122,33 @@ impl From<Answer> for (bool, Option<String>) {
 }
 
 impl Peer {
+    /// Waits for the `display` event answering `request` (0: the host's own news): (kind of
+    /// display shown, stream size, reason, may it ask for a virtual display).
+    fn display(&self, id: u64, request: u32) -> Shown {
+        self.wait("display", |e| match e {
+            Event::Display { session, request: r, info, reason, message } if session == id && r == request => Ok(Shown {
+                kind: info.display.kind,
+                size: (info.width, info.height),
+                reason,
+                message,
+                available: info.display_available,
+            }),
+            e => Err(e),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Shown {
+    kind: &'static str,
+    size: (u32, u32),
+    reason: u16,
+    message: String,
+    available: u16,
+}
+
+fn ultrawide(arrangement: Arrangement) -> DisplayChoice {
+    DisplayChoice::Virtual(VirtualDisplaySpec { width: 6144, height: 2560, hidpi: true, refresh_hz: 60, arrangement })
 }
 
 /// A fresh data directory with an identity, plus its fingerprint.
@@ -727,16 +758,34 @@ fn gestures_are_injected_with_their_phases_in_order() {
 }
 
 /// Starts a Dock swipe and leaves it unfinished, ends control the way `end` does, and checks
-/// that the host cancelled the swipe where it was (so the Dock snaps back).
+/// that the host cancelled the swipe where it was (so the Dock snaps back), right away: the
+/// viewer keeps sending heartbeats meanwhile, as the app does, so the host's release of a silent
+/// viewer (a second after the last one) can't stand in for `end`'s own path.
 fn an_unfinished_dock_swipe_is_cancelled(s: Setup, end: impl FnOnce(&Setup, u64)) {
     let id = s.viewer.connect(&s.host);
     assert!(s.viewer.request(id, true, false).active);
     s.viewer.core.send_input(id, dock(GesturePhase::Began, 0.0, 0.0));
     s.viewer.core.send_input(id, dock(GesturePhase::Changed, 0.4, 0.0));
     assert_eq!(kinds(&recorded_until(&s.record, "dock:changed")), ["dock:began", "dock:changed"]);
+    let beating = Arc::new(AtomicBool::new(true));
+    // They reach the host until the viewer learns control ended (it drops them from then on).
+    let heart = std::thread::spawn({
+        let (core, beating) = (s.viewer.core.clone(), beating.clone());
+        move || {
+            while beating.load(Ordering::Relaxed) {
+                core.send_input(id, InputMsg::Heartbeat);
+                std::thread::sleep(Duration::from_millis(protocol::HEARTBEAT_INTERVAL_MS));
+            }
+        }
+    });
     end(&s, id);
+    let ended = Instant::now();
     let events = recorded_until(&s.record, "dock:cancelled");
+    let after = ended.elapsed();
+    beating.store(false, Ordering::Relaxed);
+    heart.join().unwrap();
     assert_eq!(kinds(&events), ["dock:began", "dock:changed", "dock:cancelled"], "{events:#?}");
+    assert!(after < Duration::from_millis(500), "cancelled {after:?} after control ended, as if on silence");
     assert!((events[2]["progress"].as_f64().unwrap() - 0.4).abs() < 1e-6, "{events:#?}");
     assert_eq!(events[2]["velocity"], serde_json::json!([0.0, 0.0]), "no fling");
 }
@@ -843,4 +892,49 @@ fn system_actions_are_rate_limited() {
     let events = recorded_until(&s.record, "dock:ended");
     assert_eq!(kinds(&events[6..]), ["dock:began", "dock:changed", "dock:ended"], "a Space to the right is a one-Space swipe");
     assert_eq!(events[8]["axis"], "horizontal");
+}
+
+/// The host says what the viewer shows right after connecting, answers each display request in
+/// order, and a host that doesn't stream (as in tests) refuses virtual displays before touching
+/// any: no test ever creates a display on the developer's Mac.
+#[test]
+fn display_requests_are_answered_in_order() {
+    let s = setup("display");
+    let id = s.viewer.core.connect(&format!("127.0.0.1:{}", s.host.core.this_mac().port), (1920, 1080), 60);
+    let (kind, available) = s.viewer.wait("connected", |e| match e {
+        Event::Connected { session, info } if session == id => Ok((info.display.kind, info.display_available)),
+        e => Err(e),
+    });
+    assert_eq!((kind, available), ("main", DisplayReason::NO_VIDEO.0));
+
+    // A request the host can't do, then one it can, back to back: answered in that order.
+    let refused = s.viewer.core.set_display(id, ultrawide(Arrangement::ONLY));
+    let main = s.viewer.core.set_display(id, DisplayChoice::Main);
+    assert!(main > refused);
+    let answer = s.viewer.display(id, refused);
+    assert_eq!((answer.kind, answer.reason), ("main", DisplayReason::NO_VIDEO.0), "{answer:?}");
+    assert!(answer.message.contains("doesn't stream"), "{answer:?}");
+    let answer = s.viewer.display(id, main);
+    assert_eq!((answer.kind, answer.reason), ("main", DisplayReason::NONE.0), "{answer:?}");
+
+    // The session goes on, and pointer input still lands on the main display.
+    assert_eq!(s.viewer.request_control(id, true), (true, None));
+    s.viewer.core.send_input(id, InputMsg::MouseMove { x: pos(0.25), y: pos(0.5) });
+    let events = recorded(&s.record, 1);
+    let at = Bounds::of_display(platform_mac::capture::main_display_bounds().id).point_at(0.25, 0.5);
+    assert!((events[0]["x"].as_f64().unwrap() - at.x).abs() < 0.1 && (events[0]["y"].as_f64().unwrap() - at.y).abs() < 0.1, "{events:?}");
+}
+
+/// Display requests can rearrange a Mac's screens: a viewer flooding them is disconnected.
+#[test]
+fn a_flood_of_display_requests_ends_the_session() {
+    let s = setup("display-flood");
+    let id = s.viewer.connect(&s.host);
+    for _ in 0..12 {
+        s.viewer.core.set_display(id, DisplayChoice::Main);
+    }
+    s.viewer.wait("the host to hang up", |e| match e {
+        Event::Ended { session, .. } if session == id => Ok(()),
+        e => Err(e),
+    });
 }

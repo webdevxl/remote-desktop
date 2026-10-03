@@ -30,12 +30,12 @@ struct LanKVMApp: App {
             ControlCommands()
         }
 
-        // Shown while another Mac views or controls this one, so whoever sits here can see it
-        // and take control back.
-        MenuBarExtra(isInserted: Binding(get: { !core.host.viewers.isEmpty }, set: { _ in })) {
+        // Shown while another Mac views or controls this one, or a display made for one is still
+        // here, so whoever sits here can see it, take control back and get the screen back.
+        MenuBarExtra(isInserted: Binding(get: { !core.host.viewers.isEmpty || !core.host.virtualDisplays.isEmpty }, set: { _ in })) {
             HostMenu().environmentObject(core)
         } label: {
-            Image(systemName: core.host.controller != nil ? "cursorarrow.rays" : "eye")
+            Image(systemName: core.host.controller != nil ? "cursorarrow.rays" : core.host.viewers.isEmpty ? "display" : "eye")
         }
     }
 }
@@ -71,6 +71,13 @@ private struct ControlCommands: Commands {
                 }
             }
             .disabled(session?.isControlling != true)
+            if let session, let controls {
+                DisplayMenu(session: session, controls: controls)
+                    .disabled(!connected)
+            } else {
+                Menu("Display") {}
+                    .disabled(true)
+            }
             Divider()
             Toggle("Send System Shortcuts to Remote Mac", isOn: $sendSystemShortcuts)
             Text("⌘Tab, ⌘Space, Mission Control and screenshot keys go to the Mac you control.")
@@ -87,7 +94,7 @@ private struct ControlCommands: Commands {
     }
 }
 
-/// The menu-bar menu on a Mac others are connected to.
+/// The menu-bar menu on a Mac others are connected to, or that has displays made for them.
 private struct HostMenu: View {
     @EnvironmentObject private var core: CoreModel
 
@@ -95,12 +102,29 @@ private struct HostMenu: View {
         ForEach(core.host.viewers) { viewer in
             Text("\(viewer.name) is \(viewer.controlling ? "controlling" : "viewing") this Mac")
         }
+        if !core.host.virtualDisplays.isEmpty {
+            if !core.host.viewers.isEmpty { Divider() }
+            ForEach(core.host.virtualDisplays) { display in
+                Text("LanKVM Display for “\(display.owner)” · \(display.display.sizeText)"
+                     + (display.inUse ? "" : " · kept for a minute in case “\(display.owner)” reconnects"))
+            }
+            // One: back to this Mac's own screen. Several: each on its own.
+            if core.host.virtualDisplays.count == 1 {
+                Button("Use This Mac’s Own Screen") { core.removeVirtualDisplay(nil) }
+            } else {
+                ForEach(core.host.virtualDisplays) { display in
+                    Button("Remove Display for “\(display.owner)”") { core.removeVirtualDisplay(display) }
+                }
+            }
+        }
         Divider()
         if core.host.controller != nil {
             Button("Stop Control (⌃⌥⌘.)") { core.stopAllControl() }
         }
-        Button("Disconnect All") { core.host.viewers.forEach(core.kick) }
-        Divider()
+        if !core.host.viewers.isEmpty {
+            Button("Disconnect All") { core.host.viewers.forEach(core.kick) }
+            Divider()
+        }
         Button("Open LanKVM") {
             NSApp.activate(ignoringOtherApps: true)
             NSApp.windows.first { $0.identifier?.rawValue.hasPrefix("main") == true }?.makeKeyAndOrderFront(nil)
