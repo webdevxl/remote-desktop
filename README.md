@@ -123,8 +123,17 @@ certificate (it asks for your login password once):
   screen (within 24 pt; further out they're ignored). Scrolling keeps trackpad momentum and your
   natural-scrolling direction. Keys are sent by position, so the other Mac's keyboard layout and
   input method decide the characters (dead keys and IME work there).
-- Not possible over the network: trackpad gestures (pinch, rotate, three/four-finger swipes),
-  Force Touch, the Globe key's system actions, media keys, and the login window.
+- **Trackpad gestures** go to the other Mac too (**Control → Send Trackpad Gestures to Remote
+  Mac**, on by default). Pinch, rotate, smart zoom and swipes between pages act on what's under
+  the pointer there. Swiping between Spaces, Mission Control, App Exposé and the pinches for
+  Show Desktop and Launchpad (Apps) also need Accessibility for LanKVM on **your** Mac, the same
+  switch as for being controlled. Without it they act on your Mac, and the viewer offers **Open
+  Settings**. They go to the other Mac when they start over its picture, or anywhere on the
+  screen in full screen; elsewhere, or once you release (⌃⌥⌘), they're your Mac's again. Mission
+  Control, App Exposé, Show Desktop and Move Left/Right a Space are also in the session control's
+  **⋯** menu and in **Control → Remote Mac**.
+- Not possible over the network: Force Touch and Look Up, the swipe in from the right edge for
+  Notification Center, the Globe key's system actions, media keys, and the login window.
 
 **On the Mac being controlled**, macOS must allow LanKVM to post input: **This Mac → Remote
 control → Allow Control…**, then switch LanKVM on under Privacy & Security → Accessibility. The
@@ -228,6 +237,9 @@ real QUIC on loopback while the host records what it would inject (`crates/core/
 - **"hasn't allowed LanKVM to control it":** on that Mac, open This Mac → Remote control →
   Allow Control…, and switch LanKVM on under Privacy & Security → Accessibility. If it's already
   on but control still fails, remove it with −, add it again, and relaunch LanKVM.
+- **Spaces and Mission Control swipes act on your own Mac while controlling:** LanKVM needs
+  Accessibility on the Mac you control *from* too (Privacy & Security → Accessibility). Pinch,
+  rotate and page swipes work without it.
 - **Reset a permission:** `tccutil reset ScreenCapture dev.lankvm.LanKVM` (or `Accessibility`)
 - **Wi-Fi** adds jitter. For the lowest latency, put the viewed Macs on Ethernet.
 

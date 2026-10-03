@@ -56,7 +56,7 @@ final class InputForwarder {
     private var lastPosition = CGPoint(x: 0.5, y: 0.5)
     /// The gesture in progress on the remote Mac (it takes one at a time, like a trackpad), with a
     /// Dock swipe's latest values, which cancelling it repeats.
-    private var gesture: RemoteGesture?
+    private var heldGesture: RemoteGesture?
     /// Proves to the host, from this (UI) thread, that we're alive while anything is held.
     private var heartbeat: Timer?
     /// No forwarding while the display or the Mac sleeps, the screen is locked, or another user
@@ -215,7 +215,7 @@ final class InputForwarder {
         }
         RunLoop.main.add(timer, forMode: .common)
         heartbeat = timer
-        gesture = nil
+        heldGesture = nil
         armDockGestures()
         lk_set_focus(sessionId, true)
         onForwardingChanged?(true)
@@ -232,7 +232,7 @@ final class InputForwarder {
         heartbeat = nil
         // Ends a gesture in progress there too (the host cancels it).
         lk_input_release_all(sessionId)
-        gesture = nil
+        heldGesture = nil
         // Still controlling, just not focused: the host shows its cursor in the video meanwhile.
         if session?.isControlling == true {
             lk_set_focus(sessionId, false)
@@ -298,7 +298,7 @@ final class InputForwarder {
 
     private func beat() {
         let holding = !downKeys.isEmpty || !downButtons.isEmpty || (sentModifiers ?? 0) & ~Modifiers.capsLock != 0
-            || gesture != nil
+            || heldGesture != nil
         if isForwarding && holding {
             lk_input_heartbeat(sessionId)
         }
@@ -454,11 +454,11 @@ final class InputForwarder {
                 // A rotation starting during a pinch (or the other way round) stays out of it, as
                 // the remote Mac takes one gesture at a time. A new pinch while one seems to go on:
                 // that one's end was missed, and the host ends it.
-                guard mayBegin, gesture == nil || gesture == kind else { return }
-                gesture = kind
+                guard mayBegin, heldGesture == nil || heldGesture == kind else { return }
+                heldGesture = kind
             } else {
-                guard gesture == kind else { return }
-                if phase == LK_PHASE_ENDED || phase == LK_PHASE_CANCELLED { gesture = nil }
+                guard heldGesture == kind else { return }
+                if phase == LK_PHASE_ENDED || phase == LK_PHASE_CANCELLED { heldGesture = nil }
             }
             relay(event)
             syncModifiers(event.modifierFlags)
@@ -491,21 +491,22 @@ final class InputForwarder {
             return
         }
         if sample.phase != LK_PHASE_BEGAN {
-            guard case .dock(let axis, _, _) = gesture, axis == sample.axis else { return }
+            guard case .dock(let axis, _, _) = heldGesture, axis == sample.axis else { return }
         }
         // A Dock swipe beginning ends whatever gesture was in progress (the host cancels it).
         let ends = sample.phase == LK_PHASE_ENDED || sample.phase == LK_PHASE_CANCELLED
-        gesture = ends ? nil : .dock(axis: sample.axis, progress: sample.progress, inverted: sample.inverted)
+        heldGesture = ends ? nil : .dock(axis: sample.axis, progress: sample.progress, inverted: sample.inverted)
         sendDepth(sample.depth)
         lk_input_dock_swipe(sessionId, sample.axis, sample.phase, sample.progress, sample.velocityX, sample.velocityY,
                             sample.inverted)
     }
 
-    /// DockGestures lost track of the Dock swipe it was sending (its tap was turned off for a
-    /// moment): end it there, where the Dock snaps back.
+    /// No more of the Dock swipe in progress will come while still forwarding (DockGestures' tap
+    /// was turned off for a moment, the setting went off...): end it there, where the Dock snaps
+    /// back.
     func cancelDockSwipe() {
-        guard isForwarding, case .dock(let axis, let progress, let inverted) = gesture else { return }
-        gesture = nil
+        guard isForwarding, case .dock(let axis, let progress, let inverted) = heldGesture else { return }
+        heldGesture = nil
         lk_input_dock_swipe(sessionId, axis, UInt8(LK_PHASE_CANCELLED), progress, 0, 0, inverted)
     }
 
@@ -668,8 +669,8 @@ final class InputForwarder {
 private let HEARTBEAT_MS = 250
 
 /// User setting: whether trackpad gestures go to the remote Mac while controlling it (pinch,
-/// rotate, smart zoom, swipes, and with Accessibility the Dock's Mission Control and Spaces
-/// swipes). Off, they act on this Mac as before.
+/// rotate, smart zoom, page swipes, and with Accessibility the Dock's Mission Control and Spaces
+/// swipes, see DockGestures). Off, the Dock's act on this Mac and the others on neither.
 enum TrackpadGestures {
     static let defaultsKey = "sendTrackpadGestures"
 

@@ -244,10 +244,10 @@ final class CoreModel: ObservableObject {
         refreshHost()
     }
 
-    // MARK: Accessibility (needed to be controlled)
+    // MARK: Accessibility (needed to be controlled, and to send Dock gestures)
 
-    /// Asks macOS to let LanKVM post input: shows the system prompt the first time (which adds
-    /// LanKVM to the list), then opens the settings pane.
+    /// Asks macOS to let LanKVM post and filter input: shows the system prompt the first time
+    /// (which adds LanKVM to the list), then opens the settings pane.
     func requestControlPermission() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         if !AXIsProcessTrustedWithOptions(options) {
@@ -348,6 +348,8 @@ final class SessionModel: ObservableObject, Identifiable {
     let cursor = RemoteCursor()
     /// The floating control over the remote screen (and the Control menu's actions).
     private(set) lazy var sessionControl = SessionControlModel(session: self)
+    /// The user closed the hint about Accessibility for trackpad gestures: not again in this window.
+    @Published var gestureHintDismissed = false
     /// Whether the session ever showed the remote screen (for wording when it ends).
     var wasConnected = false
 

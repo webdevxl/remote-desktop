@@ -56,8 +56,27 @@ enum Snapshot {
                    size: CGSize(width: 640, height: 420), appearance: appearance,
                    to: dir.appendingPathComponent("ended-\(suffix).png"))
             renderSessionControls(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
+            renderGestureHint(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
         }
         NSApp.terminate(nil)
+    }
+
+    /// While controlling without Accessibility here: the hint that Dock gestures still act on this
+    /// Mac, under the session control.
+    private static func renderGestureHint(info: SessionInfo, stats: SessionStats, appearance: NSAppearance.Name,
+                                          suffix: String, into dir: URL) {
+        let session = sampleSession(info: info)
+        session.control = .active
+        session.sessionControl.showSample(forwarding: true)
+        render(
+            ZStack {
+                LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                ScreenOverlays(session: session, controls: session.sessionControl, info: info, sampleStats: stats, sampleTrusted: false)
+            }
+            .padding(.top, 28)
+            .environmentObject(CoreModel.shared),
+            size: CGSize(width: 1000, height: 400), appearance: appearance,
+            to: dir.appendingPathComponent("gesture-hint-\(suffix).png"))
     }
 
     /// The session control in each state and on each kind of edge, then over a whole screen

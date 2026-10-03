@@ -125,14 +125,17 @@ private struct ViewerContent: View {
     }
 }
 
-/// Everything drawn over the remote picture: statistics, the control banner, toasts, and the
-/// session control on top. The others keep clear of where the session control is docked.
+/// Everything drawn over the remote picture: statistics, the control banner and the gesture hint,
+/// toasts, and the session control on top. The others keep clear of where the session control is
+/// docked, and the statistics of the banners.
 struct ScreenOverlays: View {
     @ObservedObject var session: SessionModel
     @ObservedObject var controls: SessionControlModel
     let info: SessionInfo
     /// Statistics to show instead of the session's (snapshots).
     var sampleStats: SessionStats?
+    /// Whether Accessibility is granted, instead of asking macOS (snapshots).
+    var sampleTrusted: Bool?
     var retry: () -> Void = {}
     var takeOver: () -> Void = {}
     @AppStorage("showStats") private var showStats = true
@@ -147,8 +150,8 @@ struct ScreenOverlays: View {
     var body: some View {
         let screen = controls.screenSize
         let reserved = controls.isShown(enabled: showSessionControl) ? controls.reservedFrame : .null
-        let hud = CGRect(x: 12, y: 12, width: hudSize.width, height: hudSize.height)
-        let banner = CGRect(x: (screen.width - bannerSize.width) / 2, y: 14, width: bannerSize.width, height: bannerSize.height)
+        let banner = bannerFrame(screen: screen, reserved: reserved)
+        let hud = hudFrame(reserved: reserved, banner: banner)
         let toast = CGRect(x: (screen.width - toastSize.width) / 2, y: screen.height - 28 - toastSize.height,
                            width: toastSize.width, height: toastSize.height)
         Color.clear
@@ -158,14 +161,18 @@ struct ScreenOverlays: View {
                     StatsHUD(sessionId: session.id, info: info, sample: sampleStats)
                         .onGeometryChange(for: CGSize.self) { $0.size } action: { hudSize = $0 }
                         .padding(.leading, 12)
-                        .padding(.top, overlaps(reserved, hud) ? reserved.maxY + Self.gap : 12)
+                        .padding(.top, hud.minY)
+                        .animation(.easeOut(duration: 0.18), value: hud.minY)
                         .allowsHitTesting(false)
                 }
             }
             .overlay(alignment: .top) {
-                ControlBanner(session: session, hostName: info.hostName, retry: retry, takeOver: takeOver)
-                    .onGeometryChange(for: CGSize.self) { $0.size } action: { bannerSize = $0 }
-                    .padding(.top, overlaps(reserved, banner) ? reserved.maxY + Self.gap : 14)
+                VStack(spacing: Self.gap) {
+                    ControlBanner(session: session, hostName: info.hostName, retry: retry, takeOver: takeOver)
+                    GestureAccessHint(session: session, hostName: info.hostName, sampleTrusted: sampleTrusted)
+                }
+                .onGeometryChange(for: CGSize.self) { $0.size } action: { bannerSize = $0 }
+                .padding(.top, banner.minY)
             }
             .overlay(alignment: .bottom) {
                 if let text = session.toast {
@@ -186,6 +193,22 @@ struct ScreenOverlays: View {
             }
             .animation(.easeOut(duration: 0.2), value: session.toast)
             .animation(.easeOut(duration: 0.18), value: controls.placement)
+    }
+
+    /// The banners, centred at the top, below the session control when it's there.
+    private func bannerFrame(screen: CGSize, reserved: CGRect) -> CGRect {
+        var banner = CGRect(x: (screen.width - bannerSize.width) / 2, y: 14, width: bannerSize.width, height: bannerSize.height)
+        if overlaps(reserved, banner) { banner.origin.y = reserved.maxY + Self.gap }
+        return banner
+    }
+
+    /// The statistics, top left, below the session control or the banners when they'd overlap
+    /// (a narrow window).
+    private func hudFrame(reserved: CGRect, banner: CGRect) -> CGRect {
+        var hud = CGRect(x: 12, y: 12, width: hudSize.width, height: hudSize.height)
+        if overlaps(reserved, hud) { hud.origin.y = reserved.maxY + Self.gap }
+        if overlaps(banner, hud) { hud.origin.y = banner.maxY + Self.gap }
+        return hud
     }
 
     private func overlaps(_ reserved: CGRect, _ frame: CGRect) -> Bool {
@@ -237,6 +260,70 @@ struct ControlBanner: View {
 
     private func pill(icon: String, text: String, tint: Color, action: (String, () -> Void)? = nil,
                       dismiss: (() -> Void)? = nil) -> some View {
+        BannerPill(icon: icon, text: text, tint: tint, action: action, dismiss: dismiss)
+    }
+}
+
+/// While controlling, Mission Control and Spaces swipes still act on this Mac until LanKVM may
+/// take them (Accessibility, here on this Mac). Says so, with the way to fix it, until fixed or
+/// dismissed for this window. The other gestures need nothing.
+struct GestureAccessHint: View {
+    @ObservedObject var session: SessionModel
+    let hostName: String
+    @AppStorage(TrackpadGestures.defaultsKey) private var sendTrackpadGestures = true
+    /// Whether Accessibility is granted, as last checked.
+    @State private var trusted: Bool
+    private let sampleTrusted: Bool?
+
+    /// Test copies (scripts/e2e-control.sh) never offer permissions.
+    private static let noPrompts = ProcessInfo.processInfo.environment["LANKVM_NO_PROMPTS"] == "1"
+
+    /// `sampleTrusted`: for snapshots, whether Accessibility is granted (nil: ask macOS).
+    init(session: SessionModel, hostName: String, sampleTrusted: Bool? = nil) {
+        self.session = session
+        self.hostName = hostName
+        self.sampleTrusted = sampleTrusted
+        _trusted = State(initialValue: sampleTrusted ?? true)
+    }
+
+    var body: some View {
+        Group {
+            if relevant && !trusted {
+                BannerPill(icon: "hand.draw",
+                           text: "Mission Control and Spaces swipes still act on this Mac. To send them to “\(hostName)”, allow LanKVM in Accessibility.",
+                           tint: Color(hex: 0xE5B45A),
+                           action: ("Open Settings", { CoreModel.shared.requestControlPermission() }),
+                           dismiss: { session.gestureHintDismissed = true })
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: relevant && !trusted)
+        // macOS reports a grant while LanKVM runs: the hint goes as soon as it's given.
+        .task(id: relevant) {
+            guard relevant, sampleTrusted == nil else { return }
+            while !Task.isCancelled {
+                trusted = AXIsProcessTrusted()
+                if trusted { return }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    private var relevant: Bool {
+        session.isControlling && sendTrackpadGestures && !session.sameMachine && !session.gestureHintDismissed && !Self.noPrompts
+    }
+}
+
+/// A message over the top of the remote screen, legible on any picture: an icon, the text, and
+/// the action that helps and a close button when there are some.
+struct BannerPill: View {
+    let icon: String
+    let text: String
+    let tint: Color
+    var action: (String, () -> Void)?
+    var dismiss: (() -> Void)?
+
+    var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: icon).foregroundStyle(tint)
             Text(text)

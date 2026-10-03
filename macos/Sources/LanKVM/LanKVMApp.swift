@@ -75,7 +75,7 @@ private struct ControlCommands: Commands {
             Toggle("Send System Shortcuts to Remote Mac", isOn: $sendSystemShortcuts)
             Text("⌘Tab, ⌘Space, Mission Control and screenshot keys go to the Mac you control.")
             Toggle("Send Trackpad Gestures to Remote Mac", isOn: $sendTrackpadGestures)
-            Text("Pinch, rotate and swipes go to the Mac you control.")
+            Text("Pinch, rotate and swipes go to the Mac you control. Mission Control and Spaces swipes need Accessibility for LanKVM here.")
             Divider()
             Toggle("Show Session Control", isOn: $showSessionControl)
         }

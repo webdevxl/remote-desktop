@@ -3,7 +3,8 @@ import ApplicationServices
 import os
 
 /// Sends the trackpad's Dock gestures to the remote Mac while a viewer window forwards input:
-/// swiping between Spaces, Mission Control, App Exposé, and the pinches for Show Desktop and Apps.
+/// swiping between Spaces, Mission Control, App Exposé, and the pinches for Show Desktop and
+/// Launchpad (Apps).
 ///
 /// AppKit never sees these; the Dock takes them from the window server. An active event tap sees
 /// them first and can drop them. That needs Accessibility (as being controlled does), which LanKVM
@@ -62,13 +63,17 @@ enum DockGestures {
     }
 
     /// Stops taking Dock gestures for `owner`. One already taken stays away from this Mac's Dock
-    /// until it ends, but goes nowhere (the remote Mac let go of everything when forwarding stopped).
+    /// until it ends, but goes nowhere: `owner` ends it on the remote Mac (or, when forwarding
+    /// stopped, its host did as it let go of everything).
     static func disarm(_ owner: InputForwarder) {
         guard owner === self.owner else { return }
         disarmAll()
     }
 
     private static func disarmAll(immediately: Bool = false) {
+        // Still forwarding (the setting went off, Accessibility was revoked): nothing more of a Dock
+        // swipe in progress will come, and heartbeats would keep it going there.
+        owner?.cancelDockSwipe()
         owner = nil
         timer?.invalidate()
         timer = nil
@@ -499,8 +504,9 @@ private final class TapThread: Thread {
 
     override func main() {
         runLoop = CFRunLoopGetCurrent()
-        // A run loop with nothing in it returns at once: a timer due in decades keeps it waiting.
-        let idle = CFRunLoopTimerCreateWithHandler(nil, CFAbsoluteTimeGetCurrent() + 1e9, 0, 0, 0) { _ in }
+        // A run loop with nothing in it returns at once: a timer due every few decades keeps it
+        // waiting.
+        let idle = CFRunLoopTimerCreateWithHandler(nil, CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0) { _ in }
         CFRunLoopAddTimer(runLoop, idle, .defaultMode)
         started.signal()
         while true { CFRunLoopRun() }
