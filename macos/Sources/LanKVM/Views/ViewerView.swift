@@ -16,7 +16,7 @@ struct ViewerView: View {
     var body: some View {
         Group {
             if let session = core.session(sessionId) {
-                ViewerContent(session: session, reconnect: reconnect, close: { dismiss() })
+                ViewerContent(session: session, controls: session.sessionControl, reconnect: reconnect, close: { dismiss() })
             } else {
                 EndedView(target: nil, error: nil, wasConnected: true, reconnect: nil, close: { dismiss() })
                     // A window macOS restored from the last run: its session is long gone.
@@ -37,6 +37,7 @@ struct ViewerView: View {
 private struct ViewerContent: View {
     @EnvironmentObject private var core: CoreModel
     @ObservedObject var session: SessionModel
+    @ObservedObject var controls: SessionControlModel
     let reconnect: (String) -> Void
     let close: () -> Void
     @AppStorage("showStats") private var showStats = true
@@ -58,32 +59,11 @@ private struct ViewerContent: View {
             case .connected(let info):
                 RemoteScreen(session: session, info: info, toggleControl: toggleControl)
                     .background(Color.black)
-                    .overlay(alignment: .topLeading) {
-                        if showStats {
-                            // Never in the way of the remote Mac's menu bar.
-                            StatsHUD(sessionId: session.id, info: info).padding(12).allowsHitTesting(false)
-                        }
+                    .overlay {
+                        ScreenOverlays(session: session, controls: controls, info: info,
+                                       retry: { core.setControl(true, for: session.id) },
+                                       takeOver: { core.setControl(true, for: session.id, takeOver: true) })
                     }
-                    .overlay(alignment: .top) {
-                        ControlBanner(session: session, hostName: info.hostName,
-                                      retry: { core.setControl(true, for: session.id) },
-                                      takeOver: { core.setControl(true, for: session.id, takeOver: true) })
-                            .padding(.top, 14)
-                    }
-                    .overlay(alignment: .bottom) {
-                        if let toast = session.toast {
-                            Text(toast)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 9)
-                                .background(.black.opacity(0.72), in: Capsule())
-                                .padding(.bottom, 28)
-                                .allowsHitTesting(false)
-                                .transition(.opacity)
-                        }
-                    }
-                    .animation(.easeOut(duration: 0.2), value: session.toast)
             case .ended(let error):
                 EndedView(target: session.target, error: error, wasConnected: session.wasConnected,
                           reconnect: { reconnect(session.target) }, close: close)
@@ -91,6 +71,9 @@ private struct ViewerContent: View {
         }
         .navigationTitle(title)
         .navigationSubtitle(subtitle)
+        // The Control menu acts on the viewer window in front.
+        .focusedSceneObject(session)
+        .focusedSceneObject(controls)
         .toolbar {
             if case .connected = session.phase {
                 ToolbarItem(placement: .principal) {
@@ -100,7 +83,7 @@ private struct ViewerContent: View {
                     }
                     .pickerStyle(.segmented)
                     .labelStyle(.titleAndIcon)
-                    .help("View only, or control this Mac with your mouse and keyboard. Press ⌃⌥⌘ together to switch.")
+                    .help("View only, or control this Mac with your mouse and keyboard. While controlling, ⌃⌥⌘ releases your keyboard and mouse and takes them back.")
                 }
                 ToolbarItemGroup(placement: .primaryAction) {
                     Toggle(isOn: $showStats) {
@@ -124,8 +107,10 @@ private struct ViewerContent: View {
     private var subtitle: String {
         guard case .connected = session.phase else { return "" }
         switch session.control {
-        case .active where session.sameMachine: return "Controlling this Mac (test mode) · press ⌃⌥⌘ to stop"
-        case .active: return "Controlling · press ⌃⌥⌘ to stop"
+        case .active where controls.isReleased && session.sameMachine: return "Released (test mode) · click the screen to control"
+        case .active where controls.isReleased: return "Released · click the screen to control"
+        case .active where session.sameMachine: return "Controlling this Mac (test mode) · press ⌃⌥⌘ to release"
+        case .active: return "Controlling · press ⌃⌥⌘ to release"
         case .requesting: return "Asking for control…"
         default: return "Viewing"
         }
@@ -137,6 +122,74 @@ private struct ViewerContent: View {
 
     private func toggleControl() {
         setMode(session.mode == .control ? .view : .control)
+    }
+}
+
+/// Everything drawn over the remote picture: statistics, the control banner, toasts, and the
+/// session control on top. The others keep clear of where the session control is docked.
+struct ScreenOverlays: View {
+    @ObservedObject var session: SessionModel
+    @ObservedObject var controls: SessionControlModel
+    let info: SessionInfo
+    /// Statistics to show instead of the session's (snapshots).
+    var sampleStats: SessionStats?
+    var retry: () -> Void = {}
+    var takeOver: () -> Void = {}
+    @AppStorage("showStats") private var showStats = true
+    @AppStorage(SessionControlModel.visibleKey) private var showSessionControl = true
+    @State private var hudSize = CGSize.zero
+    @State private var bannerSize = CGSize.zero
+    @State private var toastSize = CGSize.zero
+
+    /// Space kept between overlays.
+    private static let gap: CGFloat = 8
+
+    var body: some View {
+        let screen = controls.screenSize
+        let reserved = controls.isShown(enabled: showSessionControl) ? controls.reservedFrame : .null
+        let hud = CGRect(x: 12, y: 12, width: hudSize.width, height: hudSize.height)
+        let banner = CGRect(x: (screen.width - bannerSize.width) / 2, y: 14, width: bannerSize.width, height: bannerSize.height)
+        let toast = CGRect(x: (screen.width - toastSize.width) / 2, y: screen.height - 28 - toastSize.height,
+                           width: toastSize.width, height: toastSize.height)
+        Color.clear
+            .overlay(alignment: .topLeading) {
+                if showStats {
+                    // Never in the way of the remote Mac's menu bar.
+                    StatsHUD(sessionId: session.id, info: info, sample: sampleStats)
+                        .onGeometryChange(for: CGSize.self) { $0.size } action: { hudSize = $0 }
+                        .padding(.leading, 12)
+                        .padding(.top, overlaps(reserved, hud) ? reserved.maxY + Self.gap : 12)
+                        .allowsHitTesting(false)
+                }
+            }
+            .overlay(alignment: .top) {
+                ControlBanner(session: session, hostName: info.hostName, retry: retry, takeOver: takeOver)
+                    .onGeometryChange(for: CGSize.self) { $0.size } action: { bannerSize = $0 }
+                    .padding(.top, overlaps(reserved, banner) ? reserved.maxY + Self.gap : 14)
+            }
+            .overlay(alignment: .bottom) {
+                if let text = session.toast {
+                    Text(text)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 9)
+                        .background(.black.opacity(0.72), in: Capsule())
+                        .onGeometryChange(for: CGSize.self) { $0.size } action: { toastSize = $0 }
+                        .padding(.bottom, overlaps(reserved, toast) ? screen.height - reserved.minY + Self.gap : 28)
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            .overlay {
+                SessionControl(session: session, model: controls)
+            }
+            .animation(.easeOut(duration: 0.2), value: session.toast)
+            .animation(.easeOut(duration: 0.18), value: controls.placement)
+    }
+
+    private func overlaps(_ reserved: CGRect, _ frame: CGRect) -> Bool {
+        !reserved.isNull && frame.width > 0 && frame.height > 0 && reserved.intersects(frame.insetBy(dx: -Self.gap, dy: -Self.gap))
     }
 }
 
@@ -159,7 +212,7 @@ struct ControlBanner: View {
                     dismissed = message
                 }
             case .active where session.sameMachine:
-                pill(icon: "exclamationmark.triangle", text: "Controlling this same Mac (test mode). Pointer and keyboard are shared; press ⌃⌥⌘ to stop.",
+                pill(icon: "exclamationmark.triangle", text: "Controlling this same Mac (test mode). Pointer and keyboard are shared; press ⌃⌥⌘ to release them.",
                      tint: Color(hex: 0xE5B45A))
             default:
                 EmptyView()
@@ -411,9 +464,13 @@ final class MetalHostView: NSView {
             input.attach(to: session)
             session.cursor.onChange = { [weak self] in self?.showRemoteCursor() }
             // Full screen hides this Mac's menu bar and Dock exactly while input goes remote,
-            // however forwarding starts or stops (focus, sleep, another Space...).
-            input.onForwardingChanged = { [weak self] on in self?.presentation?.update(immersive: on) }
+            // however forwarding starts or stops (focus, sleep, another Space, Release...).
+            input.onForwardingChanged = { [weak self] on in
+                self?.presentation?.update(immersive: on)
+                self?.showRemoteCursor()
+            }
         }
+        session.sessionControl.attach(forwarder: input, window: window)
         input.frameSize = frameSize
         input.onEscape = toggleControl
         input.update()
@@ -423,6 +480,16 @@ final class MetalHostView: NSView {
     }
 
     private var controlling: Bool { session?.isControlling == true }
+
+    /// Whether a point (view coordinates) is over the session control. The mouse there is this
+    /// Mac's: moves, clicks and scrolls aren't sent to the remote Mac (keys still are).
+    private func overSessionControl(_ point: NSPoint) -> Bool {
+        session?.sessionControl.excludes(CGPoint(x: point.x, y: bounds.height - point.y)) ?? false
+    }
+
+    private func overSessionControl(_ event: NSEvent) -> Bool {
+        overSessionControl(convert(event.locationInWindow, from: nil))
+    }
 
     override var acceptsFirstResponder: Bool { true }
     override var isOpaque: Bool { true }
@@ -434,30 +501,63 @@ final class MetalHostView: NSView {
     // MARK: Mouse (keys go through InputForwarder's event monitor)
 
     override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        // Tracking areas aren't covered by overlays: this sees moves over the session control too.
+        session?.sessionControl.pointerMoved(to: CGPoint(x: point.x, y: bounds.height - point.y))
         guard controlling else { return super.mouseMoved(with: event) }
-        input.mouseMoved(event)
-        // Hidden while the remote user types: show it again as soon as the mouse moves (hidden
-        // again if the host doesn't confirm).
-        if session?.cursor.state == .hidden { session?.cursor.unhide() }
-        showRemoteCursor(at: convert(event.locationInWindow, from: nil))
+        // Over the session control the remote pointer stays where it left the picture.
+        if !overSessionControl(point) {
+            input.mouseMoved(event)
+            // Hidden while the remote user types: show it again as soon as the mouse moves
+            // (hidden again if the host doesn't confirm).
+            if session?.cursor.state == .hidden { session?.cursor.unhide() }
+        }
+        showRemoteCursor(at: point)
     }
-    override func mouseDragged(with event: NSEvent) { controlling ? input.mouseMoved(event) : super.mouseDragged(with: event) }
-    override func rightMouseDragged(with event: NSEvent) { controlling ? input.mouseMoved(event) : super.rightMouseDragged(with: event) }
-    override func otherMouseDragged(with event: NSEvent) { controlling ? input.mouseMoved(event) : super.otherMouseDragged(with: event) }
-    override func mouseDown(with event: NSEvent) { controlling ? input.mouseButton(event, down: true) : super.mouseDown(with: event) }
+    override func mouseExited(with event: NSEvent) {
+        session?.sessionControl.pointerMoved(to: nil)
+        super.mouseExited(with: event)
+    }
+    override func mouseDragged(with event: NSEvent) { controlling ? drag(event) : super.mouseDragged(with: event) }
+    override func rightMouseDragged(with event: NSEvent) { controlling ? drag(event) : super.rightMouseDragged(with: event) }
+    override func otherMouseDragged(with event: NSEvent) { controlling ? drag(event) : super.otherMouseDragged(with: event) }
+    override func mouseDown(with event: NSEvent) { controlling ? press(event) : super.mouseDown(with: event) }
     override func mouseUp(with event: NSEvent) { controlling ? input.mouseButton(event, down: false) : super.mouseUp(with: event) }
-    override func rightMouseDown(with event: NSEvent) { controlling ? input.mouseButton(event, down: true) : super.rightMouseDown(with: event) }
+    override func rightMouseDown(with event: NSEvent) { controlling ? press(event) : super.rightMouseDown(with: event) }
     override func rightMouseUp(with event: NSEvent) { controlling ? input.mouseButton(event, down: false) : super.rightMouseUp(with: event) }
-    override func otherMouseDown(with event: NSEvent) { controlling ? input.mouseButton(event, down: true) : super.otherMouseDown(with: event) }
+    override func otherMouseDown(with event: NSEvent) { controlling ? press(event) : super.otherMouseDown(with: event) }
     override func otherMouseUp(with event: NSEvent) { controlling ? input.mouseButton(event, down: false) : super.otherMouseUp(with: event) }
-    override func scrollWheel(with event: NSEvent) { controlling ? input.scroll(event) : super.scrollWheel(with: event) }
-    // Gestures can't be reproduced on the remote Mac; don't let them act here either.
-    override func magnify(with event: NSEvent) { if !controlling { super.magnify(with: event) } }
-    override func rotate(with event: NSEvent) { if !controlling { super.rotate(with: event) } }
-    override func smartMagnify(with event: NSEvent) { if !controlling { super.smartMagnify(with: event) } }
-    override func swipe(with event: NSEvent) { if !controlling { super.swipe(with: event) } }
+    override func scrollWheel(with event: NSEvent) {
+        guard controlling else { return super.scrollWheel(with: event) }
+        if !overSessionControl(event) { input.scroll(event) }
+    }
+    // Pinch, rotate, smart zoom and page swipes act on the remote Mac (or nowhere), never here.
+    override func magnify(with event: NSEvent) { controlling ? gesture(event) : super.magnify(with: event) }
+    override func rotate(with event: NSEvent) { controlling ? gesture(event) : super.rotate(with: event) }
+    override func smartMagnify(with event: NSEvent) { controlling ? gesture(event) : super.smartMagnify(with: event) }
+    override func swipe(with event: NSEvent) { controlling ? gesture(event) : super.swipe(with: event) }
     // Ctrl-click is a click with Control held, for the remote Mac to interpret.
     override func menu(for event: NSEvent) -> NSMenu? { controlling ? nil : super.menu(for: event) }
+
+    /// A press while controlling: none goes remote next to the session control (its margin), and
+    /// while released, one on the screen takes the keyboard and mouse back instead.
+    private func press(_ event: NSEvent) {
+        if overSessionControl(event) || input.resumeOnClick(event) { return }
+        input.mouseButton(event, down: true)
+    }
+
+    /// A drag on the remote screen goes on even across the session control; without a button
+    /// pressed on the screen it's only a move, which stops at the control like other moves.
+    private func drag(_ event: NSEvent) {
+        if !input.holdsButtons && overSessionControl(event) { return }
+        input.mouseMoved(event)
+    }
+
+    /// A gesture while controlling goes to the remote Mac with Send Trackpad Gestures on, unless
+    /// it starts on the session control.
+    private func gesture(_ event: NSEvent) {
+        input.gesture(event, mayBegin: TrackpadGestures.enabled && !overSessionControl(event))
+    }
 
     // MARK: Cursor
 
@@ -465,13 +565,19 @@ final class MetalHostView: NSView {
         showRemoteCursor(at: convert(event.locationInWindow, from: nil))
     }
 
-    /// Over the picture while controlling: the remote Mac's cursor. Elsewhere: the arrow.
+    /// Over the picture while input goes there: the remote Mac's cursor. Elsewhere, or released
+    /// (the host draws its cursor in the video then): the arrow.
     private func showRemoteCursor(at point: NSPoint? = nil) {
         guard let window, window.isKeyWindow else { return }
         let p = point ?? convert(window.mouseLocationOutsideOfEventStream, from: nil)
         guard bounds.contains(p) else { return }
-        if controlling, let cursor = session?.cursor.current, input.pictureRect()?.contains(p) ?? true {
-            if NSCursor.current !== cursor { cursor.set() }
+        let remote = session?.cursor.current
+        if overSessionControl(p) {
+            // This Mac's pointer on the control, never the remote one (it may be invisible). The
+            // control sets its own hand over the grip, so only replace what was set here.
+            if let remote, NSCursor.current === remote { NSCursor.arrow.set() }
+        } else if input.isForwarding, let remote, input.pictureRect()?.contains(p) ?? true {
+            if NSCursor.current !== remote { remote.set() }
         } else if NSCursor.current !== NSCursor.arrow {
             NSCursor.arrow.set()
         }
@@ -483,6 +589,7 @@ final class MetalHostView: NSView {
             detach()
         } else {
             presentation = ImmersivePresentation(window: window!)
+            session?.sessionControl.attach(forwarder: input, window: window)
             updateScale()
             sizeChanged()
         }
@@ -519,6 +626,7 @@ final class MetalHostView: NSView {
 
     private func sizeChanged() {
         guard window != nil, bounds.width > 0, bounds.height > 0 else { return }
+        input.pictureMoved()
         let (w, h) = pixelSize
         if attached {
             lk_resize_view(sessionId, w, h)

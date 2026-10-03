@@ -290,20 +290,24 @@ pub unsafe extern "C" fn lk_input_scroll(session: u64, scroll: *const LkScroll) 
 /// velocities (129, 130); `inverted` (136). Anything else is ignored.
 #[unsafe(no_mangle)]
 pub extern "C" fn lk_input_dock_swipe(session: u64, axis: u8, phase: u8, progress: f64, velocity_x: f64, velocity_y: f64, inverted: bool) {
-    let (Some(axis), Some(phase)) = (DockAxis::from_motion(axis), GesturePhase::from_bits(phase)) else { return };
+    if let Some(msg) = dock_swipe(axis, phase, progress, velocity_x, velocity_y, inverted) {
+        send(session, msg);
+    }
+}
+
+/// `lk_input_dock_swipe`'s message; None for an axis or phase code it doesn't know.
+fn dock_swipe(axis: u8, phase: u8, progress: f64, velocity_x: f64, velocity_y: f64, inverted: bool) -> Option<InputMsg> {
+    let (axis, phase) = (DockAxis::from_motion(axis)?, GesturePhase::from_bits(phase)?);
     // To the wire's direction convention (see `GestureInput::DockSwipe`).
     let direction = platform_mac::gesture::dock_direction(axis);
-    send(
-        session,
-        InputMsg::Gesture(GestureInput::DockSwipe {
-            axis,
-            phase,
-            progress: (progress * direction) as f32,
-            velocity_x: (velocity_x * direction) as f32,
-            velocity_y: (velocity_y * direction) as f32,
-            inverted,
-        }),
-    );
+    Some(InputMsg::Gesture(GestureInput::DockSwipe {
+        axis,
+        phase,
+        progress: (progress * direction) as f32,
+        velocity_x: (velocity_x * direction) as f32,
+        velocity_y: (velocity_y * direction) as f32,
+        inverted,
+    }))
 }
 
 /// Pinch to zoom at `x`, `y`: `delta` as `NSEvent.magnification`. `phase` as for
@@ -414,7 +418,7 @@ pub extern "C" fn lk_control_permission() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::pos;
+    use super::*;
 
     #[test]
     fn positions_quantize_and_clamp() {
@@ -424,5 +428,58 @@ mod tests {
         assert_eq!(pos(-1.0), 0);
         assert_eq!(pos(7.0), u16::MAX);
         assert_eq!(pos(f64::NAN), 0);
+    }
+
+    /// The value of `#define name` in lankvm.h, which Swift passes through as it is.
+    fn header_code(name: &str) -> u16 {
+        let header = include_str!("../../../macos/Sources/CLanKVM/include/lankvm.h");
+        let line = header.lines().find(|l| l.split_whitespace().nth(1) == Some(name)).unwrap_or_else(|| panic!("no {name} in lankvm.h"));
+        line.split_whitespace().nth(2).and_then(|v| v.parse().ok()).unwrap_or_else(|| panic!("bad {line:?}"))
+    }
+
+    #[test]
+    fn header_codes_mean_what_the_core_reads() {
+        let phases = [
+            ("LK_PHASE_BEGAN", GesturePhase::Began),
+            ("LK_PHASE_CHANGED", GesturePhase::Changed),
+            ("LK_PHASE_ENDED", GesturePhase::Ended),
+            ("LK_PHASE_CANCELLED", GesturePhase::Cancelled),
+        ];
+        for (name, phase) in phases {
+            assert_eq!(GesturePhase::from_bits(header_code(name) as u8), Some(phase), "{name}");
+        }
+        let axes = [("LK_DOCK_HORIZONTAL", DockAxis::Horizontal), ("LK_DOCK_VERTICAL", DockAxis::Vertical), ("LK_DOCK_PINCH", DockAxis::Pinch)];
+        for (name, axis) in axes {
+            assert_eq!(DockAxis::from_motion(header_code(name) as u8), Some(axis), "{name}");
+        }
+        let actions = [
+            ("LK_SYSTEM_MISSION_CONTROL", SystemAction::MISSION_CONTROL),
+            ("LK_SYSTEM_APP_EXPOSE", SystemAction::APP_EXPOSE),
+            ("LK_SYSTEM_SHOW_DESKTOP", SystemAction::SHOW_DESKTOP),
+            ("LK_SYSTEM_LAUNCHPAD", SystemAction::LAUNCHPAD),
+            ("LK_SYSTEM_PREVIOUS_SPACE", SystemAction::PREVIOUS_SPACE),
+            ("LK_SYSTEM_NEXT_SPACE", SystemAction::NEXT_SPACE),
+        ];
+        for (name, action) in actions {
+            assert_eq!(SystemAction(header_code(name)), action, "{name}");
+        }
+    }
+
+    #[test]
+    fn dock_swipes_take_trackpad_codes_and_values() {
+        let factor = platform_mac::gesture::dock_direction(DockAxis::Vertical);
+        let Some(InputMsg::Gesture(GestureInput::DockSwipe { axis, phase, progress, velocity_x, velocity_y, inverted })) =
+            dock_swipe(2, 4, 0.5, 0.25, -3.0, true)
+        else {
+            panic!("not a dock swipe")
+        };
+        assert_eq!((axis, phase, inverted), (DockAxis::Vertical, GesturePhase::Ended, true));
+        assert_eq!((progress, velocity_x, velocity_y), ((0.5 * factor) as f32, (0.25 * factor) as f32, (-3.0 * factor) as f32));
+        assert_eq!(dock_swipe(0, 1, 0.0, 0.0, 0.0, false), None, "no such axis");
+        assert_eq!(dock_swipe(4, 1, 0.0, 0.0, 0.0, false), None, "no such axis");
+        // NSEvent.Phase raw values that aren't IOHID phase bits: mayBegin (32) and cancelled (16).
+        assert_eq!(dock_swipe(1, 32, 0.0, 0.0, 0.0, false), None);
+        assert_eq!(dock_swipe(1, 16, 0.0, 0.0, 0.0, false), None);
+        assert_eq!(dock_swipe(1, 0, 0.0, 0.0, 0.0, false), None);
     }
 }

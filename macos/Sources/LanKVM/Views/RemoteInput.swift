@@ -1,3 +1,4 @@
+import Accessibility
 import AppKit
 import CLanKVM
 
@@ -10,18 +11,29 @@ import CLanKVM
 ///
 /// Keys travel as virtual key codes, so the remote Mac's layout and input method produce the
 /// characters. Modifiers travel as state (left/right, Caps Lock, fn), re-sent whenever it changes.
-/// Pressing and releasing ⌃⌥⌘ together, with no other key, stops controlling.
+///
+/// Pressing and releasing ⌃⌥⌘ together, with no other key, releases: control stays, but this
+/// Mac gets its keyboard and mouse back until the user resumes (the chord again, a click on the
+/// screen, or the session control's Resume). Focus changes pause forwarding the same way, but
+/// coming back resumes by itself; after a release it doesn't.
 @MainActor
 final class InputForwarder {
     let sessionId: UInt64
     private weak var view: NSView?
     private var session: SessionModel?
 
-    /// True while input goes to the remote Mac: controlling, and this window has the focus.
+    /// True while input goes to the remote Mac: controlling, this window has the focus, and the
+    /// user hasn't released.
     private(set) var isForwarding = false
+    /// The user gave this Mac's keyboard and mouse back (`release()`) while keeping control.
+    /// Nothing is forwarded until `resume()`; cleared when control ends.
+    private(set) var userReleased = false
     /// Remote video size in pixels, for mapping positions.
-    var frameSize = CGSize(width: 1, height: 1)
-    /// Called when the user presses the ⌃⌥⌘ chord (switches between viewing and controlling).
+    var frameSize = CGSize(width: 1, height: 1) {
+        didSet { if frameSize != oldValue { pictureMoved() } }
+    }
+    /// Called when the user presses the ⌃⌥⌘ chord while not controlling: asks for control (or,
+    /// while asking, goes back to viewing).
     var onEscape: (() -> Void)?
     /// Called whenever forwarding starts (true) or stops (false), for whatever reason.
     var onForwardingChanged: ((Bool) -> Void)?
@@ -42,6 +54,9 @@ final class InputForwarder {
     private var fnHeld = false
     private var chord = ChordState.idle
     private var lastPosition = CGPoint(x: 0.5, y: 0.5)
+    /// The gesture in progress on the remote Mac (it takes one at a time, like a trackpad), with a
+    /// Dock swipe's latest values, which cancelling it repeats.
+    private var gesture: RemoteGesture?
     /// Proves to the host, from this (UI) thread, that we're alive while anything is held.
     private var heartbeat: Timer?
     /// No forwarding while the display or the Mac sleeps, the screen is locked, or another user
@@ -55,6 +70,11 @@ final class InputForwarder {
     /// The chord counts only if released this soon after all three keys went down.
     private static let chordWindow: TimeInterval = 0.6
 
+    private enum RemoteGesture: Equatable {
+        case magnify, rotate
+        case dock(axis: UInt8, progress: Double, inverted: Bool)
+    }
+
     init(sessionId: UInt64, view: NSView) {
         self.sessionId = sessionId
         self.view = view
@@ -63,10 +83,11 @@ final class InputForwarder {
     func attach(to session: SessionModel) {
         self.session = session
         guard monitor == nil else { return }
+        // Gestures too: only what passes here is recognised as our own host's echo (same Mac).
         let mask: NSEvent.EventTypeMask = [
             .keyDown, .keyUp, .flagsChanged, .mouseMoved, .leftMouseDown, .leftMouseUp, .leftMouseDragged,
             .rightMouseDown, .rightMouseUp, .rightMouseDragged, .otherMouseDown, .otherMouseUp, .otherMouseDragged,
-            .scrollWheel,
+            .scrollWheel, .magnify, .rotate, .smartMagnify, .swipe,
         ]
         // Local monitors run on the main thread, inside -[NSApplication sendEvent:], before the
         // event is routed to menus or windows. Returning nil drops it.
@@ -114,17 +135,34 @@ final class InputForwarder {
                 DispatchQueue.main.async { [weak self] in MainActor.assumeIsolated { self?.update() } }
             }
         })
-        // The Control menu's "Send System Shortcuts to Remote Mac" applies right away.
+        // The Control menu's "Send System Shortcuts" and "Send Trackpad Gestures" apply right away.
         observers.append(center.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.isForwarding else { return }
                 SystemShortcuts.capture(SystemShortcuts.enabled, owner: self)
+                self.armDockGestures()
             }
         })
+        // Dock gestures are taken where the picture is: follow it.
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification, NSWindow.didChangeScreenNotification,
+                     NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification,
+                     NSApplication.didChangeScreenParametersNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if let window = note.object as? NSWindow, window !== self.view?.window { return }
+                    self.pictureMoved()
+                }
+            })
+        }
     }
 
     func detach() {
         stop()
+        if userReleased {
+            userReleased = false
+            publishState()
+        }
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
         for o in observers {
@@ -142,7 +180,12 @@ final class InputForwarder {
             stop()
             return
         }
-        let should = session.isControlling && NSApp.isActive && window.isKeyWindow && window.isOnActiveSpace
+        // Viewing again (or refused): a later grant starts afresh, not released.
+        if userReleased && !session.isControlling {
+            userReleased = false
+            publishState()
+        }
+        let should = session.isControlling && !userReleased && NSApp.isActive && window.isKeyWindow && window.isOnActiveSpace
             && window.attachedSheet == nil && NSApp.modalWindow == nil
             && !displayAsleep && !systemAsleep && !locked && !switchedOut
         if should && !isForwarding {
@@ -172,8 +215,11 @@ final class InputForwarder {
         }
         RunLoop.main.add(timer, forMode: .common)
         heartbeat = timer
+        gesture = nil
+        armDockGestures()
         lk_set_focus(sessionId, true)
         onForwardingChanged?(true)
+        publishState()
     }
 
     /// Stops forwarding and lets go of everything on the remote Mac.
@@ -181,9 +227,12 @@ final class InputForwarder {
         guard isForwarding else { return }
         isForwarding = false
         SystemShortcuts.capture(false, owner: self)
+        DockGestures.disarm(self)
         heartbeat?.invalidate()
         heartbeat = nil
+        // Ends a gesture in progress there too (the host cancels it).
         lk_input_release_all(sessionId)
+        gesture = nil
         // Still controlling, just not focused: the host shows its cursor in the video meanwhile.
         if session?.isControlling == true {
             lk_set_focus(sessionId, false)
@@ -194,10 +243,62 @@ final class InputForwarder {
         sentDepth = nil
         chord = .idle
         onForwardingChanged?(false)
+        publishState()
+    }
+
+    /// Gives this Mac its keyboard and mouse back (⌘Tab, menu bar, Dock and gestures included)
+    /// while keeping control: everything held on the remote Mac is let go, and its cursor goes
+    /// back into the video. Window focus coming and going doesn't undo it; `resume()` does.
+    func release() {
+        guard session?.isControlling == true, !userReleased else { return }
+        userReleased = true
+        stop()
+        publishState()
+        session?.showToast("Released · click the screen or press ⌃⌥⌘ to control again")
+    }
+
+    /// Takes the keyboard and mouse back after `release()`: forwarding starts at once if this
+    /// window has the focus, otherwise as soon as it gets it.
+    func resume() {
+        guard userReleased else { return }
+        userReleased = false
+        update()
+        publishState()
+        if let session, session.isControlling {
+            AccessibilityNotification.Announcement("Controlling \(session.hostName)").post()
+        }
+    }
+
+    /// Runs an action on the remote Mac as a whole (Mission Control, Spaces...) from a menu.
+    /// Also while released: it's a click on this Mac's own controls, and holds nothing there.
+    func perform(_ action: RemoteAction) {
+        guard session?.isControlling == true else { return }
+        // Chosen here, so not relayed from a Mac controlling this one.
+        sendDepth(0)
+        lk_input_system_action(sessionId, action.code)
+    }
+
+    /// A press on the remote screen while released takes the keyboard and mouse back; the press
+    /// itself isn't sent (like the click that brings the window to the front). Returns whether
+    /// it did.
+    func resumeOnClick(_ event: NSEvent) -> Bool {
+        guard userReleased, session?.isControlling == true, distanceOutsidePicture(event) <= Self.edgeSlop else { return false }
+        resume()
+        return true
+    }
+
+    /// A button pressed on the remote screen is still down: a remote drag goes on, even across
+    /// the session control.
+    var holdsButtons: Bool { !downButtons.isEmpty }
+
+    /// Lets the session control show what input does now (it publishes a moment later).
+    private func publishState() {
+        session?.sessionControl.inputChanged(forwarding: isForwarding, released: userReleased)
     }
 
     private func beat() {
         let holding = !downKeys.isEmpty || !downButtons.isEmpty || (sentModifiers ?? 0) & ~Modifiers.capsLock != 0
+            || gesture != nil
         if isForwarding && holding {
             lk_input_heartbeat(sessionId)
         }
@@ -224,11 +325,16 @@ final class InputForwarder {
         // Injected by a LanKVM host: a Mac controlling this one is typing and clicking here.
         let injected = userData >> 32 == Self.injectedTagPrefix
         guard isForwarding else {
-            // Viewing: the same chord switches to Control. Not a controlling Mac's chord: that
-            // one is for its own window, which acts on it.
+            // Released (or paused with this window in front): the chord takes the keyboard and
+            // mouse back. Viewing: it asks for control. Not a controlling Mac's chord: that one
+            // is for its own window, which acts on it.
             if !injected {
                 if event.type == .flagsChanged, updateChord(event) {
-                    onEscape?()
+                    if session?.isControlling == true {
+                        resume()
+                    } else {
+                        onEscape?()
+                    }
                 } else if event.type == .keyDown || event.type == .leftMouseDown {
                     spoilChord(event)
                 }
@@ -268,8 +374,7 @@ final class InputForwarder {
                 fnHeld = event.modifierFlags.contains(.function)
             }
             if !injected && updateChord(event) {
-                stop()
-                onEscape?()
+                release()
                 return nil
             }
             relay(event)
@@ -334,6 +439,122 @@ final class InputForwarder {
         lk_input_scroll(sessionId, &scroll)
     }
 
+    // MARK: Gestures
+
+    /// Pinch, rotation, smart zoom or a page swipe over the remote screen. `mayBegin`: whether one
+    /// may start here (the setting is on and the pointer isn't on the session control); one that
+    /// started goes on to its end.
+    func gesture(_ event: NSEvent, mayBegin: Bool) {
+        guard isForwarding else { return }
+        switch event.type {
+        case .magnify, .rotate:
+            guard let phase = Self.gesturePhase(event.phase) else { return }
+            let kind: RemoteGesture = event.type == .magnify ? .magnify : .rotate
+            if phase == LK_PHASE_BEGAN {
+                // A rotation starting during a pinch (or the other way round) stays out of it, as
+                // the remote Mac takes one gesture at a time. A new pinch while one seems to go on:
+                // that one's end was missed, and the host ends it.
+                guard mayBegin, gesture == nil || gesture == kind else { return }
+                gesture = kind
+            } else {
+                guard gesture == kind else { return }
+                if phase == LK_PHASE_ENDED || phase == LK_PHASE_CANCELLED { gesture = nil }
+            }
+            relay(event)
+            syncModifiers(event.modifierFlags)
+            let p = position(of: event)
+            if kind == .magnify {
+                lk_input_magnify(sessionId, p.x, p.y, phase, event.magnification)
+            } else {
+                lk_input_rotate(sessionId, p.x, p.y, phase, Double(event.rotation))
+            }
+        case .smartMagnify, .swipe:
+            guard mayBegin else { return }
+            relay(event)
+            syncModifiers(event.modifierFlags)
+            let p = position(of: event)
+            if event.type == .smartMagnify {
+                lk_input_smart_magnify(sessionId, p.x, p.y)
+            } else {
+                lk_input_navigation_swipe(sessionId, p.x, p.y, Self.direction(event.deltaX), Self.direction(event.deltaY))
+            }
+        default:
+            break
+        }
+    }
+
+    /// A Dock swipe or pinch that DockGestures took from this Mac's Dock for this window.
+    func dockSwipe(_ sample: DockSwipeSample) {
+        guard isForwarding else { return }
+        // From the very Mac this window controls: it would bounce between the two (as in `filter`).
+        if sample.depth > 0, let session, !session.hostId.isEmpty, CoreModel.shared.host.controller?.deviceId == session.hostId {
+            return
+        }
+        if sample.phase != LK_PHASE_BEGAN {
+            guard case .dock(let axis, _, _) = gesture, axis == sample.axis else { return }
+        }
+        // A Dock swipe beginning ends whatever gesture was in progress (the host cancels it).
+        let ends = sample.phase == LK_PHASE_ENDED || sample.phase == LK_PHASE_CANCELLED
+        gesture = ends ? nil : .dock(axis: sample.axis, progress: sample.progress, inverted: sample.inverted)
+        sendDepth(sample.depth)
+        lk_input_dock_swipe(sessionId, sample.axis, sample.phase, sample.progress, sample.velocityX, sample.velocityY,
+                            sample.inverted)
+    }
+
+    /// DockGestures lost track of the Dock swipe it was sending (its tap was turned off for a
+    /// moment): end it there, where the Dock snaps back.
+    func cancelDockSwipe() {
+        guard isForwarding, case .dock(let axis, let progress, let inverted) = gesture else { return }
+        gesture = nil
+        lk_input_dock_swipe(sessionId, axis, UInt8(LK_PHASE_CANCELLED), progress, 0, 0, inverted)
+    }
+
+    /// Dock gestures that begin over the picture go to the remote Mac too while forwarding, with
+    /// the setting on (and Accessibility, which DockGestures checks). Never on the same Mac: the
+    /// host would hand them straight back to this Mac's Dock.
+    private func armDockGestures() {
+        guard isForwarding, TrackpadGestures.enabled, let session, !session.sameMachine, let area = gestureArea() else {
+            DockGestures.disarm(self)
+            return
+        }
+        DockGestures.arm(self, area: area, injectedTag: session.injectedTag)
+    }
+
+    /// The picture moved or changed size (window moved or resized, full screen, another remote
+    /// resolution): Dock gestures count over its new place.
+    func pictureMoved() {
+        guard isForwarding, let area = gestureArea() else { return }
+        DockGestures.update(area: area, for: self)
+    }
+
+    /// Where a Dock gesture must begin to go to the remote Mac, in global display coordinates
+    /// (points, top-left origin of the main display): over the picture, or anywhere on the screen
+    /// in full screen.
+    private func gestureArea() -> CGRect? {
+        guard let view, let window = view.window, let main = NSScreen.screens.first else { return nil }
+        let rect = window.styleMask.contains(.fullScreen)
+            ? window.frame
+            : window.convertToScreen(view.convert(pictureRect() ?? view.bounds, to: nil))
+        return CGRect(x: rect.minX, y: main.frame.maxY - rect.maxY, width: rect.width, height: rect.height)
+    }
+
+    /// LK_PHASE_* for an NSEvent phase (they number phases differently); nil for the ones the host
+    /// doesn't take (may begin, stationary).
+    nonisolated static func gesturePhase(_ phase: NSEvent.Phase) -> UInt8? {
+        switch phase {
+        case .began: UInt8(LK_PHASE_BEGAN)
+        case .changed: UInt8(LK_PHASE_CHANGED)
+        case .ended: UInt8(LK_PHASE_ENDED)
+        case .cancelled: UInt8(LK_PHASE_CANCELLED)
+        default: nil
+        }
+    }
+
+    /// A page swipe's direction along one axis: -1, 0 or 1.
+    private static func direction(_ delta: CGFloat) -> Int8 {
+        delta > 0 ? 1 : delta < 0 ? -1 : 0
+    }
+
     // MARK: Helpers
 
     /// Tells the host, when it changes, how many LanKVM hosts the input it gets next has passed
@@ -341,7 +562,10 @@ final class InputForwarder {
     /// this one injected it. Hosts drop input that went around a loop of Macs.
     private func relay(_ event: NSEvent) {
         let userData = event.cgEvent?.getIntegerValueField(.eventSourceUserData) ?? 0
-        let depth: UInt8 = userData >> 32 == Self.injectedTagPrefix ? UInt8(clamping: ((userData & Self.relayDepthMask) >> 24) + 1) : 0
+        sendDepth(userData >> 32 == Self.injectedTagPrefix ? UInt8(clamping: ((userData & Self.relayDepthMask) >> 24) + 1) : 0)
+    }
+
+    private func sendDepth(_ depth: UInt8) {
         if depth != sentDepth {
             sentDepth = depth
             lk_input_relayed(sessionId, depth)
@@ -443,11 +667,22 @@ final class InputForwarder {
 /// How often the UI thread tells the host it's alive while holding input (protocol constant).
 private let HEARTBEAT_MS = 250
 
+/// User setting: whether trackpad gestures go to the remote Mac while controlling it (pinch,
+/// rotate, smart zoom, swipes, and with Accessibility the Dock's Mission Control and Spaces
+/// swipes). Off, they act on this Mac as before.
+enum TrackpadGestures {
+    static let defaultsKey = "sendTrackpadGestures"
+
+    static var enabled: Bool {
+        UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? true
+    }
+}
+
 extension InputForwarder {
     /// High half of the source user data of every event a LanKVM host injects ("LKVM"); below
     /// it, 8 bits of relay depth, then the host's own 24 bits (crates/platform-mac inject.rs).
-    static let injectedTagPrefix: Int64 = 0x4C4B564D
-    static let relayDepthMask: Int64 = 0xFF << 24
+    nonisolated static let injectedTagPrefix: Int64 = 0x4C4B564D
+    nonisolated static let relayDepthMask: Int64 = 0xFF << 24
 }
 
 /// Modifier bits of `CGEventFlags` / `NSEvent.ModifierFlags` (IOLLEvent.h), as the core expects.

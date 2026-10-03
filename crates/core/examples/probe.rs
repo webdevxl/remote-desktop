@@ -29,6 +29,15 @@
 //!   {"text":"Hello, world"}  {"hold":"a","ms":1500,"heartbeat":true}  {"sleep":100}
 //!   {"release":true}  {"control":false}  {"disconnect":true}  {"relayed":1} (input as if relayed)
 //!   {"assert_idle":true}   fails unless this Mac holds no modifier or mouse button now
+//! Trackpad gestures (updates 16 ms apart, like a trackpad's):
+//!   {"pinch":[x,y],"amount":0.5,"steps":8}    magnify began, changed ×steps (to 1.5×), ended
+//!   {"rotate":[x,y],"degrees":45,"steps":8}   counterclockwise positive
+//!   {"smart_magnify":[x,y]}  {"swipe":[x,y],"dx":-1,"dy":0} (swipe between pages)
+//!   {"dock":"vertical","to":1.0,"steps":10,"velocity":2.0,"end":"ended"}   a swipe the Dock acts
+//!       on: horizontal, vertical or pinch; progress in the wire's convention (+ is right, Mission
+//!       Control); "end" is ended, cancelled or none (leave it hanging, e.g. to test silence)
+//!   {"system":"mission_control"}   also app_expose, show_desktop, launchpad, previous_space,
+//!       next_space
 //!
 //! `--input-latency N` clicks the middle of `--rect` (for example LanKVM Input Lab's patch,
 //! which flips between black and white on every click) N times and times each click until the
@@ -42,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use lankvm_core::{Core, Event};
 use platform_mac::clock;
-use protocol::{InputMsg, POS_MAX, ScrollInput};
+use protocol::{DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction};
 use serde_json::Value;
 
 /// Long enough for someone to read the PIN off the host (which allows 120 s).
@@ -462,6 +471,13 @@ impl Probe {
         } else if step.get("disconnect").is_some() {
             self.core.disconnect(self.id);
             std::thread::sleep(Duration::from_millis(300));
+        } else if let Some(msgs) = gesture_step(step, &at)? {
+            for (i, msg) in msgs.into_iter().enumerate() {
+                if i > 0 {
+                    std::thread::sleep(GESTURE_UPDATE_INTERVAL);
+                }
+                self.send(msg);
+            }
         } else {
             return Err(format!("unknown step {step}"));
         }
@@ -618,6 +634,83 @@ impl Probe {
     }
 }
 
+/// Between a gesture's updates, as from a trackpad.
+const GESTURE_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
+
+/// The messages of a trackpad gesture step (see the doc at the top), or None if `step` isn't
+/// one. `at` turns a step's position into the wire's.
+fn gesture_step(step: &Value, at: &dyn Fn(&Value) -> Result<(u16, u16), String>) -> Result<Option<Vec<InputMsg>>, String> {
+    use GesturePhase::{Began, Cancelled, Changed, Ended};
+    let steps = step.get("steps").and_then(Value::as_u64).unwrap_or(8).max(1);
+    let number = |key: &str, default: f64| step.get(key).and_then(Value::as_f64).unwrap_or(default);
+    let msgs = if let Some(p) = step.get("pinch") {
+        let (x, y) = at(p)?;
+        let amount = number("amount", 0.5);
+        if amount <= -1.0 {
+            return Err("pinch amount must be above -1 (it scales by 1 + amount)".into());
+        }
+        // Magnifications compose: each step scales by the same factor.
+        let delta = ((1.0 + amount).powf(1.0 / steps as f64) - 1.0) as f32;
+        let pinch = |phase, delta| InputMsg::Gesture(GestureInput::Magnify { x, y, phase, delta });
+        phased(pinch(Began, 0.0), (0..steps).map(|_| pinch(Changed, delta)), Some(pinch(Ended, 0.0)))
+    } else if let Some(p) = step.get("rotate") {
+        let (x, y) = at(p)?;
+        let per_step = (number("degrees", 45.0) / steps as f64) as f32;
+        let turn = |phase, degrees| InputMsg::Gesture(GestureInput::Rotate { x, y, phase, degrees });
+        phased(turn(Began, 0.0), (0..steps).map(|_| turn(Changed, per_step)), Some(turn(Ended, 0.0)))
+    } else if let Some(p) = step.get("smart_magnify") {
+        let (x, y) = at(p)?;
+        vec![InputMsg::Gesture(GestureInput::SmartMagnify { x, y })]
+    } else if let Some(p) = step.get("swipe") {
+        let (x, y) = at(p)?;
+        let direction = |key| step.get(key).and_then(Value::as_i64).unwrap_or(0).signum() as i8;
+        let (dx, dy) = (direction("dx"), direction("dy"));
+        if (dx, dy) == (0, 0) {
+            return Err("swipe needs dx or dy".into());
+        }
+        vec![InputMsg::Gesture(GestureInput::NavigationSwipe { x, y, dx, dy })]
+    } else if let Some(axis) = step.get("dock") {
+        let axis = match axis.as_str() {
+            Some("horizontal") => DockAxis::Horizontal,
+            Some("vertical") => DockAxis::Vertical,
+            Some("pinch") => DockAxis::Pinch,
+            _ => return Err(format!("dock needs horizontal, vertical or pinch, not {axis}")),
+        };
+        let to = number("to", 1.0);
+        let velocity = number("velocity", 0.0) as f32;
+        let swipe = |phase, progress: f64, velocity: f32| {
+            // A horizontal swipe's exit velocity is along x; the others' along y.
+            let (velocity_x, velocity_y) = if axis == DockAxis::Horizontal { (velocity, 0.0) } else { (0.0, velocity) };
+            InputMsg::Gesture(GestureInput::DockSwipe { axis, phase, progress: progress as f32, velocity_x, velocity_y, inverted: false })
+        };
+        let end = match step.get("end").and_then(Value::as_str).unwrap_or("ended") {
+            "ended" => Some(swipe(Ended, to, velocity)),
+            "cancelled" => Some(swipe(Cancelled, to, 0.0)),
+            "none" => None,
+            other => return Err(format!("dock end is ended, cancelled or none, not {other:?}")),
+        };
+        phased(swipe(Began, 0.0, 0.0), (1..=steps).map(|i| swipe(Changed, to * i as f64 / steps as f64, 0.0)), end)
+    } else if let Some(name) = step.get("system") {
+        let action = match name.as_str() {
+            Some("mission_control") => SystemAction::MISSION_CONTROL,
+            Some("app_expose") => SystemAction::APP_EXPOSE,
+            Some("show_desktop") => SystemAction::SHOW_DESKTOP,
+            Some("launchpad") => SystemAction::LAUNCHPAD,
+            Some("previous_space") => SystemAction::PREVIOUS_SPACE,
+            Some("next_space") => SystemAction::NEXT_SPACE,
+            _ => return Err(format!("unknown system action {name}")),
+        };
+        vec![InputMsg::System(action)]
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(msgs))
+}
+
+fn phased(began: InputMsg, changes: impl Iterator<Item = InputMsg>, end: Option<InputMsg>) -> Vec<InputMsg> {
+    std::iter::once(began).chain(changes).chain(end).collect()
+}
+
 fn norm(v: f64, size: f64) -> u16 {
     ((v / size).clamp(0.0, 1.0) * f64::from(POS_MAX)).round() as u16
 }
@@ -719,5 +812,63 @@ mod tests {
         assert_eq!(key_of(&Value::from("~")).unwrap(), (50, true));
         assert_eq!(key_of(&Value::from("?")).unwrap(), (44, true));
         assert_eq!(key_of(&Value::from(36)).unwrap(), (36, false));
+    }
+
+    fn gesture(step: &str) -> Result<Option<Vec<InputMsg>>, String> {
+        gesture_step(&serde_json::from_str(step).unwrap(), &|_| Ok((100, 200)))
+    }
+
+    fn phases(msgs: &[InputMsg]) -> Vec<GesturePhase> {
+        msgs.iter().filter_map(|m| if let InputMsg::Gesture(g) = m { g.phase() } else { None }).collect()
+    }
+
+    #[test]
+    fn pinch_and_rotate_steps_add_up_to_the_whole_gesture() {
+        use GesturePhase::*;
+        let pinch = gesture(r#"{"pinch":"patch","amount":0.5,"steps":8}"#).unwrap().unwrap();
+        assert_eq!(phases(&pinch), [[Began].as_slice(), &[Changed; 8], &[Ended]].concat());
+        let scale: f64 = pinch.iter().map(|m| if let InputMsg::Gesture(GestureInput::Magnify { delta, .. }) = m { 1.0 + f64::from(*delta) } else { 1.0 }).product();
+        assert!((scale - 1.5).abs() < 1e-4, "{scale}");
+        assert!(matches!(pinch[3], InputMsg::Gesture(GestureInput::Magnify { x: 100, y: 200, .. })));
+        let turn = gesture(r#"{"rotate":"patch","degrees":45,"steps":9}"#).unwrap().unwrap();
+        let degrees: f32 = turn.iter().map(|m| if let InputMsg::Gesture(GestureInput::Rotate { degrees, .. }) = m { *degrees } else { 0.0 }).sum();
+        assert!((degrees - 45.0).abs() < 1e-3, "{degrees}");
+        assert!(gesture(r#"{"pinch":"patch","amount":-1}"#).is_err());
+    }
+
+    #[test]
+    fn dock_steps_end_as_asked() {
+        use GesturePhase::*;
+        let swipe = gesture(r#"{"dock":"horizontal","to":-1.0,"steps":4,"velocity":-3,"end":"ended"}"#).unwrap().unwrap();
+        assert_eq!(phases(&swipe), [Began, Changed, Changed, Changed, Changed, Ended]);
+        let InputMsg::Gesture(GestureInput::DockSwipe { axis, progress, velocity_x, velocity_y, .. }) = swipe[5] else { panic!() };
+        assert_eq!((axis, progress, velocity_x, velocity_y), (DockAxis::Horizontal, -1.0, -3.0, 0.0));
+        assert!(matches!(swipe[2], InputMsg::Gesture(GestureInput::DockSwipe { progress: -0.5, velocity_x: 0.0, .. })));
+        let hanging = gesture(r#"{"dock":"vertical","to":0.4,"steps":5,"end":"none"}"#).unwrap().unwrap();
+        assert_eq!(phases(&hanging).last(), Some(&Changed));
+        let cancelled = gesture(r#"{"dock":"pinch","velocity":2,"end":"cancelled"}"#).unwrap().unwrap();
+        assert!(matches!(cancelled.last(), Some(InputMsg::Gesture(GestureInput::DockSwipe { phase: Cancelled, velocity_y: 0.0, .. }))));
+        assert!(gesture(r#"{"dock":"diagonal"}"#).is_err());
+        assert!(gesture(r#"{"dock":"vertical","end":"later"}"#).is_err());
+    }
+
+    #[test]
+    fn taps_actions_and_other_steps() {
+        assert_eq!(gesture(r#"{"smart_magnify":"patch"}"#).unwrap().unwrap(), [InputMsg::Gesture(GestureInput::SmartMagnify { x: 100, y: 200 })]);
+        let swipe = gesture(r#"{"swipe":"patch","dx":-3}"#).unwrap().unwrap();
+        assert_eq!(swipe, [InputMsg::Gesture(GestureInput::NavigationSwipe { x: 100, y: 200, dx: -1, dy: 0 })]);
+        assert!(gesture(r#"{"swipe":"patch"}"#).is_err());
+        assert_eq!(gesture(r#"{"system":"next_space"}"#).unwrap().unwrap(), [InputMsg::System(SystemAction::NEXT_SPACE)]);
+        assert!(gesture(r#"{"system":"reboot"}"#).is_err());
+        assert_eq!(gesture(r#"{"key":"a"}"#).unwrap(), None);
+    }
+
+    #[test]
+    fn the_gesture_scenarios_are_valid() {
+        let scripts = [include_str!("../../../scripts/e2e/gestures.jsonl"), include_str!("../../../scripts/e2e/gesture-silence.jsonl")];
+        for line in scripts.iter().flat_map(|s| s.lines()).map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let step: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"));
+            assert!(gesture_step(&step, &|_| Ok((1, 2))).is_ok(), "{line}");
+        }
     }
 }

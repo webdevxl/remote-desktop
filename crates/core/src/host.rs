@@ -24,7 +24,7 @@ use transport::pairing::{generate_pin, host_respond};
 use serde::Serialize;
 use transport::video::Packetizer;
 
-use crate::control::{Backend, HostSettings, InputCmdSender, InputConfig, InputFailure, InputShared, InputThread};
+use crate::control::{Backend, HostSettings, InputCmdSender, InputConfig, InputFailure, InputShared, InputThread, RateLimit};
 use crate::{Event, EventSink, Trust};
 
 /// Minimum spacing between keyframes produced on request; a client that keeps losing packets
@@ -474,25 +474,6 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
 
 const PERMISSION_CHECK: Duration = Duration::from_secs(1);
 
-/// Counts events in one-second windows.
-#[derive(Default)]
-struct RateLimit {
-    window_start: Option<Instant>,
-    count: u32,
-}
-
-impl RateLimit {
-    /// Counts one event at `now`; false if that makes more than `max` in the current second.
-    fn allow(&mut self, now: Instant, max: u32) -> bool {
-        if self.window_start.is_none_or(|start| now.duration_since(start) >= Duration::from_secs(1)) {
-            self.window_start = Some(now);
-            self.count = 0;
-        }
-        self.count += 1;
-        self.count <= max
-    }
-}
-
 /// Holds a place among the handshakes in progress (see [`MAX_HANDSHAKES`]).
 struct Handshake {
     ctx: Arc<HostCtx>,
@@ -707,6 +688,9 @@ impl SessionControl {
             });
             displaced
         };
+        // Until the displaced session handles this, its input thread may still inject a batch,
+        // so for a moment two viewers' input can mix (two Dock swipes confuse the Dock until both
+        // end; the revoke cancels its one). Rare and brief, so accepted.
         if let Some(events) = displaced {
             let _ = events.send(SessionEvt::Revoke(ControlReason::TAKEN_OVER, format!("{} took control of {host}.", self.viewer_name)));
         }
@@ -1324,15 +1308,6 @@ mod tests {
         t.end();
         t.succeeded();
         assert!(t.begin(t1, "Studio").is_ok());
-    }
-
-    #[test]
-    fn rate_limit_counts_per_second() {
-        let mut r = RateLimit::default();
-        let t0 = Instant::now();
-        assert!((0..50).all(|_| r.allow(t0, 50)));
-        assert!(!r.allow(t0 + Duration::from_millis(999), 50));
-        assert!(r.allow(t0 + Duration::from_secs(1), 50));
     }
 
     #[test]

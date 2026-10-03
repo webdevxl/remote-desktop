@@ -55,8 +55,105 @@ enum Snapshot {
             render(EndedView(target: "192.168.1.31", error: "That Mac hasn't allowed Screen Recording for LanKVM yet.", reconnect: {}, close: {}),
                    size: CGSize(width: 640, height: 420), appearance: appearance,
                    to: dir.appendingPathComponent("ended-\(suffix).png"))
+            renderSessionControls(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
         }
         NSApp.terminate(nil)
+    }
+
+    /// The session control in each state and on each kind of edge, then over a whole screen
+    /// with the other overlays keeping clear of it.
+    private static func renderSessionControls(info: SessionInfo, stats: SessionStats, appearance: NSAppearance.Name,
+                                              suffix: String, into dir: URL) {
+        let wide = CGSize(width: 560, height: 96)
+        let tall = CGSize(width: 560, height: 220)
+        let left = Placement(edge: .left, fraction: 0.5)
+        let bottom = Placement(edge: .bottom, fraction: 0.5)
+        render(
+            VStack(alignment: .leading, spacing: 10) {
+                Grid(horizontalSpacing: 10, verticalSpacing: 10) {
+                    GridRow {
+                        controlTile("Controlling, collapsed (idle)", info: info, size: wide) { $0.control = .active; $1.showSample(forwarding: true) }
+                        controlTile("Released, collapsed", info: info, size: wide) { $0.control = .active; $1.showSample(released: true) }
+                    }
+                    GridRow {
+                        controlTile("Controlling, expanded", info: info, size: wide) { $0.control = .active; $1.showSample(forwarding: true, expanded: true) }
+                        controlTile("Released, expanded", info: info, size: wide) { $0.control = .active; $1.showSample(released: true, expanded: true) }
+                    }
+                    GridRow {
+                        controlTile("Viewing (full screen)", info: info, size: wide) { $0.control = .off; $1.showSample(fullScreen: true, expanded: true) }
+                        controlTile("Asking for control", info: info, size: wide) { $0.control = .requesting; $1.showSample(expanded: true) }
+                    }
+                    GridRow {
+                        controlTile("Left edge, collapsed", info: info, size: tall) { $0.control = .active; $1.showSample(forwarding: true, placement: left) }
+                        controlTile("Left edge, expanded", info: info, size: tall) { $0.control = .active; $1.showSample(forwarding: true, expanded: true, placement: left) }
+                    }
+                    GridRow {
+                        controlTile("Over a white screen", info: info, size: wide, background: .white) { $0.control = .active; $1.showSample(forwarding: true, expanded: true) }
+                        controlTile("Increased contrast", info: info, size: wide) { $0.control = .active; $1.showSample(forwarding: true, expanded: true) }
+                            .environment(\._colorSchemeContrast, .increased)
+                    }
+                    GridRow {
+                        controlTile("Narrow window", info: info, size: CGSize(width: 480, height: 96)) { $0.control = .active; $1.showSample(forwarding: true, expanded: true) }
+                        controlTile("Paused (window in the background)", info: info, size: wide, captionAt: .topTrailing) {
+                            $0.control = .active
+                            $1.showSample(expanded: true, placement: bottom)
+                        }
+                    }
+                }
+            }
+            .padding(EdgeInsets(top: 38, leading: 10, bottom: 10, trailing: 10))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(Color.lkBackground)
+            .environmentObject(CoreModel.shared),
+            size: CGSize(width: 1150, height: 800), appearance: appearance,
+            to: dir.appendingPathComponent("session-control-\(suffix).png"))
+
+        // A whole screen: the statistics, the test-mode banner and a toast stay clear of the
+        // control (top-docked, then bottom-docked).
+        for (name, placement) in [("top", Placement.default), ("bottom", bottom)] {
+            let session = sampleSession(info: info)
+            session.control = .active
+            session.sameMachine = true
+            session.showToast("Controlling Studio · press ⌃⌥⌘ to release")
+            session.sessionControl.showSample(forwarding: true, expanded: true, placement: placement)
+            render(
+                ZStack {
+                    LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    ScreenOverlays(session: session, controls: session.sessionControl, info: info, sampleStats: stats)
+                }
+                .padding(.top, 28)
+                .environmentObject(CoreModel.shared),
+                size: CGSize(width: 1000, height: 648), appearance: appearance,
+                to: dir.appendingPathComponent("session-overlays-\(name)-\(suffix).png"))
+        }
+    }
+
+    private static func sampleSession(info: SessionInfo) -> SessionModel {
+        let session = SessionModel(id: 0, target: "192.168.1.31")
+        session.phase = .connected(info)
+        return session
+    }
+
+    /// One state of the session control over a stand-in for the remote screen, with a caption.
+    private static func controlTile(_ caption: String, info: SessionInfo, size: CGSize, background: Color? = nil,
+                                    captionAt: Alignment = .bottomTrailing,
+                                    setUp: (SessionModel, SessionControlModel) -> Void) -> some View {
+        let session = sampleSession(info: info)
+        setUp(session, session.sessionControl)
+        return ZStack(alignment: captionAt) {
+            if let background {
+                background
+            } else {
+                LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            }
+            SessionControl(session: session, model: session.sessionControl)
+            Text(caption)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(background == nil ? .white.opacity(0.6) : .black.opacity(0.45))
+                .padding(8)
+        }
+        .frame(width: size.width, height: size.height)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private static func render<V: View>(_ view: V, size: CGSize, appearance: NSAppearance.Name, to url: URL) {

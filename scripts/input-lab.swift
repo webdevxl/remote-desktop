@@ -1,7 +1,7 @@
-// LanKVM Input Lab: a target app for testing remote control. It logs every mouse, scroll and
-// keyboard event it receives as JSON lines, so a test can check exactly what a LanKVM host
-// injected, and flips a large patch between black and white on every key or click, so a viewer
-// can measure input-to-photon latency from the video.
+// LanKVM Input Lab: a target app for testing remote control. It logs every mouse, scroll,
+// keyboard and trackpad gesture event it receives as JSON lines, so a test can check exactly
+// what a LanKVM host injected, and flips a large patch between black and white on every key or
+// click, so a viewer can measure input-to-photon latency from the video.
 //
 //   swiftc -O scripts/input-lab.swift -o target/input-lab
 //   target/input-lab --log /tmp/input-lab.jsonl [--frame X,Y,W,H]
@@ -254,6 +254,20 @@ final class LabController: NSObject, NSWindowDelegate, NSTextViewDelegate {
         case .magnify:
             name = "magnify"
             fields["amount"] = Double(event.magnification)
+            fields["phase"] = phaseName(event.phase)
+        case .rotate:
+            name = "rotate"
+            fields["degrees"] = Double(event.rotation)
+            fields["phase"] = phaseName(event.phase)
+        case .smartMagnify:
+            name = "smart_magnify"
+        case .swipe:
+            name = "swipe"
+            fields["dx"] = Double(event.deltaX)
+            fields["dy"] = Double(event.deltaY)
+            fields["phase"] = phaseName(event.phase)
+        case .beginGesture, .endGesture:
+            name = event.type == .beginGesture ? "begin_gesture" : "end_gesture"
         default:
             return
         }
@@ -273,7 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mask: NSEvent.EventTypeMask = [
             .mouseMoved, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .rightMouseUp,
             .rightMouseDragged, .otherMouseDown, .otherMouseUp, .otherMouseDragged, .scrollWheel,
-            .keyDown, .keyUp, .flagsChanged, .magnify,
+            .keyDown, .keyUp, .flagsChanged, .magnify, .rotate, .smartMagnify, .swipe, .beginGesture, .endGesture,
         ]
         NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
             self?.lab.record(event)

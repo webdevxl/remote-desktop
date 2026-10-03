@@ -3,8 +3,9 @@
 //!
 //! Each controlling viewer gets its own input thread. It reads the viewer's input stream, merges
 //! any backlog of moves, and injects the result through [`InputState`], so nothing can be left
-//! held: the thread releases every key and button when control is switched off, when the viewer
-//! goes silent, and whenever it exits for any reason.
+//! held: the thread releases every key and button, and cancels a trackpad gesture in progress,
+//! when control is switched off, when the viewer goes silent, and whenever it exits for any
+//! reason.
 
 use std::fs::File;
 use std::io::Write as _;
@@ -14,9 +15,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use platform_mac::{clock, keys};
-use platform_mac::inject::{self, Bounds, InjectGuard, InputState, MouseKind, Poster, Scroll, Synth};
-use protocol::{HostMsg, INPUT_ACK_INTERVAL_US, InputMsg, MAX_RELAY_DEPTH, POS_MAX};
+use platform_mac::{clock, gesture, keys};
+use platform_mac::inject::{
+    self, AppGestureKind, Bounds, DockAxis, Gesture, GesturePhase, InjectGuard, InputState, MouseKind, Poster, Scroll, Synth, SystemAction,
+};
+use protocol::{GestureInput, HostMsg, INPUT_ACK_INTERVAL_US, InputMsg, MAX_RELAY_DEPTH, POS_MAX};
 use quinn::RecvStream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -28,6 +31,10 @@ const SILENCE_RELEASE: Duration = Duration::from_millis(protocol::INPUT_SILENCE_
 const SILENCE_CHECK: Duration = Duration::from_millis(100);
 /// How often remote activity keeps the host's display awake.
 const USER_ACTIVITY_INTERVAL: Duration = Duration::from_secs(1);
+/// System actions (Mission Control, a Space left...) injected per second at most. Each one
+/// animates for a good part of a second, so faster ones would only queue up behind it or toggle
+/// it back; the rest of that second's are dropped.
+const MAX_SYSTEM_ACTIONS_PER_SEC: u32 = 4;
 
 /// Host-wide settings, stored in the data directory (not in user defaults, which every copy of
 /// the app with the same bundle id would share).
@@ -125,6 +132,42 @@ impl Sink {
             }
         }
     }
+
+    /// Posts what the poster has come due (the end of a Dock swipe, once more). A recording has
+    /// nothing timed, so the same input always records the same lines.
+    fn poll(&mut self, now: Instant) {
+        if let Sink::Hid(poster) = self {
+            poster.poll(now);
+        }
+    }
+}
+
+fn phase_name(phase: GesturePhase) -> &'static str {
+    match phase {
+        GesturePhase::Began => "began",
+        GesturePhase::Changed => "changed",
+        GesturePhase::Ended => "ended",
+        GesturePhase::Cancelled => "cancelled",
+    }
+}
+
+fn axis_name(axis: DockAxis) -> &'static str {
+    match axis {
+        DockAxis::Horizontal => "horizontal",
+        DockAxis::Vertical => "vertical",
+        DockAxis::Pinch => "pinch",
+    }
+}
+
+fn action_name(action: SystemAction) -> &'static str {
+    match action {
+        SystemAction::MissionControl => "mission_control",
+        SystemAction::AppExpose => "app_expose",
+        SystemAction::ShowDesktop => "show_desktop",
+        SystemAction::Launchpad => "launchpad",
+        SystemAction::PreviousSpace => "previous_space",
+        SystemAction::NextSpace => "next_space",
+    }
 }
 
 fn synth_json(synth: &Synth) -> serde_json::Value {
@@ -144,6 +187,23 @@ fn synth_json(synth: &Synth) -> serde_json::Value {
             "pixels": [scroll.pixels_x, scroll.pixels_y], "continuous": scroll.continuous,
             "phase": scroll.phase, "momentum": scroll.momentum, "inverted": scroll.inverted, "flags": flags,
         }),
+        Synth::DockSwipe { axis, phase, progress, velocity_x, velocity_y, inverted } => json!({
+            "type": "gesture", "gesture": "dock", "axis": axis_name(*axis), "phase": phase_name(*phase),
+            "progress": progress, "velocity": [velocity_x, velocity_y], "inverted": inverted,
+        }),
+        Synth::AppGesture { at, phase, kind: AppGestureKind::Magnify, value, flags } => json!({
+            "type": "gesture", "gesture": "magnify", "x": at.x, "y": at.y, "phase": phase_name(*phase), "delta": value, "flags": flags,
+        }),
+        Synth::AppGesture { at, phase, kind: AppGestureKind::Rotate, value, flags } => json!({
+            "type": "gesture", "gesture": "rotate", "x": at.x, "y": at.y, "phase": phase_name(*phase), "degrees": value, "flags": flags,
+        }),
+        Synth::SmartMagnify { at, flags } => json!({
+            "type": "gesture", "gesture": "smart_magnify", "x": at.x, "y": at.y, "flags": flags,
+        }),
+        Synth::NavigationSwipe { at, dx, dy, flags } => json!({
+            "type": "gesture", "gesture": "swipe", "x": at.x, "y": at.y, "dx": dx, "dy": dy, "flags": flags,
+        }),
+        Synth::System(action) => json!({ "type": "system", "action": action_name(*action) }),
     }
 }
 
@@ -174,14 +234,54 @@ pub fn apply(state: &mut InputState, msg: InputMsg, bounds: &Bounds, host_caps_l
         InputMsg::ReleaseAll => state.release_all(host_caps_lock(), out),
         // The worker keeps the depth (see `Worker::inject`).
         InputMsg::Heartbeat | InputMsg::Relayed { .. } => {}
-        // PLACEHOLDER (contract only): gestures and system actions aren't injected yet.
-        InputMsg::Gesture(_) | InputMsg::System(_) => {}
+        InputMsg::Gesture(GestureInput::DockSwipe { axis, phase, progress, velocity_x, velocity_y, inverted }) => {
+            // From the wire's direction convention to this Mac's (see `GestureInput::DockSwipe`).
+            // The factor comes with the state, so a recording uses the same one on any Mac.
+            let direction = state.dock_modes().direction(axis);
+            let swipe = Gesture::DockSwipe {
+                axis,
+                progress: f64::from(progress) * direction,
+                velocity_x: f64::from(velocity_x) * direction,
+                velocity_y: f64::from(velocity_y) * direction,
+                inverted,
+            };
+            state.gesture(phase, swipe, None, out);
+        }
+        InputMsg::Gesture(GestureInput::Magnify { x, y, phase, delta }) => {
+            state.gesture(phase, Gesture::Magnify { delta: f64::from(delta) }, Some(at(x, y)), out);
+        }
+        InputMsg::Gesture(GestureInput::Rotate { x, y, phase, degrees }) => {
+            state.gesture(phase, Gesture::Rotate { degrees: f64::from(degrees) }, Some(at(x, y)), out);
+        }
+        InputMsg::Gesture(GestureInput::SmartMagnify { x, y }) => state.smart_magnify(at(x, y), out),
+        InputMsg::Gesture(GestureInput::NavigationSwipe { x, y, dx, dy }) => state.navigation_swipe(at(x, y), dx, dy, out),
+        // Actions this version doesn't know never get here (see `InputMsg::sanitized`).
+        InputMsg::System(action) => {
+            if let Some(action) = SystemAction::from_wire(action) {
+                state.system(action, out);
+            }
+        }
     }
 }
 
 /// Whether `msg` needs a position on the display.
 fn is_pointer(msg: &InputMsg) -> bool {
-    matches!(msg, InputMsg::MouseMove { .. } | InputMsg::MouseButton { .. } | InputMsg::Scroll(_))
+    match msg {
+        InputMsg::MouseMove { .. } | InputMsg::MouseButton { .. } | InputMsg::Scroll(_) => true,
+        InputMsg::Gesture(g) => g.position().is_some(),
+        _ => false,
+    }
+}
+
+/// Whether `msg` starts something (a press, a gesture, a tap or an action): what the flood
+/// guard counts.
+fn is_press(msg: &InputMsg) -> bool {
+    match msg {
+        InputMsg::Key { down: true, repeat: false, .. } | InputMsg::MouseButton { down: true, .. } | InputMsg::System(_) => true,
+        // Taps have no phase.
+        InputMsg::Gesture(g) => g.phase().is_none_or(|p| p == GesturePhase::Began),
+        _ => false,
+    }
 }
 
 /// Shared between a session and its input thread.
@@ -283,10 +383,16 @@ impl InputThread {
             } else {
                 (inject::cursor_position(), inject::host_caps_lock)
             };
+            let mut state = InputState::new(pos, caps_lock(), inject::mouse_event_number_seed());
+            if !recording {
+                // How this Mac's Dock takes swipes. The first call self-tests the recipes (in
+                // memory, a few milliseconds): better now than in the middle of a swipe.
+                state.set_dock_modes(gesture::dock_modes());
+            }
             let mut worker = Worker {
                 sink,
                 guard: guard_pid.map(InjectGuard::new),
-                state: InputState::new(pos, caps_lock(), inject::mouse_event_number_seed()),
+                state,
                 display_id,
                 shared,
                 out,
@@ -297,6 +403,7 @@ impl InputThread {
                 last_ack_us: 0,
                 last_activity: None,
                 flood: FloodGuard::default(),
+                system_actions: RateLimit::default(),
                 display_warned: false,
             };
             let mut recv = recv;
@@ -393,10 +500,35 @@ impl FloodGuard {
     }
 }
 
+/// Counts events in one-second windows.
+#[derive(Default)]
+pub(crate) struct RateLimit {
+    window_start: Option<Instant>,
+    count: u32,
+}
+
+impl RateLimit {
+    /// Counts one event at `now`; false if that makes more than `max` in the current second.
+    pub(crate) fn allow(&mut self, now: Instant, max: u32) -> bool {
+        if self.window_start.is_none_or(|start| now.duration_since(start) >= Duration::from_secs(1)) {
+            self.window_start = Some(now);
+            self.count = 0;
+        }
+        self.count += 1;
+        self.count <= max
+    }
+
+    /// Whether the event just counted was the first one refused in its second (to say so once).
+    fn first_refused(&self, max: u32) -> bool {
+        self.count == max + 1
+    }
+}
+
 struct Worker {
     sink: Sink,
     guard: Option<InjectGuard>,
     flood: FloodGuard,
+    system_actions: RateLimit,
     display_warned: bool,
     state: InputState,
     display_id: u32,
@@ -436,9 +568,8 @@ impl Worker {
                         };
                         self.seq += 1;
                         let Some(msg) = msg.sanitized() else { continue };
-                        let press = matches!(msg, InputMsg::Key { down: true, repeat: false, .. } | InputMsg::MouseButton { down: true, .. });
-                        if press && self.flood.press(received_us) {
-                            return Err(Stop::Bad("more than 1000 key and button presses a second".into()));
+                        if is_press(&msg) && self.flood.press(received_us) {
+                            return Err(Stop::Bad("more than 1000 presses, gestures and actions a second".into()));
                         }
                         if !batch.last_mut().is_some_and(|last| last.coalesce(&msg)) {
                             batch.push(msg);
@@ -468,6 +599,7 @@ impl Worker {
                         tracing::warn!(silent_ms = silent_us / 1000, "viewer went silent while holding input; releasing it");
                         self.release_all();
                     }
+                    self.sink.poll(Instant::now());
                 }
             }
         }
@@ -484,9 +616,11 @@ impl Worker {
                     continue;
                 }
                 // Input that went around a loop of Macs controlling each other dies here. Releases
-                // still apply (only of what is held, so they can't start anything going round).
+                // still apply (only of what is held, so they can't start anything going round),
+                // and so does the end of a gesture (only of the one in progress).
                 InputMsg::ReleaseAll | InputMsg::Heartbeat => {}
                 InputMsg::Key { down: false, .. } | InputMsg::MouseButton { down: false, .. } => {}
+                InputMsg::Gesture(g) if g.ends() => {}
                 InputMsg::Modifiers { flags } if self.depth > MAX_RELAY_DEPTH => {
                     let held = self.state.modifiers();
                     let target = (u64::from(flags) & held & !keys::CAPS_LOCK) | (held & keys::CAPS_LOCK);
@@ -497,12 +631,22 @@ impl Worker {
                 _ => {}
             }
             if !bounds.is_usable() && is_pointer(&msg) {
-                // The streamed display is gone: don't click at (0, 0), let go of buttons instead.
+                // The streamed display is gone: don't click at (0, 0), let go of buttons (and end
+                // a pinch or rotation made there) instead.
                 if !self.display_warned {
                     tracing::warn!(display = self.display_id, "display unavailable; dropping pointer input");
                     self.display_warned = true;
                 }
+                self.state.cancel_positioned_gesture(&mut self.synth);
                 self.state.release_buttons(&mut self.synth);
+                continue;
+            }
+            if let InputMsg::System(action) = msg
+                && !self.system_actions.allow(Instant::now(), MAX_SYSTEM_ACTIONS_PER_SEC)
+            {
+                if self.system_actions.first_refused(MAX_SYSTEM_ACTIONS_PER_SEC) {
+                    tracing::warn!(?action, "more than {MAX_SYSTEM_ACTIONS_PER_SEC} system actions a second; dropping the rest");
+                }
                 continue;
             }
             apply(&mut self.state, msg, &bounds, self.host_caps_lock, &mut self.synth);
@@ -611,8 +755,148 @@ mod tests {
         let mut out = Vec::new();
         apply(&mut s, InputMsg::Modifiers { flags: 0x0010_0008 }, &bounds(), || false, &mut out);
         apply(&mut s, InputMsg::Key { code: 0, down: true, repeat: false }, &bounds(), || false, &mut out);
+        apply(&mut s, dock(GesturePhase::Began, 0.0), &bounds(), || false, &mut out);
+        apply(&mut s, dock(GesturePhase::Changed, 0.4), &bounds(), || false, &mut out);
         assert!(s.holds_anything());
+        out.clear();
         apply(&mut s, InputMsg::ReleaseAll, &bounds(), || false, &mut out);
         assert!(!s.holds_anything());
+        assert_eq!(kinds(&out), ["gesture dock cancelled", "keyup", "keyup"], "the swipe ends first: {out:#?}");
+        assert!((synth_json(&out[0])["progress"].as_f64().unwrap() - 0.4).abs() < 1e-6, "{out:#?}");
+    }
+
+    fn dock(phase: GesturePhase, progress: f32) -> InputMsg {
+        InputMsg::Gesture(GestureInput::DockSwipe { axis: DockAxis::Vertical, phase, progress, velocity_x: 0.0, velocity_y: 0.0, inverted: false })
+    }
+
+    /// Each event as "type", or "type gesture phase" for gestures.
+    fn kinds(out: &[Synth]) -> Vec<String> {
+        out.iter()
+            .map(|e| {
+                let j = synth_json(e);
+                [&j["type"], &j["gesture"], &j["phase"]].iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gestures_land_where_the_viewer_made_them() {
+        let mut s = InputState::new(Default::default(), false, 0);
+        let mut out = Vec::new();
+        let pinch = |phase, delta| InputMsg::Gesture(GestureInput::Magnify { x: POS_MAX / 4, y: POS_MAX / 2, phase, delta });
+        apply(&mut s, pinch(GesturePhase::Began, 0.0), &bounds(), || false, &mut out);
+        apply(&mut s, pinch(GesturePhase::Changed, 0.05), &bounds(), || false, &mut out);
+        apply(&mut s, pinch(GesturePhase::Ended, 0.0), &bounds(), || false, &mut out);
+        let tap = InputMsg::Gesture(GestureInput::SmartMagnify { x: POS_MAX, y: 0 });
+        apply(&mut s, tap, &bounds(), || false, &mut out);
+        let swipe = InputMsg::Gesture(GestureInput::NavigationSwipe { x: POS_MAX, y: 0, dx: 1, dy: 0 });
+        apply(&mut s, swipe, &bounds(), || false, &mut out);
+        assert_eq!(
+            kinds(&out),
+            ["move", "gesture magnify began", "gesture magnify changed", "gesture magnify ended", "move", "gesture smart_magnify", "gesture swipe"]
+        );
+        let pinched = synth_json(&out[2]);
+        assert!((pinched["x"].as_f64().unwrap() - 500.0).abs() < 0.1 && (pinched["y"].as_f64().unwrap() - 500.0).abs() < 0.1, "{pinched}");
+        assert!((pinched["delta"].as_f64().unwrap() - 0.05).abs() < 1e-6);
+        assert_eq!(synth_json(&out[6])["x"], 1999.0);
+        assert_eq!(synth_json(&out[6])["dx"], 1);
+    }
+
+    #[test]
+    fn dock_swipes_are_turned_to_this_macs_direction() {
+        let mut s = InputState::new(Default::default(), false, 0);
+        let mut out = Vec::new();
+        let swipe = |phase, progress, velocity_x| {
+            InputMsg::Gesture(GestureInput::DockSwipe { axis: DockAxis::Horizontal, phase, progress, velocity_x, velocity_y: 0.0, inverted: true })
+        };
+        // The same on every Mac unless set: what recordings use.
+        apply(&mut s, swipe(GesturePhase::Began, 0.0, 0.0), &bounds(), || false, &mut out);
+        apply(&mut s, swipe(GesturePhase::Ended, 0.75, 3.0), &bounds(), || false, &mut out);
+        assert_eq!(
+            out[1],
+            Synth::DockSwipe { axis: DockAxis::Horizontal, phase: GesturePhase::Ended, progress: 0.75, velocity_x: 3.0, velocity_y: 0.0, inverted: true }
+        );
+        // A Mac whose Dock reads horizontal swipes the other way round.
+        s.set_dock_modes(gesture::DockModes { directions: [-1.0, 1.0, 1.0], ..gesture::DockModes::default() });
+        out.clear();
+        apply(&mut s, swipe(GesturePhase::Began, 0.0, 0.0), &bounds(), || false, &mut out);
+        apply(&mut s, swipe(GesturePhase::Ended, 0.75, 3.0), &bounds(), || false, &mut out);
+        assert!(matches!(out[1], Synth::DockSwipe { progress: -0.75, velocity_x: -3.0, inverted: true, .. }), "{out:#?}");
+    }
+
+    #[test]
+    fn system_actions_are_done_or_become_space_swipes() {
+        let mut s = InputState::new(Default::default(), false, 0);
+        let mut out = Vec::new();
+        apply(&mut s, InputMsg::System(protocol::SystemAction::MISSION_CONTROL), &bounds(), || false, &mut out);
+        apply(&mut s, InputMsg::System(protocol::SystemAction::NEXT_SPACE), &bounds(), || false, &mut out);
+        // Unknown codes are dropped by sanitizing; one that got here anyway does nothing.
+        apply(&mut s, InputMsg::System(protocol::SystemAction(99)), &bounds(), || false, &mut out);
+        assert_eq!(kinds(&out), ["system", "gesture dock began", "gesture dock changed", "gesture dock ended"]);
+        assert_eq!(synth_json(&out[0]), serde_json::json!({ "type": "system", "action": "mission_control" }));
+        assert_eq!(synth_json(&out[3])["axis"], "horizontal");
+        assert!(!s.holds_anything());
+    }
+
+    #[test]
+    fn gesture_lines_are_recorded_with_their_values() {
+        use serde_json::json;
+        let at = inject::Point { x: 812.0, y: 540.0 };
+        let dock = Synth::DockSwipe { axis: DockAxis::Vertical, phase: GesturePhase::Began, progress: 0.25, velocity_x: 0.5, velocity_y: -2.0, inverted: false };
+        assert_eq!(
+            synth_json(&dock),
+            json!({ "type": "gesture", "gesture": "dock", "axis": "vertical", "phase": "began", "progress": 0.25, "velocity": [0.5, -2.0], "inverted": false })
+        );
+        let rotate = Synth::AppGesture { at, phase: GesturePhase::Cancelled, kind: AppGestureKind::Rotate, value: -3.5, flags: 0x100 };
+        assert_eq!(
+            synth_json(&rotate),
+            json!({ "type": "gesture", "gesture": "rotate", "x": 812.0, "y": 540.0, "phase": "cancelled", "degrees": -3.5, "flags": 0x100 })
+        );
+        let magnify = Synth::AppGesture { at, phase: GesturePhase::Changed, kind: AppGestureKind::Magnify, value: 0.5, flags: 0 };
+        assert_eq!(synth_json(&magnify)["delta"], 0.5);
+        assert_eq!(synth_json(&Synth::SmartMagnify { at, flags: 0 })["gesture"], "smart_magnify");
+        assert_eq!(
+            synth_json(&Synth::NavigationSwipe { at, dx: 0, dy: -1, flags: 0 }),
+            json!({ "type": "gesture", "gesture": "swipe", "x": 812.0, "y": 540.0, "dx": 0, "dy": -1, "flags": 0 })
+        );
+        let names: Vec<_> = [
+            SystemAction::MissionControl,
+            SystemAction::AppExpose,
+            SystemAction::ShowDesktop,
+            SystemAction::Launchpad,
+            SystemAction::PreviousSpace,
+            SystemAction::NextSpace,
+        ]
+        .map(|a| synth_json(&Synth::System(a))["action"].as_str().unwrap().to_string())
+        .into();
+        assert_eq!(names, ["mission_control", "app_expose", "show_desktop", "launchpad", "previous_space", "next_space"]);
+    }
+
+    #[test]
+    fn positioned_gestures_need_the_display_and_starts_count_as_presses() {
+        let pinch = |phase| InputMsg::Gesture(GestureInput::Magnify { x: 0, y: 0, phase, delta: 0.0 });
+        assert!(is_pointer(&pinch(GesturePhase::Changed)));
+        assert!(is_pointer(&InputMsg::Gesture(GestureInput::SmartMagnify { x: 0, y: 0 })));
+        assert!(!is_pointer(&dock(GesturePhase::Began, 0.0)), "a Dock swipe isn't tied to a display");
+        assert!(!is_pointer(&InputMsg::System(protocol::SystemAction::SHOW_DESKTOP)));
+        assert!(is_press(&pinch(GesturePhase::Began)));
+        assert!(is_press(&dock(GesturePhase::Began, 0.0)));
+        assert!(is_press(&InputMsg::Gesture(GestureInput::NavigationSwipe { x: 0, y: 0, dx: 1, dy: 0 })));
+        assert!(is_press(&InputMsg::System(protocol::SystemAction::MISSION_CONTROL)));
+        assert!(!is_press(&pinch(GesturePhase::Changed)) && !is_press(&dock(GesturePhase::Ended, 1.0)));
+        assert!(is_press(&InputMsg::Key { code: 0, down: true, repeat: false }));
+        assert!(!is_press(&InputMsg::Key { code: 0, down: true, repeat: true }));
+    }
+
+    #[test]
+    fn rate_limit_counts_per_second() {
+        let mut r = RateLimit::default();
+        let t0 = Instant::now();
+        assert!((0..50).all(|_| r.allow(t0, 50)));
+        assert!(!r.allow(t0 + Duration::from_millis(999), 50));
+        assert!(r.first_refused(50), "the first one over says so");
+        assert!(!r.allow(t0 + Duration::from_millis(999), 50));
+        assert!(!r.first_refused(50), "once a second");
+        assert!(r.allow(t0 + Duration::from_secs(1), 50));
     }
 }

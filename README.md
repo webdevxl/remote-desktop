@@ -97,13 +97,28 @@ certificate (it asks for your login password once):
 ### Controlling the other Mac
 
 - Choose **Control** in the viewer's toolbar, or press **⌃⌥⌘** (Control-Option-Command together,
-  then let go). The same chord switches back to **View**. The window remembers the mode per Mac.
+  then let go). **View** in the toolbar, or **View Only** in the menus, goes back to watching.
+  The window remembers the mode per Mac.
 - While you control a Mac, every key goes to it, including ⌘Q, ⌘W, ⌘H, Tab and Esc, and, with
   **Control → Send System Shortcuts to Remote Mac** (on by default), also system shortcuts such
-  as ⌘Tab and ⌘Space. Clicking another window on your Mac, or ⌃⌥⌘, gives the keyboard
-  back; anything held on the other Mac is released then.
+  as ⌘Tab and ⌘Space.
+- **Release** gives your keyboard and mouse back to your own Mac without giving up control:
+  press **⌃⌥⌘**, or click **Release** on the session control. Anything held on the other Mac is
+  let go, and in full screen your menu bar and Dock come back. To carry on, click the remote
+  screen (that click isn't sent), press ⌃⌥⌘ again, or click **Resume**. Clicking another window
+  pauses control the same way, but coming back to the viewer resumes it, unless you released.
+- The **session control** is the small tab at the top of the remote screen. Point at it or click
+  it to expand it: it says whether you're controlling, with **Release** or **Resume**, and a
+  **⋯** menu with Mission Control, App Exposé, Show Desktop and Move Left/Right a Space on the
+  other Mac, the input settings, View Only, Exit Full Screen, Keep Expanded, Hide Session
+  Control and Disconnect. Drag it by its grip to any edge; double-click the grip to put it back
+  at the top. Each Mac's window remembers where it was. Moves, clicks and scrolling over it stay
+  on your Mac (keys still go to the other one). It shows while you control; while you only
+  watch, it shows in full screen, where the toolbar is hidden. The **Control** menu has the same
+  actions, and **Show Session Control** brings it back after you hide it.
 - In full screen while controlling, your own menu bar and Dock stay hidden, so the screen edges
-  reach the other Mac's menu bar, Dock and hot corners. Use ⌃⌥⌘ to get your Mac back.
+  reach the other Mac's menu bar, Dock and hot corners. Release (⌃⌥⌘, or the session control)
+  to get them back.
 - Clicks in the black bars around the picture land on the nearest edge of the other Mac's
   screen (within 24 pt; further out they're ignored). Scrolling keeps trackpad momentum and your
   natural-scrolling direction. Keys are sent by position, so the other Mac's keyboard layout and

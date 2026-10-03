@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use lankvm_core::control::Backend;
 use lankvm_core::{Core, CoreOptions, Event};
 use platform_mac::inject::Bounds;
-use protocol::{InputMsg, POS_MAX, ScrollInput};
+use protocol::{DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction};
 use serde_json::Value;
 use transport::identity::DeviceIdentity;
 
@@ -156,10 +156,39 @@ fn kinds(events: &[Value]) -> Vec<String> {
             match t {
                 "keydown" | "keyup" => format!("{t}{}", e["code"]),
                 "down" | "up" | "drag" => format!("{t}{}", e["button"]),
+                // "dock:began", "magnify:changed"; taps have no phase.
+                "gesture" => match e["phase"].as_str() {
+                    Some(phase) => format!("{}:{phase}", e["gesture"].as_str().unwrap()),
+                    None => e["gesture"].as_str().unwrap().to_string(),
+                },
+                "system" => e["action"].as_str().unwrap().to_string(),
                 _ => t.to_string(),
             }
         })
         .collect()
+}
+
+/// Reads the host's record once its last event is of kind `last` (see [`kinds`]).
+fn recorded_until(path: &Path, last: &str) -> Vec<Value> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let events = recorded(path, 0);
+        if kinds(&events).last().is_some_and(|k| k == last) || Instant::now() > deadline {
+            return events;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// [`kinds`] with repeats collapsed: the host may merge a backlog of gesture updates.
+fn phases(events: &[Value]) -> Vec<String> {
+    let mut kinds = kinds(events);
+    kinds.dedup();
+    kinds
+}
+
+fn dock(phase: GesturePhase, progress: f32, velocity_y: f32) -> InputMsg {
+    InputMsg::Gesture(GestureInput::DockSwipe { axis: DockAxis::Vertical, phase, progress, velocity_x: 0.0, velocity_y, inverted: false })
 }
 
 fn pos(v: f64) -> u16 {
@@ -522,16 +551,15 @@ fn quitting_the_host_releases_held_input() {
     assert_eq!(kinds(&recorded(&s.record, 2)), ["keydown7", "keyup7"]);
 }
 
-#[test]
-fn garbage_on_the_input_stream_ends_control_but_not_the_session() {
-    use std::io::Write as _;
-    // Speak raw QUIC to the host: handshake as the trusted viewer, ask for control, then send
-    // nonsense on the input stream.
-    let s = setup("garbage");
+/// Speaks raw QUIC to the host: handshakes as the trusted viewer, asks for control, sends `input`
+/// on the input stream and waits until the host ends control. Then checks that the session
+/// (video, control stream) is still up, and returns whether control had been granted and the
+/// host's last word on it.
+fn raw_input(s: &Setup, input: Vec<u8>) -> (bool, protocol::ControlState) {
     let host_port = s.host.core.this_mac().port;
     let identity = DeviceIdentity::load_or_create(&s.viewer_dir).unwrap();
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (active, ended) = rt.block_on(async move {
+    rt.block_on(async move {
         let endpoint = transport::endpoint::make_endpoint("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
         let conn = endpoint.connect(format!("127.0.0.1:{host_port}").parse().unwrap(), "lankvm").unwrap().await.unwrap();
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -559,11 +587,8 @@ fn garbage_on_the_input_stream_ends_control_but_not_the_session() {
                 _ => {}
             }
         }
-        let mut input = conn.open_uni().await.unwrap();
-        let mut junk = Vec::new();
-        junk.write_all(&9999u32.to_le_bytes()).unwrap(); // longer than any input message
-        junk.extend_from_slice(&[0xAB; 64]);
-        input.write_all(&junk).await.unwrap();
+        let mut stream = conn.open_uni().await.unwrap();
+        stream.write_all(&input).await.unwrap();
         let ended = loop {
             match transport::framing::read_msg::<protocol::HostMsg>(&mut recv).await.unwrap().unwrap() {
                 protocol::HostMsg::Control(c) if !c.active => break c,
@@ -578,9 +603,31 @@ fn garbage_on_the_input_stream_ends_control_but_not_the_session() {
             }
         }
         (answers.last().unwrap().active, ended)
-    });
+    })
+}
+
+#[test]
+fn garbage_on_the_input_stream_ends_control_but_not_the_session() {
+    use std::io::Write as _;
+    let s = setup("garbage");
+    let mut junk = Vec::new();
+    junk.write_all(&9999u32.to_le_bytes()).unwrap(); // longer than any input message
+    junk.extend_from_slice(&[0xAB; 64]);
+    let (active, ended) = raw_input(&s, junk);
     assert!(active);
     assert_eq!(ended.reason, protocol::ControlReason::BAD_INPUT, "{ended:?}");
+    assert!(std::fs::read_to_string(&s.record).unwrap_or_default().is_empty(), "nothing injected");
+}
+
+#[test]
+fn an_input_message_from_a_newer_version_ends_control_but_not_the_session() {
+    // What a host would see if a newer viewer sent a kind of input added later without a
+    // version bump (Hello refuses other versions): a frame with variant 10, which doesn't exist.
+    let s = setup("newer");
+    let (active, ended) = raw_input(&s, vec![1, 0, 0, 0, 10]);
+    assert!(active);
+    assert_eq!(ended.reason, protocol::ControlReason::BAD_INPUT, "{ended:?}");
+    assert!(ended.message.contains("couldn't accept"), "{ended:?}");
     assert!(std::fs::read_to_string(&s.record).unwrap_or_default().is_empty(), "nothing injected");
 }
 
@@ -623,4 +670,177 @@ fn input_that_went_around_a_loop_of_macs_dies_out() {
     assert_eq!(kinds(&events), ["keydown55", "keydown1", "keydown4", "keyup1", "keyup55", "keyup4", "keydown3"], "{events:#?}");
     assert_eq!(events[1]["depth"], 1);
     assert!(events[6].get("depth").is_none());
+}
+
+#[test]
+fn gestures_are_injected_with_their_phases_in_order() {
+    use GesturePhase::*;
+    let s = setup("gestures");
+    let id = s.viewer.connect(&s.host);
+    assert!(s.viewer.request(id, true, false).active);
+    let send = |m| s.viewer.core.send_input(id, m);
+    let (x, y) = (pos(0.25), pos(0.5));
+    let pinch = |phase, delta| InputMsg::Gesture(GestureInput::Magnify { x, y, phase, delta });
+    let turn = |phase, degrees| InputMsg::Gesture(GestureInput::Rotate { x, y, phase, degrees });
+    send(pinch(Began, 0.0));
+    for _ in 0..8 {
+        send(pinch(Changed, 0.05));
+    }
+    send(pinch(Ended, 0.0));
+    send(turn(Began, 0.0));
+    for _ in 0..9 {
+        send(turn(Changed, 5.0));
+    }
+    send(turn(Ended, 0.0));
+    send(dock(Began, 0.0, 0.0));
+    for i in 1..=10 {
+        send(dock(Changed, i as f32 / 10.0, 0.0));
+    }
+    send(dock(Ended, 1.0, 2.5));
+    send(InputMsg::Gesture(GestureInput::SmartMagnify { x, y }));
+    send(InputMsg::Gesture(GestureInput::NavigationSwipe { x, y, dx: -1, dy: 0 }));
+    send(InputMsg::System(SystemAction::MISSION_CONTROL));
+
+    let events = recorded_until(&s.record, "mission_control");
+    assert_eq!(
+        phases(&events),
+        [
+            "move", "magnify:began", "magnify:changed", "magnify:ended", "rotate:began", "rotate:changed", "rotate:ended", "dock:began", "dock:changed",
+            "dock:ended", "smart_magnify", "swipe", "mission_control",
+        ],
+        "{events:#?}"
+    );
+    // However the updates were merged on the way, they add up to the same gesture.
+    let of = |name: &'static str| events.iter().filter(move |e| e["gesture"] == name);
+    let scale: f64 = of("magnify").map(|e| 1.0 + e["delta"].as_f64().unwrap()).product();
+    assert!((scale - 1.05f64.powi(8)).abs() < 1e-4, "composed to {scale}");
+    let degrees: f64 = of("rotate").map(|e| e["degrees"].as_f64().unwrap()).sum();
+    assert!((degrees - 45.0).abs() < 1e-3, "turned {degrees}");
+    let end = of("dock").last().unwrap();
+    assert_eq!((end["axis"].as_str(), end["progress"].as_f64(), &end["velocity"]), (Some("vertical"), Some(1.0), &serde_json::json!([0.0, 2.5])));
+    // App gestures go where the viewer made them, in display points; they stay there.
+    let at = Bounds::of_display(platform_mac::capture::main_display_bounds().id).point_at(0.25, 0.5);
+    for e in events.iter().filter(|e| e["type"] == "gesture" && e["gesture"] != "dock") {
+        assert!((e["x"].as_f64().unwrap() - at.x).abs() < 0.1 && (e["y"].as_f64().unwrap() - at.y).abs() < 0.1, "{e}");
+    }
+    assert_eq!(of("swipe").next().unwrap()["dx"], -1);
+}
+
+/// Starts a Dock swipe and leaves it unfinished, ends control the way `end` does, and checks
+/// that the host cancelled the swipe where it was (so the Dock snaps back).
+fn an_unfinished_dock_swipe_is_cancelled(s: Setup, end: impl FnOnce(&Setup, u64)) {
+    let id = s.viewer.connect(&s.host);
+    assert!(s.viewer.request(id, true, false).active);
+    s.viewer.core.send_input(id, dock(GesturePhase::Began, 0.0, 0.0));
+    s.viewer.core.send_input(id, dock(GesturePhase::Changed, 0.4, 0.0));
+    assert_eq!(kinds(&recorded_until(&s.record, "dock:changed")), ["dock:began", "dock:changed"]);
+    end(&s, id);
+    let events = recorded_until(&s.record, "dock:cancelled");
+    assert_eq!(kinds(&events), ["dock:began", "dock:changed", "dock:cancelled"], "{events:#?}");
+    assert!((events[2]["progress"].as_f64().unwrap() - 0.4).abs() < 1e-6, "{events:#?}");
+    assert_eq!(events[2]["velocity"], serde_json::json!([0.0, 0.0]), "no fling");
+}
+
+#[test]
+fn an_unfinished_dock_swipe_is_cancelled_on_disconnect() {
+    an_unfinished_dock_swipe_is_cancelled(setup("swipe-disconnect"), |s, id| s.viewer.core.disconnect(id));
+}
+
+#[test]
+fn an_unfinished_dock_swipe_is_cancelled_when_the_host_stops_control() {
+    an_unfinished_dock_swipe_is_cancelled(setup("swipe-stop"), |s, id| {
+        s.host.core.stop_control(s.host.core.host_status().viewers[0].id);
+        assert!(!s.viewer.host_said(id).active);
+    });
+}
+
+#[test]
+fn an_unfinished_dock_swipe_is_cancelled_when_the_host_quits() {
+    an_unfinished_dock_swipe_is_cancelled(setup("swipe-quit"), |s, _| s.host.core.shutdown());
+}
+
+#[test]
+fn an_unfinished_dock_swipe_is_cancelled_when_the_test_time_runs_out() {
+    let s = setup_with("swipe-ttl", |dir, record| start_host(dir, Backend::Record(record.to_path_buf()), Some(Duration::from_millis(500))));
+    an_unfinished_dock_swipe_is_cancelled(s, |s, id| assert_eq!(s.viewer.host_said(id).reason, 11));
+}
+
+#[test]
+fn an_unfinished_dock_swipe_is_cancelled_by_release_all() {
+    an_unfinished_dock_swipe_is_cancelled(setup("swipe-release"), |s, id| s.viewer.core.send_input(id, InputMsg::ReleaseAll));
+}
+
+#[test]
+fn a_silent_viewer_mid_gesture_is_cancelled_but_heartbeats_keep_it() {
+    let s = setup("gesture-silence");
+    let id = s.viewer.connect(&s.host);
+    s.viewer.request_control(id, true);
+    s.viewer.core.send_input(id, dock(GesturePhase::Began, 0.0, 0.0));
+    s.viewer.core.send_input(id, dock(GesturePhase::Changed, 0.3, 0.0));
+    assert_eq!(recorded(&s.record, 2).len(), 2);
+    // Heartbeats keep a slow swipe (fingers resting on the trackpad) alive...
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(protocol::HEARTBEAT_INTERVAL_MS));
+        s.viewer.core.send_input(id, InputMsg::Heartbeat);
+    }
+    assert_eq!(recorded(&s.record, 2).len(), 2, "cancelled despite heartbeats");
+    // ...and without them the host cancels it within about a second.
+    let silent = Instant::now();
+    let events = recorded_until(&s.record, "dock:cancelled");
+    assert_eq!(kinds(&events[2..]), ["dock:cancelled"]);
+    let after = silent.elapsed();
+    assert!(after >= Duration::from_millis(800) && after < Duration::from_millis(2000), "cancelled after {after:?}");
+    // A late update of the cancelled swipe doesn't start it again.
+    s.viewer.core.send_input(id, dock(GesturePhase::Changed, 0.5, 0.0));
+    s.viewer.core.send_input(id, InputMsg::Key { code: 5, down: true, repeat: false });
+    assert_eq!(kinds(&recorded_until(&s.record, "keydown5")[3..]), ["keydown5"]);
+}
+
+#[test]
+fn gestures_past_the_relay_limit_die_but_ends_apply() {
+    let s = setup("gesture-relay");
+    let id = s.viewer.connect(&s.host);
+    assert!(s.viewer.request(id, true, false).active);
+    let send = |m| s.viewer.core.send_input(id, m);
+    let pinch = |phase| InputMsg::Gesture(GestureInput::Magnify { x: pos(0.25), y: pos(0.25), phase, delta: 0.1 });
+    send(InputMsg::Relayed { depth: 1 });
+    send(dock(GesturePhase::Began, 0.0, 0.0));
+    send(dock(GesturePhase::Changed, 0.3, 0.0));
+    // Past the limit (it has been around a loop): nothing new starts or moves on...
+    send(InputMsg::Relayed { depth: protocol::MAX_RELAY_DEPTH + 1 });
+    send(dock(GesturePhase::Changed, 0.6, 0.0));
+    send(pinch(GesturePhase::Began));
+    send(InputMsg::Gesture(GestureInput::SmartMagnify { x: 0, y: 0 }));
+    send(InputMsg::System(SystemAction::MISSION_CONTROL));
+    // ...but the swipe in progress still ends, and an end of nothing does nothing.
+    send(dock(GesturePhase::Ended, 0.6, 2.0));
+    send(pinch(GesturePhase::Ended));
+    send(InputMsg::Relayed { depth: 0 });
+    send(InputMsg::Key { code: 3, down: true, repeat: false });
+    let events = recorded_until(&s.record, "keydown3");
+    assert_eq!(kinds(&events), ["dock:began", "dock:changed", "dock:ended", "keydown3"], "{events:#?}");
+    assert_eq!(events[0]["depth"], 1);
+    assert_eq!(events[2]["depth"], protocol::MAX_RELAY_DEPTH + 1);
+    assert!((events[2]["progress"].as_f64().unwrap() - 0.6).abs() < 1e-6, "the end's own values: {events:#?}");
+}
+
+#[test]
+fn system_actions_are_rate_limited() {
+    let s = setup("system-rate");
+    let id = s.viewer.connect(&s.host);
+    assert!(s.viewer.request(id, true, false).active);
+    // Mission Control can't usefully toggle faster than it animates.
+    for _ in 0..10 {
+        s.viewer.core.send_input(id, InputMsg::System(SystemAction::MISSION_CONTROL));
+    }
+    s.viewer.core.send_input(id, InputMsg::Key { code: 5, down: true, repeat: false });
+    s.viewer.core.send_input(id, InputMsg::Key { code: 5, down: false, repeat: false });
+    let events = recorded_until(&s.record, "keyup5");
+    assert_eq!(kinds(&events), ["mission_control", "mission_control", "mission_control", "mission_control", "keydown5", "keyup5"], "{events:#?}");
+    // A second later they work again.
+    std::thread::sleep(Duration::from_millis(1100));
+    s.viewer.core.send_input(id, InputMsg::System(SystemAction::NEXT_SPACE));
+    let events = recorded_until(&s.record, "dock:ended");
+    assert_eq!(kinds(&events[6..]), ["dock:began", "dock:changed", "dock:ended"], "a Space to the right is a one-Space swipe");
+    assert_eq!(events[8]["axis"], "horizontal");
 }

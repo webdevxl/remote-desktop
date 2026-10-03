@@ -27,10 +27,7 @@ struct LanKVMApp: App {
         .defaultSize(width: 1280, height: 800)
         .windowToolbarStyle(.unified(showsTitle: true))
         .commands {
-            CommandMenu("Control") {
-                Toggle("Send System Shortcuts to Remote Mac", isOn: $sendSystemShortcuts)
-                Text("⌘Tab, ⌘Space, Mission Control and screenshot keys go to the Mac you control.")
-            }
+            ControlCommands()
         }
 
         // Shown while another Mac views or controls this one, so whoever sits here can see it
@@ -41,8 +38,53 @@ struct LanKVMApp: App {
             Image(systemName: core.host.controller != nil ? "cursorarrow.rays" : "eye")
         }
     }
+}
 
+/// The Control menu: what the session control offers, for the viewer window in front, plus the
+/// settings. (While input goes to the remote Mac every key does too, so these are for the mouse,
+/// and for when the session control is hidden.)
+private struct ControlCommands: Commands {
+    @FocusedObject private var session: SessionModel?
+    @FocusedObject private var controls: SessionControlModel?
     @AppStorage(SystemShortcuts.defaultsKey) private var sendSystemShortcuts = true
+    @AppStorage(TrackpadGestures.defaultsKey) private var sendTrackpadGestures = true
+    @AppStorage(SessionControlModel.visibleKey) private var showSessionControl = true
+
+    var body: some Commands {
+        CommandMenu("Control") {
+            // A chord of modifiers alone can't be a key equivalent: it's in the titles instead.
+            if controls?.isReleased == true {
+                Button("Resume Control (⌃⌥⌘)") { controls?.resume() }
+            } else {
+                Button("Release Keyboard and Mouse (⌃⌥⌘)") { controls?.release() }
+                    .disabled(controls?.isForwarding != true)
+            }
+            if session?.mode == .control {
+                Button("View Only") { controls?.viewOnly() }
+            } else {
+                Button("Control") { controls?.requestControl() }
+                    .disabled(!connected)
+            }
+            Menu("Remote Mac") {
+                ForEach(RemoteAction.allCases) { action in
+                    Button(action.title) { controls?.perform(action) }
+                }
+            }
+            .disabled(session?.isControlling != true)
+            Divider()
+            Toggle("Send System Shortcuts to Remote Mac", isOn: $sendSystemShortcuts)
+            Text("⌘Tab, ⌘Space, Mission Control and screenshot keys go to the Mac you control.")
+            Toggle("Send Trackpad Gestures to Remote Mac", isOn: $sendTrackpadGestures)
+            Text("Pinch, rotate and swipes go to the Mac you control.")
+            Divider()
+            Toggle("Show Session Control", isOn: $showSessionControl)
+        }
+    }
+
+    private var connected: Bool {
+        if case .connected = session?.phase { return true }
+        return false
+    }
 }
 
 /// The menu-bar menu on a Mac others are connected to.

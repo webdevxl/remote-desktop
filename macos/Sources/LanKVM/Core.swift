@@ -1,3 +1,4 @@
+import Accessibility
 import AppKit
 import ApplicationServices
 import CLanKVM
@@ -104,7 +105,7 @@ final class CoreModel: ObservableObject {
                 session.hostPid = event.hostPid ?? 0
                 if event.active == true {
                     if session.control != .active {
-                        session.showToast("Controlling \(session.hostName) · press ⌃⌥⌘ to stop")
+                        session.showToast("Controlling \(session.hostName) · press ⌃⌥⌘ to release")
                     }
                     session.control = .active
                     session.mode = .control
@@ -345,6 +346,8 @@ final class SessionModel: ObservableObject, Identifiable {
     /// Id of the latest control request; answers to older ones are ignored.
     var latestRequest: UInt32 = 0
     let cursor = RemoteCursor()
+    /// The floating control over the remote screen (and the Control menu's actions).
+    private(set) lazy var sessionControl = SessionControlModel(session: self)
     /// Whether the session ever showed the remote screen (for wording when it ends).
     var wasConnected = false
 
@@ -362,8 +365,10 @@ final class SessionModel: ObservableObject, Identifiable {
 
     private var toastGeneration = 0
 
+    /// Also read out by VoiceOver: each says what just changed.
     func showToast(_ text: String) {
         toast = text
+        AccessibilityNotification.Announcement(text).post()
         toastGeneration += 1
         let generation = toastGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in

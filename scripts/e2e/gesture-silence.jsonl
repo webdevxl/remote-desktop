@@ -1,0 +1,5 @@
+# For a recording host (scripts/e2e-control.sh host record): the viewer leaves a Dock swipe
+# hanging and goes silent. Within about a second the host must cancel it, so the last line of
+# target/e2e/host/injected.jsonl is a "dock" gesture with phase "cancelled".
+{"dock":"vertical","to":0.4,"steps":5,"end":"none"}
+{"sleep":1500}

@@ -14,8 +14,13 @@
 //! - Mouse and scroll posted at the HID tap, keyboard at the session tap (keeps left/right).
 //! - Modifier keys posted as their own key codes, which `CGEventCreateKeyboardEvent` turns into
 //!   flags-changed events.
+//!
+//! Trackpad gestures are held state like buttons: one at a time, ended as cancelled by every
+//! release, so the Dock is never left mid-transition. How their events are built is in
+//! [`crate::gesture`].
 
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use objc2_core_foundation::{CFRetained, CGPoint};
@@ -23,7 +28,10 @@ use objc2_core_graphics::{
     CGDisplayBounds, CGEvent, CGEventField, CGEventFilterMask, CGEventFlags, CGEventSource, CGEventSourceStateID,
     CGEventSuppressionState, CGEventTapLocation, CGEventType, CGMouseButton, CGScrollEventUnit,
 };
+/// The wire's gesture phases and Dock axes, which are plain data, used here as they are.
+pub use protocol::{DockAxis, GesturePhase};
 
+use crate::gesture::{self, DockModes, DockRecipe, DockSample, PROGRESS_EPSILON};
 use crate::keys::{self, CAPS_LOCK, FN, KEY_CAPS_LOCK, KEYBOARD_EVENT_BIT, MODIFIERS, NUMERIC_PAD};
 
 /// High half of the tag stamped into `kCGEventSourceUserData` of every event LanKVM posts
@@ -143,7 +151,105 @@ pub enum Synth {
     /// A key press or release. Modifier key codes post as flags-changed events.
     Key { code: u16, down: bool, autorepeat: bool, flags: u64 },
     Scroll { at: Point, scroll: Scroll, flags: u64 },
+    /// A swipe the Dock acts on, in this Mac's own direction convention (the wire's values times
+    /// `gesture::dock_direction`).
+    DockSwipe { axis: DockAxis, phase: GesturePhase, progress: f64, velocity_x: f64, velocity_y: f64, inverted: bool },
+    /// A pinch or rotation for the window it began over: `value` is the magnification or the
+    /// degrees since the previous event.
+    AppGesture { at: Point, phase: GesturePhase, kind: AppGestureKind, value: f64, flags: u64 },
+    /// A two-finger double tap.
+    SmartMagnify { at: Point, flags: u64 },
+    /// A swipe between pages: -1, 0 or 1 per axis, as `NSEvent.deltaX/Y`.
+    NavigationSwipe { at: Point, dx: i8, dy: i8, flags: u64 },
+    /// Something done to the Mac as a whole rather than posted as an event.
+    System(SystemAction),
 }
+
+/// A gesture with phases, as [`InputState::gesture`] takes it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Gesture {
+    /// Values in this Mac's own direction convention (the wire's times
+    /// `gesture::dock_direction`).
+    DockSwipe { axis: DockAxis, progress: f64, velocity_x: f64, velocity_y: f64, inverted: bool },
+    /// `delta` as `NSEvent.magnification`, since the previous event.
+    Magnify { delta: f64 },
+    /// `degrees` as `NSEvent.rotation` (counterclockwise positive), since the previous event.
+    Rotate { degrees: f64 },
+}
+
+/// A gesture with phases that goes to the window under the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppGestureKind {
+    Magnify,
+    Rotate,
+}
+
+/// Something to do on the Mac as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemAction {
+    MissionControl,
+    /// The front app's windows.
+    AppExpose,
+    ShowDesktop,
+    /// Launchpad, or Apps from macOS 26 on.
+    Launchpad,
+    /// One Space (or full-screen app) to the left.
+    PreviousSpace,
+    /// One Space (or full-screen app) to the right.
+    NextSpace,
+}
+
+impl SystemAction {
+    /// The action a wire code names; None for a code this version doesn't know.
+    pub fn from_wire(action: protocol::SystemAction) -> Option<Self> {
+        Some(match action {
+            protocol::SystemAction::MISSION_CONTROL => Self::MissionControl,
+            protocol::SystemAction::APP_EXPOSE => Self::AppExpose,
+            protocol::SystemAction::SHOW_DESKTOP => Self::ShowDesktop,
+            protocol::SystemAction::LAUNCHPAD => Self::Launchpad,
+            protocol::SystemAction::PREVIOUS_SPACE => Self::PreviousSpace,
+            protocol::SystemAction::NEXT_SPACE => Self::NextSpace,
+            _ => return None,
+        })
+    }
+}
+
+/// A gesture in progress.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HeldGesture {
+    kind: HeldKind,
+    /// Where a pinch or rotation began: AppKit sends all of it to the view under that point.
+    at: Point,
+    /// A Dock swipe's latest progress and flag, which its cancel repeats.
+    progress: f64,
+    inverted: bool,
+    /// Swallowed here and recognised when it ends: its axis has no working Dock swipe recipe.
+    discrete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldKind {
+    Dock(DockAxis),
+    Magnify,
+    Rotate,
+}
+
+impl HeldKind {
+    fn of(gesture: &Gesture) -> Self {
+        match *gesture {
+            Gesture::DockSwipe { axis, .. } => Self::Dock(axis),
+            Gesture::Magnify { .. } => Self::Magnify,
+            Gesture::Rotate { .. } => Self::Rotate,
+        }
+    }
+}
+
+/// A discrete Dock swipe acts where the Dock would commit: past half a transition, or flung
+/// the same way after some travel. The fling numbers are guesses (progress per second is
+/// assumed), pending real trackpad recordings.
+const DISCRETE_COMMIT_PROGRESS: f64 = 0.5;
+const DISCRETE_FLING_PROGRESS: f64 = 0.1;
+const DISCRETE_FLING_VELOCITY: f64 = 2.0;
 
 /// What has been pressed on the host on behalf of one remote viewer.
 #[derive(Debug)]
@@ -158,6 +264,10 @@ pub struct InputState {
     pos: Point,
     /// Fractional pixels left over from integer mouse deltas.
     delta_rem: (f64, f64),
+    /// The gesture in progress (one at a time, like a trackpad).
+    gesture: Option<HeldGesture>,
+    /// How this Mac's Dock takes swipes (see [`set_dock_modes`](Self::set_dock_modes)).
+    dock: DockModes,
 }
 
 impl InputState {
@@ -172,6 +282,8 @@ impl InputState {
             event_number,
             pos,
             delta_rem: (0.0, 0.0),
+            gesture: None,
+            dock: DockModes::default(),
         }
     }
 
@@ -183,9 +295,23 @@ impl InputState {
         self.pos
     }
 
-    /// Whether any key, modifier or button is held (Caps Lock is a state, not a held key).
+    /// Whether any key, modifier or button is held, or a gesture is in progress (Caps Lock is a
+    /// state, not a held key). A viewer that goes silent while this holds gets everything
+    /// released: that is also what cancels a Dock swipe left hanging.
     pub fn holds_anything(&self) -> bool {
-        !self.keys.is_empty() || self.buttons != 0 || self.mods & !CAPS_LOCK != 0
+        !self.keys.is_empty() || self.buttons != 0 || self.mods & !CAPS_LOCK != 0 || self.gesture.is_some()
+    }
+
+    /// How Dock swipes are handled here: which axes are recognised rather than replayed, and the
+    /// direction factors behind the Space swipes [`system`](Self::system) makes. Defaults to
+    /// `DockModes::default()`, the same on any Mac (for recordings); a host posting real events
+    /// sets `gesture::dock_modes()`.
+    pub fn set_dock_modes(&mut self, modes: DockModes) {
+        self.dock = modes;
+    }
+
+    pub fn dock_modes(&self) -> DockModes {
+        self.dock
     }
 
     /// Brings the held modifiers, Caps Lock and fn to `target` (any flags; normalized here),
@@ -317,10 +443,172 @@ impl InputState {
         }
     }
 
-    /// Releases every key, button and modifier, and puts Caps Lock back to the host's own state.
-    /// Buttons go up while the modifiers are still down, so a drag in progress (⌥-drag to copy)
-    /// drops the way it was meant to.
+    /// One phase of a gesture. Began ends any gesture in progress first (as cancelled) and, for
+    /// a pinch or rotation, moves to `at` first: AppKit sends the whole gesture to the view under
+    /// the pointer where it began, so its later events go there too, wherever `at` says. Changed,
+    /// Ended and Cancelled apply only to the gesture in progress (same kind, same Dock axis) and
+    /// are dropped otherwise, like the release of a key that isn't held.
+    ///
+    /// On an axis whose Dock swipes are discrete (see [`set_dock_modes`](Self::set_dock_modes)),
+    /// the swipe posts nothing while it lasts; when it ends past the Dock's commit point it
+    /// becomes the matching [`SystemAction`].
+    pub fn gesture(&mut self, phase: GesturePhase, gesture: Gesture, at: Option<Point>, out: &mut Vec<Synth>) {
+        let kind = HeldKind::of(&gesture);
+        if phase == GesturePhase::Began {
+            self.cancel_gesture(out);
+            let at = match (kind, at) {
+                (HeldKind::Magnify | HeldKind::Rotate, Some(at)) => {
+                    if at != self.pos {
+                        self.move_to(at, out);
+                    }
+                    at
+                }
+                _ => self.pos,
+            };
+            let discrete = matches!(kind, HeldKind::Dock(axis) if self.dock.recipe(axis) == DockRecipe::Discrete);
+            self.gesture = Some(HeldGesture { kind, at, progress: 0.0, inverted: false, discrete });
+        }
+        let Some(held) = self.gesture.as_mut().filter(|h| h.kind == kind) else { return };
+        if let Gesture::DockSwipe { progress, inverted, .. } = gesture {
+            (held.progress, held.inverted) = (progress, inverted);
+        }
+        let held = *held;
+        if phase.ends() {
+            self.gesture = None;
+        }
+        if held.discrete {
+            if phase == GesturePhase::Ended
+                && let Some(action) = self.recognise(gesture)
+            {
+                out.push(Synth::System(action));
+            }
+            return;
+        }
+        out.push(self.gesture_event(phase, gesture, held.at));
+    }
+
+    /// Ends the gesture in progress, if any, as cancelled: a Dock swipe at its latest progress
+    /// with no velocity, which makes the Dock snap back. Nothing to end for a discrete swipe.
+    pub fn cancel_gesture(&mut self, out: &mut Vec<Synth>) {
+        let Some(held) = self.gesture.take() else { return };
+        if held.discrete {
+            return;
+        }
+        let cancel = match held.kind {
+            HeldKind::Dock(axis) => Gesture::DockSwipe { axis, progress: held.progress, velocity_x: 0.0, velocity_y: 0.0, inverted: held.inverted },
+            HeldKind::Magnify => Gesture::Magnify { delta: 0.0 },
+            HeldKind::Rotate => Gesture::Rotate { degrees: 0.0 },
+        };
+        out.push(self.gesture_event(GesturePhase::Cancelled, cancel, held.at));
+    }
+
+    /// Cancels a pinch or rotation in progress but not a Dock swipe (e.g. when the display it
+    /// was on went away; a Dock swipe isn't tied to a display).
+    pub fn cancel_positioned_gesture(&mut self, out: &mut Vec<Synth>) {
+        if self.gesture.is_some_and(|h| !matches!(h.kind, HeldKind::Dock(_))) {
+            self.cancel_gesture(out);
+        }
+    }
+
+    /// A two-finger double tap at `at` (moving there first if needed). Not held.
+    pub fn smart_magnify(&mut self, at: Point, out: &mut Vec<Synth>) {
+        if at != self.pos {
+            self.move_to(at, out);
+        }
+        out.push(Synth::SmartMagnify { at, flags: self.mods });
+    }
+
+    /// A swipe between pages at `at` (moving there first if needed): -1, 0 or 1 per axis. Not
+    /// held; one without a direction is dropped.
+    pub fn navigation_swipe(&mut self, at: Point, dx: i8, dy: i8, out: &mut Vec<Synth>) {
+        let (dx, dy) = (dx.signum(), dy.signum());
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        if at != self.pos {
+            self.move_to(at, out);
+        }
+        out.push(Synth::NavigationSwipe { at, dx, dy, flags: self.mods });
+    }
+
+    /// Does `action` on the Mac, after ending any gesture in progress. Previous and Next Space
+    /// become a one-Space Dock swipe (Space Rabbit's: began at ±ε, changed to ±1, ended at ±1
+    /// with a fling), so they are posted, recorded and tested like any swipe. The rest, and
+    /// Spaces when horizontal swipes are discrete, are [`Synth::System`].
+    pub fn system(&mut self, action: SystemAction, out: &mut Vec<Synth>) {
+        self.cancel_gesture(out);
+        let right = match action {
+            SystemAction::NextSpace => 1.0,
+            SystemAction::PreviousSpace => -1.0,
+            _ => {
+                out.push(Synth::System(action));
+                return;
+            }
+        };
+        if self.dock.recipe(DockAxis::Horizontal) == DockRecipe::Discrete {
+            out.push(Synth::System(action));
+            return;
+        }
+        let sign = right * self.dock.direction(DockAxis::Horizontal);
+        let swipe = |phase, progress: f64, velocity: f64| Synth::DockSwipe {
+            axis: DockAxis::Horizontal,
+            phase,
+            progress: sign * progress,
+            velocity_x: sign * velocity,
+            velocity_y: 0.0,
+            inverted: false,
+        };
+        out.push(swipe(GesturePhase::Began, PROGRESS_EPSILON, 0.0));
+        out.push(swipe(GesturePhase::Changed, 1.0, 0.0));
+        out.push(swipe(GesturePhase::Ended, 1.0, self.dock.hop_velocity));
+    }
+
+    fn gesture_event(&self, phase: GesturePhase, gesture: Gesture, at: Point) -> Synth {
+        match gesture {
+            Gesture::DockSwipe { axis, progress, velocity_x, velocity_y, inverted } => {
+                Synth::DockSwipe { axis, phase, progress, velocity_x, velocity_y, inverted }
+            }
+            Gesture::Magnify { delta } => Synth::AppGesture { at, phase, kind: AppGestureKind::Magnify, value: delta, flags: self.mods },
+            Gesture::Rotate { degrees } => Synth::AppGesture { at, phase, kind: AppGestureKind::Rotate, value: degrees, flags: self.mods },
+        }
+    }
+
+    /// The action a discrete Dock swipe that just ended asks for, if it went far or fast enough.
+    /// Directions are the wire's (this Mac's values times its direction factor, which is its own
+    /// inverse): + is right, up (Mission Control) or apart. Unverified: that the "inverted" flag
+    /// flips the direction, and the fling threshold.
+    fn recognise(&self, gesture: Gesture) -> Option<SystemAction> {
+        let Gesture::DockSwipe { axis, progress, velocity_x, velocity_y, inverted } = gesture else { return None };
+        let sign = self.dock.direction(axis) * if inverted { -1.0 } else { 1.0 };
+        let progress = progress * sign;
+        let velocity = sign
+            * match axis {
+                DockAxis::Horizontal => velocity_x,
+                DockAxis::Vertical => velocity_y,
+                // Which one a pinch fills is unknown: take the larger.
+                DockAxis::Pinch if velocity_x.abs() >= velocity_y.abs() => velocity_x,
+                DockAxis::Pinch => velocity_y,
+            };
+        let flung = progress.abs() >= DISCRETE_FLING_PROGRESS && velocity * progress > 0.0 && velocity.abs() >= DISCRETE_FLING_VELOCITY;
+        if progress.abs() < DISCRETE_COMMIT_PROGRESS && !flung {
+            return None;
+        }
+        Some(match (axis, progress > 0.0) {
+            (DockAxis::Horizontal, true) => SystemAction::NextSpace,
+            (DockAxis::Horizontal, false) => SystemAction::PreviousSpace,
+            (DockAxis::Vertical, true) => SystemAction::MissionControl,
+            (DockAxis::Vertical, false) => SystemAction::AppExpose,
+            (DockAxis::Pinch, true) => SystemAction::ShowDesktop,
+            (DockAxis::Pinch, false) => SystemAction::Launchpad,
+        })
+    }
+
+    /// Ends any gesture in progress (as cancelled), then releases every key, button and modifier,
+    /// and puts Caps Lock back to the host's own state. The gesture ends first, under the flags
+    /// it began with. Buttons go up while the modifiers are still down, so a drag in progress
+    /// (⌥-drag to copy) drops the way it was meant to.
     pub fn release_all(&mut self, host_caps_lock: bool, out: &mut Vec<Synth>) {
+        self.cancel_gesture(out);
         for code in std::mem::take(&mut self.keys) {
             out.push(self.key_event(code, false, false));
         }
@@ -341,6 +629,35 @@ pub struct Poster {
     tag: i64,
     /// Post to this process only (tests), instead of to the whole session.
     pid: Option<i32>,
+    /// The end of the last Dock swipe, due to go out once more.
+    resend: TerminalResend,
+    resend_delay: Option<Duration>,
+    dock_unavailable_warned: bool,
+}
+
+/// Mac Mouse Fix's fix for a Dock that misses the end of a swipe and stays stuck mid-transition:
+/// the end goes out once more a little later (`gesture::terminal_resend_delay`), unless another
+/// swipe began meanwhile.
+#[derive(Debug, Default)]
+struct TerminalResend {
+    pending: Option<(Instant, Synth, u8)>,
+}
+
+impl TerminalResend {
+    /// Notes a posted Dock swipe event.
+    fn note(&mut self, synth: &Synth, depth: u8, now: Instant, delay: Option<Duration>) {
+        let Synth::DockSwipe { phase, .. } = *synth else { return };
+        if phase == GesturePhase::Began {
+            self.pending = None;
+        } else if phase.ends() {
+            self.pending = delay.map(|delay| (now + delay, synth.clone(), depth));
+        }
+    }
+
+    /// The end to post again, once it is due.
+    fn take_due(&mut self, now: Instant) -> Option<(Synth, u8)> {
+        self.pending.take_if(|(at, ..)| now >= *at).map(|(_, synth, depth)| (synth, depth))
+    }
 }
 
 // SAFETY: a CGEventSource is a thread-safe CoreFoundation object; the poster is used from one
@@ -368,11 +685,19 @@ impl Poster {
             all,
             CGEventSuppressionState::EventSuppressionStateRemoteMouseDrag,
         );
-        Ok(Self { source, tag, pid: None })
+        Ok(Self {
+            source,
+            tag,
+            pid: None,
+            resend: TerminalResend::default(),
+            resend_delay: gesture::terminal_resend_delay(),
+            dock_unavailable_warned: false,
+        })
     }
 
     /// Like [`new`](Self::new), but delivers every event to process `pid` only, wherever the
     /// cursor and focus are (for tests: control one app without touching the rest of the Mac).
+    /// Dock swipes and system actions are skipped: they act on the whole Mac.
     pub fn for_pid(tag: i64, pid: i32) -> Result<Self> {
         Ok(Self { pid: Some(pid), ..Self::new(tag)? })
     }
@@ -388,7 +713,7 @@ impl Poster {
     }
 
     /// Posts `synth`, stamped with the relay depth of the input it came from.
-    pub fn post(&self, synth: &Synth, depth: u8) {
+    pub fn post(&mut self, synth: &Synth, depth: u8) {
         let src = Some(&*self.source);
         match *synth {
             Synth::Mouse { kind, at, button, click_state, event_number, dx, dy, flags } => {
@@ -436,7 +761,70 @@ impl Poster {
                 CGEvent::set_flags(e, CGEventFlags(flags));
                 self.send(CGEventTapLocation::HIDEventTap, e.expect("created above"), depth);
             }
+            Synth::DockSwipe { .. } => {
+                if self.post_dock_swipe(synth, depth) {
+                    self.resend.note(synth, depth, Instant::now(), self.resend_delay);
+                }
+            }
+            // Gestures go where mouse events go, so they can't overtake the move before them.
+            Synth::AppGesture { at, phase, kind, value, flags } => {
+                let e = match kind {
+                    AppGestureKind::Magnify => gesture::magnify_event(src, at, phase, value, flags),
+                    AppGestureKind::Rotate => gesture::rotate_event(src, at, phase, value, flags),
+                };
+                let Some(e) = e else { return };
+                self.send(CGEventTapLocation::HIDEventTap, &e, depth);
+            }
+            Synth::SmartMagnify { at, flags } => {
+                let Some(e) = gesture::smart_magnify_event(src, at, flags) else { return };
+                self.send(CGEventTapLocation::HIDEventTap, &e, depth);
+            }
+            Synth::NavigationSwipe { at, dx, dy, flags } => {
+                let Some(events) = gesture::navigation_swipe_events(src, at, dx, dy, flags) else { return };
+                for e in &events {
+                    self.send(CGEventTapLocation::HIDEventTap, e, depth);
+                }
+            }
+            // They act on the whole Mac, which pid mode promises not to touch.
+            Synth::System(action) => {
+                if self.pid.is_none() {
+                    gesture::perform(action);
+                }
+            }
         }
+    }
+
+    /// Posts what has come due: the end of the last Dock swipe, once more. Call it regularly (the
+    /// input thread's 100 ms tick); nothing happens on its own, so recordings stay deterministic.
+    pub fn poll(&mut self, now: Instant) {
+        if let Some((synth, depth)) = self.resend.take_due(now) {
+            self.post_dock_swipe(&synth, depth);
+        }
+    }
+
+    /// Posts a [`Synth::DockSwipe`] with this Mac's recipe for its axis, at the session tap where
+    /// the Dock reads it. Whether it was posted.
+    fn post_dock_swipe(&mut self, synth: &Synth, depth: u8) -> bool {
+        let Synth::DockSwipe { axis, phase, progress, velocity_x, velocity_y, inverted } = *synth else { return false };
+        // Swipes act on the whole Mac, which pid mode promises not to touch.
+        if self.pid.is_some() {
+            return false;
+        }
+        let recipe = gesture::dock_recipe(axis);
+        let sample = DockSample { axis, phase, progress, velocity_x, velocity_y, inverted };
+        // Made without a source (as in every recipe known to work), so tagged here, every time.
+        let Some(events) = gesture::dock_swipe_events(recipe, gesture::os_major(), &sample, tag_with_depth(self.tag, depth)) else {
+            if !self.dock_unavailable_warned {
+                tracing::warn!(?axis, ?recipe, "dock swipe not posted: no working recipe for it on this mac");
+                self.dock_unavailable_warned = true;
+            }
+            return false;
+        };
+        CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&events.dock));
+        if let Some(companion) = &events.companion {
+            CGEvent::post(CGEventTapLocation::SessionEventTap, Some(companion));
+        }
+        true
     }
 }
 
@@ -444,6 +832,8 @@ impl Poster {
 /// where they would reach one process. Pointer events must land on a window of that process that
 /// is front-most at that point; key presses need that process's window in front. The release of
 /// a delivered press always passes (nothing may stay held); that of a dropped press is dropped too.
+/// Gestures follow the same rules (the rest of a pinch goes where its start went); Dock swipes
+/// and system actions never pass, since they change the whole Mac.
 pub struct InjectGuard {
     pid: i32,
     windows: Vec<WindowInfo>,
@@ -451,6 +841,8 @@ pub struct InjectGuard {
     /// Keys whose press got through, so their release must too.
     delivered_keys: BTreeSet<u16>,
     dropped_buttons: u32,
+    /// Whether the pinch or rotation in progress began over the target.
+    delivered_gesture: bool,
     pub dropped: u64,
 }
 
@@ -464,7 +856,15 @@ pub struct WindowInfo {
 
 impl InjectGuard {
     pub fn new(pid: i32) -> Self {
-        Self { pid, windows: Vec::new(), refreshed: None, delivered_keys: BTreeSet::new(), dropped_buttons: 0, dropped: 0 }
+        Self {
+            pid,
+            windows: Vec::new(),
+            refreshed: None,
+            delivered_keys: BTreeSet::new(),
+            dropped_buttons: 0,
+            delivered_gesture: false,
+            dropped: 0,
+        }
     }
 
     pub fn allows(&mut self, synth: &Synth) -> bool {
@@ -512,6 +912,21 @@ impl InjectGuard {
                 ok
             }
             Synth::Scroll { at, .. } => self.owner_at(at) == Some(self.pid),
+            Synth::DockSwipe { .. } | Synth::System(_) => false,
+            Synth::AppGesture { at, phase: GesturePhase::Began, .. } => {
+                self.delivered_gesture = self.owner_at(at) == Some(self.pid);
+                self.delivered_gesture
+            }
+            // No new check of the position: the gesture stays with its window, and one that
+            // began there always ends.
+            Synth::AppGesture { phase, .. } => {
+                let delivered = self.delivered_gesture;
+                if phase.ends() {
+                    self.delivered_gesture = false;
+                }
+                delivered
+            }
+            Synth::SmartMagnify { at, .. } | Synth::NavigationSwipe { at, .. } => self.owner_at(at) == Some(self.pid),
         }
     }
 
@@ -632,6 +1047,33 @@ mod tests {
 
     fn state() -> InputState {
         InputState::new(p(100.0, 100.0), false, 1000)
+    }
+
+    fn dock(axis: DockAxis, progress: f64) -> Gesture {
+        Gesture::DockSwipe { axis, progress, velocity_x: 0.0, velocity_y: 0.0, inverted: false }
+    }
+
+    fn dock_end(axis: DockAxis, progress: f64, velocity_x: f64, velocity_y: f64) -> Gesture {
+        Gesture::DockSwipe { axis, progress, velocity_x, velocity_y, inverted: false }
+    }
+
+    /// The phases of the gestures in `out`, with their progress or value.
+    fn gesture_events(out: &[Synth]) -> Vec<(GesturePhase, f64)> {
+        out.iter()
+            .filter_map(|e| match *e {
+                Synth::DockSwipe { phase, progress, .. } => Some((phase, progress)),
+                Synth::AppGesture { phase, value, .. } => Some((phase, value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn with_discrete(axis: DockAxis) -> InputState {
+        let mut s = state();
+        let defaults = DockModes::default();
+        let recipes = [DockAxis::Horizontal, DockAxis::Vertical, DockAxis::Pinch].map(|a| if a == axis { DockRecipe::Discrete } else { defaults.recipe(a) });
+        s.set_dock_modes(DockModes { recipes, ..defaults });
+        s
     }
 
     #[test]
@@ -870,6 +1312,8 @@ mod tests {
         s.key(1, true, false, &mut out);
         s.button(0, true, 1, p(10.0, 10.0), &mut out);
         s.button(2, true, 1, p(10.0, 10.0), &mut out);
+        s.gesture(GesturePhase::Began, dock(DockAxis::Vertical, 0.0), None, &mut out);
+        s.gesture(GesturePhase::Changed, dock(DockAxis::Vertical, 0.3), None, &mut out);
         assert!(s.holds_anything());
         out.clear();
         s.release_all(false, &mut out);
@@ -879,10 +1323,15 @@ mod tests {
             .map(|e| match e {
                 Synth::Key { code, down: false, .. } => format!("key{code}"),
                 Synth::Mouse { kind: MouseKind::Up, button, .. } => format!("button{button}"),
+                Synth::DockSwipe { phase: GesturePhase::Cancelled, .. } => "dock".to_string(),
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
-        assert_eq!(ups, ["key0", "key1", "button0", "button2", "key63", "key55"], "buttons before modifiers, which go in reverse press order");
+        assert_eq!(
+            ups,
+            ["dock", "key0", "key1", "button0", "button2", "key63", "key55"],
+            "the gesture first, then buttons before modifiers, which go in reverse press order"
+        );
         out.clear();
         s.release_all(false, &mut out);
         assert!(out.is_empty(), "nothing left to release");
@@ -909,5 +1358,271 @@ mod tests {
         assert_eq!(out[1], Synth::Scroll { at: p(300.0, 200.0), scroll, flags: 0 });
         s.scroll(scroll, p(300.0, 200.0), &mut out);
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn a_dock_swipe_goes_out_phase_by_phase_while_it_is_held() {
+        use GesturePhase::*;
+        let mut s = state();
+        let mut out = Vec::new();
+        s.gesture(Began, dock(DockAxis::Vertical, 0.0), None, &mut out);
+        assert!(s.holds_anything(), "a swipe in progress is held, so silence cancels it");
+        s.gesture(Changed, dock(DockAxis::Vertical, 0.4), None, &mut out);
+        s.gesture(Ended, dock_end(DockAxis::Vertical, 0.9, 0.0, 3.5), None, &mut out);
+        assert!(!s.holds_anything());
+        assert_eq!(gesture_events(&out), [(Began, 0.0), (Changed, 0.4), (Ended, 0.9)]);
+        assert_eq!(
+            out[2],
+            Synth::DockSwipe { axis: DockAxis::Vertical, phase: Ended, progress: 0.9, velocity_x: 0.0, velocity_y: 3.5, inverted: false }
+        );
+        assert_eq!(s.position(), p(100.0, 100.0), "a Dock swipe doesn't move the pointer");
+    }
+
+    #[test]
+    fn gesture_updates_without_their_start_are_dropped() {
+        use GesturePhase::*;
+        let mut s = state();
+        let mut out = Vec::new();
+        s.gesture(Changed, dock(DockAxis::Horizontal, 0.2), None, &mut out);
+        s.gesture(Ended, dock(DockAxis::Horizontal, 0.2), None, &mut out);
+        s.gesture(Cancelled, Gesture::Magnify { delta: 0.0 }, Some(p(1.0, 1.0)), &mut out);
+        assert!(out.is_empty(), "{out:#?}");
+        s.gesture(Began, dock(DockAxis::Horizontal, 0.0), None, &mut out);
+        s.gesture(Changed, dock(DockAxis::Vertical, 0.5), None, &mut out);
+        s.gesture(Changed, Gesture::Rotate { degrees: 3.0 }, Some(p(1.0, 1.0)), &mut out);
+        assert_eq!(gesture_events(&out), [(Began, 0.0)], "another axis or kind is not the swipe in progress");
+        s.gesture(Ended, dock(DockAxis::Horizontal, 0.7), None, &mut out);
+        s.gesture(Ended, dock(DockAxis::Horizontal, 0.7), None, &mut out);
+        assert_eq!(gesture_events(&out), [(Began, 0.0), (Ended, 0.7)], "a second end is dropped");
+    }
+
+    #[test]
+    fn a_new_gesture_cancels_the_one_in_progress() {
+        use GesturePhase::*;
+        let mut s = state();
+        let mut out = Vec::new();
+        s.gesture(Began, dock(DockAxis::Vertical, 0.0), None, &mut out);
+        s.gesture(Changed, Gesture::DockSwipe { axis: DockAxis::Vertical, progress: -0.35, velocity_x: 1.0, velocity_y: 2.0, inverted: true }, None, &mut out);
+        out.clear();
+        s.gesture(Began, Gesture::Magnify { delta: 0.0 }, Some(p(300.0, 200.0)), &mut out);
+        assert_eq!(
+            out[0],
+            Synth::DockSwipe { axis: DockAxis::Vertical, phase: Cancelled, progress: -0.35, velocity_x: 0.0, velocity_y: 0.0, inverted: true },
+            "cancelled where it was, without a fling"
+        );
+        assert!(matches!(out[1], Synth::Mouse { kind: MouseKind::Moved, at, .. } if at == p(300.0, 200.0)), "{out:#?}");
+        assert!(matches!(out[2], Synth::AppGesture { phase: Began, kind: AppGestureKind::Magnify, .. }));
+        // A Dock swipe on another axis also replaces one.
+        out.clear();
+        s.gesture(Began, dock(DockAxis::Horizontal, 0.0), None, &mut out);
+        assert_eq!(gesture_events(&out), [(Cancelled, 0.0), (Began, 0.0)]);
+    }
+
+    #[test]
+    fn a_pinch_stays_where_it_began_and_carries_the_modifiers() {
+        use GesturePhase::*;
+        let mut s = state();
+        let mut out = Vec::new();
+        s.set_modifiers(COMMAND | DEVICE_LCMD, &mut out);
+        out.clear();
+        s.gesture(Began, Gesture::Rotate { degrees: 0.0 }, Some(p(50.0, 60.0)), &mut out);
+        s.gesture(Changed, Gesture::Rotate { degrees: 4.5 }, Some(p(51.0, 60.0)), &mut out);
+        s.gesture(Ended, Gesture::Rotate { degrees: 0.0 }, Some(p(52.0, 61.0)), &mut out);
+        assert_eq!(out.len(), 4, "one move, then the three phases: {out:#?}");
+        for e in &out[1..] {
+            let Synth::AppGesture { at, kind, flags, .. } = *e else { panic!("{e:?}") };
+            assert_eq!((at, kind, flags), (p(50.0, 60.0), AppGestureKind::Rotate, COMMAND | DEVICE_LCMD));
+        }
+        assert_eq!(gesture_events(&out), [(Began, 0.0), (Changed, 4.5), (Ended, 0.0)]);
+    }
+
+    #[test]
+    fn cancelling_keeps_the_last_progress_and_needs_a_gesture() {
+        use GesturePhase::*;
+        let mut s = state();
+        let mut out = Vec::new();
+        s.cancel_gesture(&mut out);
+        assert!(out.is_empty());
+        s.gesture(Began, dock(DockAxis::Pinch, 0.0), None, &mut out);
+        s.gesture(Changed, dock(DockAxis::Pinch, 0.62), None, &mut out);
+        s.cancel_gesture(&mut out);
+        assert_eq!(gesture_events(&out), [(Began, 0.0), (Changed, 0.62), (Cancelled, 0.62)]);
+        assert!(!s.holds_anything());
+        s.gesture(Changed, dock(DockAxis::Pinch, 0.7), None, &mut out);
+        assert_eq!(out.len(), 3, "a late update after the cancel is dropped");
+        // A pinch cancels with no further zoom.
+        s.gesture(Began, Gesture::Magnify { delta: 0.0 }, Some(p(100.0, 100.0)), &mut out);
+        s.gesture(Changed, Gesture::Magnify { delta: 0.1 }, Some(p(100.0, 100.0)), &mut out);
+        s.cancel_gesture(&mut out);
+        assert!(matches!(out.last(), Some(Synth::AppGesture { phase: Cancelled, value: 0.0, .. })));
+    }
+
+    #[test]
+    fn a_lost_display_cancels_a_pinch_but_not_a_dock_swipe() {
+        use GesturePhase::*;
+        let mut s = state();
+        let mut out = Vec::new();
+        s.gesture(Began, dock(DockAxis::Horizontal, 0.0), None, &mut out);
+        s.cancel_positioned_gesture(&mut out);
+        assert!(s.holds_anything());
+        s.gesture(Began, Gesture::Magnify { delta: 0.0 }, Some(p(100.0, 100.0)), &mut out);
+        out.clear();
+        s.cancel_positioned_gesture(&mut out);
+        assert!(matches!(out[..], [Synth::AppGesture { phase: Cancelled, .. }]), "{out:#?}");
+        assert!(!s.holds_anything());
+    }
+
+    #[test]
+    fn taps_are_not_held() {
+        let mut s = state();
+        let mut out = Vec::new();
+        s.smart_magnify(p(10.0, 20.0), &mut out);
+        s.navigation_swipe(p(10.0, 20.0), -3, 0, &mut out);
+        s.navigation_swipe(p(10.0, 20.0), 0, 0, &mut out);
+        assert!(!s.holds_anything());
+        assert!(matches!(out[0], Synth::Mouse { kind: MouseKind::Moved, .. }));
+        assert_eq!(out[1], Synth::SmartMagnify { at: p(10.0, 20.0), flags: 0 });
+        assert_eq!(out[2], Synth::NavigationSwipe { at: p(10.0, 20.0), dx: -1, dy: 0, flags: 0 });
+        assert_eq!(out.len(), 3, "a swipe without a direction is dropped");
+    }
+
+    #[test]
+    fn spaces_are_one_space_dock_swipes() {
+        use GesturePhase::*;
+        let mut s = state();
+        let mut out = Vec::new();
+        s.system(SystemAction::NextSpace, &mut out);
+        assert_eq!(gesture_events(&out), [(Began, PROGRESS_EPSILON), (Changed, 1.0), (Ended, 1.0)]);
+        assert!(matches!(out[2], Synth::DockSwipe { axis: DockAxis::Horizontal, velocity_x: 8.0, velocity_y: 0.0, .. }));
+        assert!(!s.holds_anything(), "the swipe is complete");
+        out.clear();
+        s.system(SystemAction::PreviousSpace, &mut out);
+        assert_eq!(gesture_events(&out), [(Began, -PROGRESS_EPSILON), (Changed, -1.0), (Ended, -1.0)]);
+        // Where this Mac's Dock reads horizontal swipes the other way round (macOS 27 with Natural
+        // scrolling), and flings harder.
+        s.set_dock_modes(DockModes { directions: [-1.0, 1.0, 1.0], hop_velocity: 9999.0, ..DockModes::default() });
+        out.clear();
+        s.system(SystemAction::NextSpace, &mut out);
+        assert!(matches!(out[2], Synth::DockSwipe { progress: -1.0, velocity_x: -9999.0, .. }), "{out:#?}");
+        // The others are done directly, after ending a gesture in progress.
+        out.clear();
+        s.gesture(Began, dock(DockAxis::Vertical, 0.0), None, &mut out);
+        s.system(SystemAction::MissionControl, &mut out);
+        assert!(matches!(out[1..], [Synth::DockSwipe { phase: Cancelled, .. }, Synth::System(SystemAction::MissionControl)]), "{out:#?}");
+    }
+
+    #[test]
+    fn discrete_dock_swipes_become_actions_when_they_end() {
+        use GesturePhase::*;
+        let swipe = |s: &mut InputState, axis, end: Gesture, out: &mut Vec<Synth>| {
+            s.gesture(Began, dock(axis, 0.0), None, out);
+            s.gesture(Changed, dock(axis, 0.2), None, out);
+            assert!(s.holds_anything(), "held (heartbeats keep it) but not posted");
+            s.gesture(Ended, end, None, out);
+        };
+        let cases = [
+            (DockAxis::Vertical, dock(DockAxis::Vertical, 0.6), Some(SystemAction::MissionControl)),
+            (DockAxis::Vertical, dock(DockAxis::Vertical, -0.6), Some(SystemAction::AppExpose)),
+            (DockAxis::Vertical, dock(DockAxis::Vertical, 0.3), None),
+            (DockAxis::Vertical, dock_end(DockAxis::Vertical, 0.3, 0.0, 5.0), Some(SystemAction::MissionControl)),
+            (DockAxis::Vertical, dock_end(DockAxis::Vertical, 0.3, 5.0, 0.0), None),
+            (DockAxis::Vertical, dock_end(DockAxis::Vertical, 0.3, 0.0, -5.0), None),
+            (DockAxis::Vertical, dock_end(DockAxis::Vertical, 0.05, 0.0, 5.0), None),
+            (DockAxis::Horizontal, dock(DockAxis::Horizontal, 1.2), Some(SystemAction::NextSpace)),
+            (DockAxis::Horizontal, dock_end(DockAxis::Horizontal, -0.2, -3.0, 0.0), Some(SystemAction::PreviousSpace)),
+            (DockAxis::Pinch, dock(DockAxis::Pinch, 0.8), Some(SystemAction::ShowDesktop)),
+            (DockAxis::Pinch, dock_end(DockAxis::Pinch, -0.4, 0.0, -3.0), Some(SystemAction::Launchpad)),
+            (
+                DockAxis::Vertical,
+                Gesture::DockSwipe { axis: DockAxis::Vertical, progress: 0.6, velocity_x: 0.0, velocity_y: 0.0, inverted: true },
+                Some(SystemAction::AppExpose),
+            ),
+        ];
+        for (axis, end, want) in cases {
+            let mut s = with_discrete(axis);
+            let mut out = Vec::new();
+            swipe(&mut s, axis, end, &mut out);
+            let got: Vec<_> = out.iter().map(|e| if let Synth::System(a) = e { *a } else { panic!("posted {e:?}") }).collect();
+            assert_eq!(got, want.into_iter().collect::<Vec<_>>(), "{end:?}");
+            assert!(!s.holds_anything());
+        }
+        // Read in the wire's direction: where this Mac's factor is -1, -0.6 is up.
+        let mut s = with_discrete(DockAxis::Vertical);
+        s.set_dock_modes(DockModes { directions: [1.0, -1.0, 1.0], ..s.dock_modes() });
+        let mut out = Vec::new();
+        swipe(&mut s, DockAxis::Vertical, dock(DockAxis::Vertical, -0.6), &mut out);
+        assert_eq!(out, [Synth::System(SystemAction::MissionControl)]);
+        // Cancelled or released, a discrete swipe does nothing; other axes still replay.
+        let mut s = with_discrete(DockAxis::Vertical);
+        out.clear();
+        s.gesture(Began, dock(DockAxis::Vertical, 0.0), None, &mut out);
+        s.gesture(Changed, dock(DockAxis::Vertical, 0.9), None, &mut out);
+        s.release_all(false, &mut out);
+        s.gesture(Began, dock(DockAxis::Vertical, 0.0), None, &mut out);
+        s.gesture(Cancelled, dock(DockAxis::Vertical, 0.9), None, &mut out);
+        assert!(out.is_empty(), "{out:#?}");
+        s.gesture(Began, dock(DockAxis::Horizontal, 0.0), None, &mut out);
+        assert_eq!(gesture_events(&out), [(Began, 0.0)]);
+        // Spaces too, when horizontal swipes are discrete.
+        let mut s = with_discrete(DockAxis::Horizontal);
+        out.clear();
+        s.system(SystemAction::NextSpace, &mut out);
+        assert_eq!(out, [Synth::System(SystemAction::NextSpace)]);
+    }
+
+    #[test]
+    fn system_actions_map_from_the_wire() {
+        assert_eq!(SystemAction::from_wire(protocol::SystemAction::MISSION_CONTROL), Some(SystemAction::MissionControl));
+        assert_eq!(SystemAction::from_wire(protocol::SystemAction::NEXT_SPACE), Some(SystemAction::NextSpace));
+        assert_eq!(SystemAction::from_wire(protocol::SystemAction(0)), None);
+        assert_eq!(SystemAction::from_wire(protocol::SystemAction(7)), None);
+        for code in 1..=6 {
+            assert!(SystemAction::from_wire(protocol::SystemAction(code)).is_some(), "{code}");
+        }
+    }
+
+    #[test]
+    fn guard_keeps_gestures_with_their_window_and_drops_whole_mac_ones() {
+        use GesturePhase::*;
+        let target = 4242;
+        let mut g = InjectGuard::new(target);
+        let win = |pid, x, w| WindowInfo { pid, layer: 0, bounds: Bounds { x, y: 0.0, width: w, height: 500.0 } };
+        g.set_windows(vec![win(target, 0.0, 500.0), win(2, 0.0, 2000.0)]);
+        let pinch = |phase, x| Synth::AppGesture { at: p(x, 10.0), phase, kind: AppGestureKind::Magnify, value: 0.1, flags: 0 };
+        assert!(g.judge(&pinch(Began, 10.0)));
+        assert!(g.judge(&pinch(Changed, 900.0)), "the rest of a delivered pinch follows it");
+        assert!(g.judge(&pinch(Ended, 900.0)));
+        assert!(!g.judge(&pinch(Changed, 10.0)), "nothing in progress");
+        assert!(!g.judge(&pinch(Began, 900.0)));
+        assert!(!g.judge(&pinch(Changed, 10.0)), "the rest of a dropped pinch is dropped");
+        assert!(!g.judge(&pinch(Cancelled, 10.0)));
+        assert!(g.judge(&Synth::SmartMagnify { at: p(10.0, 10.0), flags: 0 }));
+        assert!(!g.judge(&Synth::NavigationSwipe { at: p(900.0, 10.0), dx: 1, dy: 0, flags: 0 }));
+        let dock = Synth::DockSwipe { axis: DockAxis::Vertical, phase: Began, progress: 0.0, velocity_x: 0.0, velocity_y: 0.0, inverted: false };
+        assert!(!g.judge(&dock), "Dock swipes change the whole Mac");
+        assert!(!g.judge(&Synth::System(SystemAction::ShowDesktop)));
+    }
+
+    #[test]
+    fn the_end_of_a_dock_swipe_is_posted_again_once_unless_another_began() {
+        use GesturePhase::*;
+        let swipe = |phase| Synth::DockSwipe { axis: DockAxis::Horizontal, phase, progress: 1.0, velocity_x: 8.0, velocity_y: 0.0, inverted: false };
+        let delay = Some(Duration::from_millis(200));
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut r = TerminalResend::default();
+        r.note(&swipe(Began), 0, t0, delay);
+        r.note(&swipe(Ended), 2, at(10), delay);
+        assert_eq!(r.take_due(at(100)), None);
+        assert_eq!(r.take_due(at(210)), Some((swipe(Ended), 2)), "with its relay depth");
+        assert_eq!(r.take_due(at(500)), None, "once");
+        r.note(&swipe(Cancelled), 0, at(600), delay);
+        r.note(&swipe(Began), 0, at(700), delay);
+        assert_eq!(r.take_due(at(900)), None, "a new swipe began");
+        r.note(&swipe(Changed), 0, at(950), delay);
+        r.note(&Synth::System(SystemAction::MissionControl), 0, at(950), delay);
+        assert_eq!(r.take_due(at(2000)), None);
+        r.note(&swipe(Ended), 0, at(3000), None);
+        assert_eq!(r.take_due(at(9000)), None, "not on this macOS");
     }
 }

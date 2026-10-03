@@ -1,0 +1,17 @@
+# Trackpad gestures for LanKVM Input Lab (positions name its parts; run the probe with
+# --lab <lab log>). python scripts/e2e/check_lab.py --scenario gestures checks what the lab got.
+# App gestures over the patch: they go to the window under the pointer.
+{"move":"patch"}
+{"pinch":"patch","amount":0.5,"steps":8}
+{"sleep":150}
+{"rotate":"patch","degrees":45,"steps":9}
+{"sleep":150}
+{"smart_magnify":"patch"}
+{"sleep":150}
+{"swipe":"patch","dx":-1}
+{"sleep":150}
+# Gestures for the whole Mac: the guard ("hid" mode) and "pid" mode drop them, so the lab sees
+# neither (a recording host records them). The swipe is cancelled, should one ever get through.
+{"dock":"vertical","to":0.3,"steps":5,"end":"cancelled"}
+{"system":"mission_control"}
+{"assert_idle":true}
