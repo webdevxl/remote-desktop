@@ -98,8 +98,10 @@ pub struct ControlState {
     pub reason: ControlReason,
     /// The reason in words, naming the host, for the client to show. Empty for `NONE`.
     pub message: String,
-    /// Every event the host injects carries this in `kCGEventSourceUserData`. A client on the
-    /// same Mac drops events with it, so injected input never loops back into the session.
+    /// The host's tag for injected events: each one carries it in `kCGEventSourceUserData`, with
+    /// bits 24..31 replaced by its relay depth (see [`InputMsg::Relayed`]). A client on the same
+    /// Mac drops events matching it with those bits masked, so injected input never loops back
+    /// into the session.
     pub injected_tag: i64,
     /// The host's process id: injected events also carry it, as a second way to recognise them.
     pub host_pid: u32,
@@ -174,7 +176,8 @@ pub enum InputMsg {
     Relayed { depth: u8 },
 }
 
-/// Deepest relayed input a host still injects: chains of up to four Macs.
+/// Deepest relayed input a host still injects: input made on one Mac reaches up to four
+/// controlled Macs in a chain (A → B → C → D → E); a fifth drops it. Releases always apply.
 pub const MAX_RELAY_DEPTH: u8 = 3;
 
 pub const POS_MAX: u16 = u16::MAX;

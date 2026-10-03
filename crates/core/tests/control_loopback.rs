@@ -603,18 +603,24 @@ fn input_that_went_around_a_loop_of_macs_dies_out() {
     let s = setup("relay");
     let id = s.viewer.connect(&s.host);
     assert!(s.viewer.request(id, true, false).active);
-    // Relayed once (a Mac controlling the viewer's Mac typed it): injected, stamped with depth 2.
+    // Relayed once (a Mac controlling the viewer's Mac typed it): injected, stamped with depth 1
+    // (a viewer on this Mac would pass it on as 2).
     s.viewer.core.send_input(id, InputMsg::Relayed { depth: 1 });
+    s.viewer.core.send_input(id, InputMsg::Modifiers { flags: 0x0010_0008 }); // left command
     s.viewer.core.send_input(id, InputMsg::Key { code: 1, down: true, repeat: false });
-    // Past the limit (it has been around a loop): dropped, though releases still apply.
+    s.viewer.core.send_input(id, InputMsg::Key { code: 4, down: true, repeat: false });
+    // Past the limit (it has been around a loop): presses are dropped, releases still apply.
     s.viewer.core.send_input(id, InputMsg::Relayed { depth: protocol::MAX_RELAY_DEPTH + 1 });
     s.viewer.core.send_input(id, InputMsg::Key { code: 2, down: true, repeat: false });
+    s.viewer.core.send_input(id, InputMsg::Modifiers { flags: 0x0012_000A }); // + left shift: dropped
+    s.viewer.core.send_input(id, InputMsg::Key { code: 1, down: false, repeat: false });
+    s.viewer.core.send_input(id, InputMsg::Modifiers { flags: 0 });
     s.viewer.core.send_input(id, InputMsg::ReleaseAll);
     // Made on the viewer's own Mac again.
     s.viewer.core.send_input(id, InputMsg::Relayed { depth: 0 });
     s.viewer.core.send_input(id, InputMsg::Key { code: 3, down: true, repeat: false });
-    let events = recorded(&s.record, 3);
-    assert_eq!(kinds(&events), ["keydown1", "keyup1", "keydown3"], "{events:#?}");
-    assert_eq!(events[0]["depth"], 1);
-    assert!(events[2].get("depth").is_none());
+    let events = recorded(&s.record, 7);
+    assert_eq!(kinds(&events), ["keydown55", "keydown1", "keydown4", "keyup1", "keyup55", "keyup4", "keydown3"], "{events:#?}");
+    assert_eq!(events[1]["depth"], 1);
+    assert!(events[6].get("depth").is_none());
 }

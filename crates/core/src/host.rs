@@ -1,6 +1,7 @@
 //! Host role: accept viewers from the local network and stream this Mac's screen to them.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,6 +34,11 @@ const KEYFRAME_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 /// A frame should leave the encoder within milliseconds; past this, move on to the next one.
 const ENCODE_TIMEOUT: Duration = Duration::from_millis(500);
+/// QUIC handshakes in progress at once, in all and from one address. Honest ones take a round
+/// trip on a LAN; a peer that starts handshakes and never finishes them can't pile them up.
+const MAX_HANDSHAKES: usize = 64;
+const MAX_HANDSHAKES_PER_ADDRESS: usize = 8;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Connections from devices not (yet) trusted that are still saying Hello, pairing or starting
 /// their stream. More are turned away, so peers that never finish can't pile up. Trusted devices
 /// don't count and are never turned away.
@@ -90,7 +96,8 @@ pub struct HostCtx {
     pub settings_path: PathBuf,
     /// Where injected input goes (real events unless a test asks to record them).
     pub backend: Backend,
-    /// Stamped on every injected event; viewers on this Mac drop events carrying it.
+    /// Stamped on every injected event, with bits 24..31 holding the relay depth; viewers on
+    /// this Mac drop events matching it with those bits masked.
     pub injected_tag: i64,
     /// Runs input threads' async reads.
     pub rt: tokio::runtime::Handle,
@@ -110,6 +117,8 @@ pub struct HostCtx {
     pub(crate) pairing_throttle: Mutex<PairingThrottle>,
     /// Connections being set up (see [`MAX_PENDING`]).
     pub(crate) pending: AtomicUsize,
+    /// Handshakes in progress by address (see [`MAX_HANDSHAKES`]).
+    pub(crate) handshakes: Mutex<HashMap<IpAddr, usize>>,
 }
 
 /// Host status as the UI sees it.
@@ -252,9 +261,22 @@ pub async fn run(endpoint: Endpoint, ctx: Arc<HostCtx>) {
             incoming.refuse();
             continue;
         }
+        // The peer proves it receives at its address (a stateless retry: one more round trip)
+        // before the host keeps any state for it, so floods from made-up addresses cost nothing.
+        if !incoming.remote_address_validated() {
+            if let Err(e) = incoming.retry() {
+                e.into_incoming().ignore();
+            }
+            continue;
+        }
+        let Some(handshake) = Handshake::enter(&ctx, remote.ip()) else {
+            tracing::warn!(%remote, "refused connection: too many handshakes in progress");
+            incoming.refuse();
+            continue;
+        };
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            match serve(incoming, ctx).await {
+            match serve(incoming, ctx, handshake).await {
                 Ok(()) => tracing::info!(%remote, "viewer disconnected"),
                 Err(e) => tracing::info!(%remote, "viewer session ended: {e:#}"),
             }
@@ -262,8 +284,9 @@ pub async fn run(endpoint: Endpoint, ctx: Arc<HostCtx>) {
     }
 }
 
-async fn serve(incoming: Incoming, ctx: Arc<HostCtx>) -> Result<()> {
-    let conn = incoming.await.context("handshake")?;
+async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> Result<()> {
+    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await.context("handshake timed out")?.context("handshake")?;
+    drop(handshake);
     let client_fp = peer_fingerprint(&conn).context("viewer sent no certificate")?;
     // The handshake proved the device holds its key, so trust can't be faked here.
     let pending = if ctx.trust.viewers.lock().unwrap().contains(&client_fp) {
@@ -467,6 +490,37 @@ impl RateLimit {
         }
         self.count += 1;
         self.count <= max
+    }
+}
+
+/// Holds a place among the handshakes in progress (see [`MAX_HANDSHAKES`]).
+struct Handshake {
+    ctx: Arc<HostCtx>,
+    ip: IpAddr,
+}
+
+impl Handshake {
+    fn enter(ctx: &Arc<HostCtx>, ip: IpAddr) -> Option<Self> {
+        let mut handshakes = ctx.handshakes.lock().unwrap();
+        let total: usize = handshakes.values().sum();
+        let from_ip = handshakes.get(&ip).copied().unwrap_or(0);
+        if total >= MAX_HANDSHAKES || from_ip >= MAX_HANDSHAKES_PER_ADDRESS {
+            return None;
+        }
+        handshakes.insert(ip, from_ip + 1);
+        Some(Self { ctx: ctx.clone(), ip })
+    }
+}
+
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        let mut handshakes = self.ctx.handshakes.lock().unwrap();
+        if let Some(n) = handshakes.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                handshakes.remove(&self.ip);
+            }
+        }
     }
 }
 

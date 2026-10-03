@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use platform_mac::clock;
+use platform_mac::{clock, keys};
 use platform_mac::inject::{self, Bounds, InjectGuard, InputState, MouseKind, Poster, Scroll, Synth};
 use protocol::{HostMsg, INPUT_ACK_INTERVAL_US, InputMsg, MAX_RELAY_DEPTH, POS_MAX};
 use quinn::RecvStream;
@@ -273,15 +273,24 @@ impl InputThread {
                     return;
                 }
             };
+            // Recording posts nothing: start from a fixed state (pointer mid-display, Caps Lock
+            // off), so the same input records the same events on any Mac.
+            let recording = matches!(backend, Backend::Record(_));
+            let (pos, caps_lock): (_, fn() -> bool) = if recording {
+                (Bounds::of_display(display_id).point_at(0.5, 0.5), || false)
+            } else {
+                (inject::cursor_position(), inject::host_caps_lock)
+            };
             let mut worker = Worker {
                 sink,
                 guard: guard_pid.map(InjectGuard::new),
-                state: InputState::new(inject::cursor_position(), inject::host_caps_lock(), inject::mouse_event_number_seed()),
+                state: InputState::new(pos, caps_lock(), inject::mouse_event_number_seed()),
                 display_id,
                 shared,
                 out,
                 synth: Vec::new(),
                 depth: 0,
+                host_caps_lock: caps_lock,
                 seq: 0,
                 last_ack_us: 0,
                 last_activity: None,
@@ -394,6 +403,8 @@ struct Worker {
     synth: Vec<Synth>,
     /// Relay depth of the input being injected (see `InputMsg::Relayed`).
     depth: u8,
+    /// This Mac's own Caps Lock state, which a release puts back.
+    host_caps_lock: fn() -> bool,
     seq: u64,
     last_ack_us: u64,
     last_activity: Option<Instant>,
@@ -470,9 +481,16 @@ impl Worker {
                     self.depth = depth;
                     continue;
                 }
-                // Input that went around a loop of Macs controlling each other: let it die here.
-                // (Releases still apply.)
+                // Input that went around a loop of Macs controlling each other dies here. Releases
+                // still apply (only of what is held, so they can't start anything going round).
                 InputMsg::ReleaseAll | InputMsg::Heartbeat => {}
+                InputMsg::Key { down: false, .. } | InputMsg::MouseButton { down: false, .. } => {}
+                InputMsg::Modifiers { flags } if self.depth > MAX_RELAY_DEPTH => {
+                    let held = self.state.modifiers();
+                    let target = (u64::from(flags) & held & !keys::CAPS_LOCK) | (held & keys::CAPS_LOCK);
+                    self.state.set_modifiers(target, &mut self.synth);
+                    continue;
+                }
                 _ if self.depth > MAX_RELAY_DEPTH => continue,
                 _ => {}
             }
@@ -485,7 +503,7 @@ impl Worker {
                 self.state.release_buttons(&mut self.synth);
                 continue;
             }
-            apply(&mut self.state, msg, &bounds, inject::host_caps_lock, &mut self.synth);
+            apply(&mut self.state, msg, &bounds, self.host_caps_lock, &mut self.synth);
         }
         self.flush();
         let injected_us = clock::now_us();
@@ -501,7 +519,7 @@ impl Worker {
     }
 
     fn release_all(&mut self) {
-        self.state.release_all(inject::host_caps_lock(), &mut self.synth);
+        self.state.release_all((self.host_caps_lock)(), &mut self.synth);
         self.flush();
     }
 

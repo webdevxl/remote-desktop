@@ -222,6 +222,7 @@ impl Core {
             control_ttl,
             pairing_throttle: Default::default(),
             pending: Default::default(),
+            handshakes: Default::default(),
         });
         if guard_pid.is_some() || control_ttl.is_some() {
             tracing::warn!(?guard_pid, ?control_ttl, "test limits on remote control");
