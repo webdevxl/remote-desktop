@@ -793,6 +793,7 @@ struct SessionControl: View {
         .disabled(!session.isControlling)
         Divider()
         DisplayMenu(session: session, controls: model)
+        EngineMenu(session: session)
         Divider()
         Toggle("Send System Shortcuts to Remote Mac", isOn: $sendSystemShortcuts)
         Toggle("Send Trackpad Gestures to Remote Mac", isOn: $sendTrackpadGestures)

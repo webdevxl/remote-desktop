@@ -61,6 +61,14 @@ private struct ViewerContent: View {
                     // The display used last time is being set up: the host's own screen would only
                     // flash by meanwhile.
                     ConnectingView(target: info.hostName, detail: "Setting up a \(label) display…", cancel: close)
+                } else if let asked = session.engineSwitch, asked.fromConnect, asked.engine == .sunshine {
+                    // Likewise while Sunshine + Moonlight, used last time, starts.
+                    ConnectingView(target: info.hostName, detail: "Starting Sunshine for Moonlight…", cancel: close)
+                } else if session.streamsInMoonlight {
+                    // The picture is in Moonlight's window. Without the remote screen here, nothing
+                    // goes to the host from this window's keyboard and mouse, and the session
+                    // control is gone with the other overlays.
+                    MoonlightView(session: session, info: info, close: close)
                 } else {
                     RemoteScreen(session: session, info: info, fillsScreen: controls.fillsThisScreen(info.display),
                                  toggleControl: toggleControl)
@@ -95,15 +103,20 @@ private struct ViewerContent: View {
                     }
                     .pickerStyle(.segmented)
                     .labelStyle(.titleAndIcon)
-                    .help("View only, or control this Mac with your mouse and keyboard. While controlling, ⌃⌥⌘ releases your keyboard and mouse and takes them back.")
+                    .help(session.streamsInMoonlight ? "Moonlight's window has its own keyboard and mouse"
+                        : "View only, or control this Mac with your mouse and keyboard. While controlling, ⌃⌥⌘ releases your keyboard and mouse and takes them back.")
+                    .disabled(session.streamsInMoonlight)
                     DisplayMenu(session: session, controls: controls, inToolbar: true)
                         .help("Show “\(info.hostName)” at the size of this screen")
+                    EngineMenu(session: session, inToolbar: true)
+                        .help("Stream “\(info.hostName)” with LanKVM, or with Sunshine shown in Moonlight")
                 }
                 ToolbarItemGroup(placement: .primaryAction) {
                     Toggle(isOn: $showStats) {
                         Label("Statistics", systemImage: "gauge.with.dots.needle.33percent")
                     }
-                    .help("Show latency and bandwidth")
+                    .help(session.streamsInMoonlight ? "Statistics are for LanKVM’s own stream" : "Show latency and bandwidth")
+                    .disabled(session.streamsInMoonlight)
                     Button(action: close) {
                         Label("Disconnect", systemImage: "xmark.circle")
                     }
@@ -120,6 +133,7 @@ private struct ViewerContent: View {
 
     private var subtitle: String {
         guard case .connected = session.phase else { return "" }
+        if session.streamsInMoonlight { return "Streaming in Moonlight" }
         switch session.control {
         case .active where controls.isReleased && session.sameMachine: return "Released (test mode) · click the screen to control"
         case .active where controls.isReleased: return "Released · click the screen to control"
@@ -191,6 +205,7 @@ struct ScreenOverlays: View {
             .overlay(alignment: .top) {
                 VStack(spacing: Self.gap) {
                     DisplayBanner(session: session, controls: controls, info: info)
+                    EngineBanner(session: session, info: info)
                     ControlBanner(session: session, hostName: info.hostName, retry: retry, takeOver: takeOver)
                     GestureAccessHint(session: session, hostName: info.hostName, sampleTrusted: sampleTrusted)
                 }

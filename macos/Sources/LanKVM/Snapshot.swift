@@ -59,6 +59,7 @@ enum Snapshot {
             renderGestureHint(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
             renderDisplays(stats: sample, appearance: appearance, suffix: suffix, into: dir)
             renderInternet(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
+            renderEngines(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
         }
         NSApp.terminate(nil)
     }
@@ -93,6 +94,53 @@ enum Snapshot {
             }.environmentObject(core),
             size: CGSize(width: 520, height: 320), appearance: appearance,
             to: dir.appendingPathComponent("hud-internet-\(suffix).png"))
+    }
+
+    /// Sunshine + Moonlight: the window while Moonlight shows the picture (pairing, streaming,
+    /// closed, failed, going back to LanKVM's stream), the banners over LanKVM's picture while
+    /// Sunshine starts and when it was refused, and This Mac while Sunshine streams to a viewer.
+    private static func renderEngines(info: SessionInfo, stats: SessionStats, appearance: NSAppearance.Name, suffix: String,
+                                      into dir: URL) {
+        let core = CoreModel.shared
+        let states: [(String, SessionModel.MoonlightStatus?, StreamEngine?)] = [
+            ("pairing", .init(state: .pairing, pid: 1), nil),
+            ("streaming", .init(state: .streaming, pid: 1), nil),
+            ("closed", .init(state: .ended, message: "Moonlight ended (exit code 0)."), nil),
+            ("failed", .init(state: .failed, message: "Sunshine on Studio didn't pair with Moonlight."), nil),
+            ("leaving", .init(state: .streaming, pid: 1), .lankvm),
+        ]
+        for (name, moonlight, switching) in states {
+            let session = sampleSession(info: info)
+            session.engine = .sunshine
+            session.moonlight = moonlight
+            if let switching { session.engineSwitch = .init(request: 2, engine: switching, fromConnect: false) }
+            render(MoonlightView(session: session, info: info, close: {}).environmentObject(core),
+                   size: CGSize(width: 760, height: 480), appearance: appearance,
+                   to: dir.appendingPathComponent("moonlight-\(name)-\(suffix).png"))
+        }
+
+        let starting = sampleSession(info: info)
+        starting.engineSwitch = .init(request: 1, engine: .sunshine, fromConnect: false)
+        let refused = sampleSession(info: info)
+        refused.engineNotice = "Sunshine isn't installed on Studio. Run LanKVM's installer there (./install.sh) or brew install lizardbyte/homebrew/sunshine."
+        let quit = sampleSession(info: info)
+        quit.engineNotice = "Sunshine on Studio quit, so LanKVM streams again."
+        render(
+            ZStack(alignment: .top) {
+                LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                VStack(spacing: 12) {
+                    ForEach(Array([starting, refused, quit].enumerated()), id: \.offset) { _, session in
+                        EngineBanner(session: session, info: info)
+                    }
+                }
+                .padding(.top, 14)
+            },
+            size: CGSize(width: 640, height: 220), appearance: appearance,
+            to: dir.appendingPathComponent("engine-banners-\(suffix).png"))
+
+        core.loadSampleState(screenAllowed: true, sunshine: true)
+        render(ContentView(selection: .thisMac).environmentObject(core), size: CGSize(width: 900, height: 1250),
+               appearance: appearance, to: dir.appendingPathComponent("thisMac-sunshine-\(suffix).png"))
     }
 
     /// Virtual displays: the banners while switching and when it went wrong, the dimmed screen

@@ -18,6 +18,8 @@ struct ThisMacView: View {
 
             InternetAccessCard()
 
+            StreamingEngineCard()
+
             if let mac = core.thisMac {
                 VStack(alignment: .leading, spacing: 8) {
                     SectionLabel(title: "Address")
@@ -288,6 +290,67 @@ private struct RemoteControlCard: View {
             return "To use this Mac's mouse and keyboard from another Mac, macOS needs to allow LanKVM under Accessibility."
         }
         return "Paired Macs can switch to Control and use this Mac's mouse and keyboard. To take it back at any time, press ⌃⌥⌘ and the period key here."
+    }
+}
+
+/// Sunshine, the other engine paired Macs can stream this screen with (Moonlight shows it on
+/// theirs): whether it's installed here, and which Mac it streams to now. LanKVM starts and
+/// stops it itself, for one viewer at a time.
+private struct StreamingEngineCard: View {
+    @EnvironmentObject private var core: CoreModel
+
+    private var sunshine: SunshineStatus { core.host.sunshine }
+
+    var body: some View {
+        Card {
+            HStack(alignment: .top, spacing: 12) {
+                IconBadge(systemName: "play.tv", tint: sunshine.running ? .lkAccent : .lkSecondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Streaming engine")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.lkText)
+                        Spacer()
+                        status
+                    }
+                    Text("Paired Macs can stream this screen with Sunshine and Moonlight instead of LanKVM's own engine; choose it in the viewer's Engine menu.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.lkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let note {
+                        Text(note)
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color.lkText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+            .padding(14)
+        }
+        // Installing Sunshine doesn't tell LanKVM: look again whenever the page shows.
+        .onAppear { core.refreshHost() }
+    }
+
+    @ViewBuilder private var status: some View {
+        if sunshine.running {
+            StatusPill(text: sunshine.viewer.map { "Streaming to \($0)" } ?? "Streaming", color: .lkAccent)
+        } else if sunshine.installed {
+            StatusPill(text: "Installed", color: .lkSuccess)
+        } else {
+            StatusPill(text: "Not installed", color: .lkSecondary)
+        }
+    }
+
+    /// How to install it, or what a Mac streaming with it may do here. Sunshine passes on
+    /// Moonlight's keyboard and mouse under the same conditions as LanKVM's control, but has no
+    /// View or Control of its own.
+    private var note: String? {
+        guard sunshine.installed else {
+            return "Sunshine isn't installed on this Mac. Run LanKVM's installer (./install.sh) or brew install lizardbyte/homebrew/sunshine."
+        }
+        guard core.host.allowControl else { return nil }
+        return "While “Let paired Macs control this Mac” is on, a Mac streaming with Moonlight can also use this Mac's mouse and keyboard, whether it picked View or Control."
     }
 }
 

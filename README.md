@@ -69,8 +69,15 @@ The installer:
    needed. Both of these ask for your password.
 3. Installs **Rust** (rustup, Rust 1.88 or later) if it's missing, using Homebrew when available,
    and updates it if it's older.
-4. Offers to create a local code-signing certificate (see Signing below).
-5. Builds and signs `LanKVM.app`, installs it into `/Applications` (or `~/Applications`), and
+4. Checks for **Sunshine and Moonlight**, the optional second streaming engine. If either is
+   missing and Homebrew is there, it asks before installing them (a run without a terminal
+   answers yes): Sunshine from LizardByte's tap (it trusts just the `sunshine` and
+   `sunshine-beta` formulae, which Homebrew 7 requires) and Moonlight as a cask. Both are
+   GPL-3.0 and stay separate apps that LanKVM starts. Without Homebrew it prints the download
+   pages. A failure here is only a warning: LanKVM's own engine doesn't need them.
+   `--no-streaming-engine` skips this step.
+5. Offers to create a local code-signing certificate (see Signing below).
+6. Builds and signs `LanKVM.app`, installs it into `/Applications` (or `~/Applications`), and
    opens it.
 
 `./install.sh --check` only reports what's missing. The minimum versions are at the top of
@@ -234,6 +241,56 @@ when packets get lost or start to queue. On a slow connection the frame rate dro
 picture falling behind. What limits it is usually the upload of the Mac you're looking at: for the
 best picture, give that Mac a fast upload.
 
+### Streaming with Sunshine and Moonlight
+
+A second streaming engine, for comparison: [Sunshine](https://github.com/LizardByte/Sunshine) on
+the viewed Mac and [Moonlight](https://moonlight-stream.org) on the viewing one, both installed
+separately (`./install.sh` offers them; both are GPL-3.0 and stay apps of their own that LanKVM
+starts). LanKVM still connects, pairs and makes virtual displays; only the picture goes through
+them.
+
+1. Connect as usual, then choose **Engine → Sunshine + Moonlight** in the viewer's toolbar (also
+   in the **Control** menu and the session control's **⋯** menu). The window remembers it per Mac.
+2. The other Mac starts Sunshine on the display you watch (its own screen or the virtual display
+   you chose). The first time, Moonlight pairs with it by itself: LanKVM hands Sunshine the PIN
+   over the connection you already paired, so there's nothing to type.
+3. Moonlight opens its own window (or full screen, with **Open Moonlight in Full Screen**). The
+   LanKVM window says what it's doing, with **Show Moonlight**, **Open Moonlight Again** and
+   **Use LanKVM's Stream**.
+
+- Sunshine runs only while a Mac streams with it, as LanKVM's child, so it uses LanKVM's Screen
+  Recording and Accessibility permissions; its settings live in LanKVM's data folder
+  (`sunshine/`), never in `~/.config/sunshine`. Its ports start at 48989 (`LANKVM_SUNSHINE_PORT`),
+  so a Sunshine you run yourself on 47989 isn't disturbed. Local network only.
+- Changing the display restarts Sunshine on the new one, and Moonlight opens again.
+- With **Let paired Macs control this Mac** on (and Accessibility allowed), Moonlight's keyboard
+  and mouse reach the other Mac whatever View/Control says. Sunshine moves the pointer on the
+  main display only, so control works on the host's own screen or a virtual display arranged
+  **Only It** or **As Main Display**, not **Next to**. **Forget** also unpairs that Mac's Moonlight.
+
+**How they compare** (one M3 Max, macOS 26.5, `scripts/engine-bench.sh`; a 2560×1600 Retina
+virtual display at 120 Hz, the viewer window on the built-in screen; time from a frame drawn on
+the host's display to that frame on this screen, median of 2-5 runs):
+
+| | LanKVM | Sunshine + Moonlight |
+|---|---|---|
+| A small part of the screen changes: p50 / p95 | 48 / 73 ms | 104 / 113 ms |
+| The whole screen changes: p50 / p95 | 48 / 71 ms | 109 / 119 ms |
+| 1280×800 display, small change: p50 | 40 ms | 80 ms |
+| Distinct frames shown per second | 73-80 (all but ~10% of what the source drew) | 84-88, never more |
+| Source frames that never showed | ~10% | 26-30% |
+| CPU on the viewed Mac (host / Sunshine) | 18-20% | 27-35% |
+
+- Sunshine captures with AVCaptureScreenInput, which on this Mac never delivers more than about
+  89 frames a second and hands each over ~29 ms after it's drawn, against 119 fps and ~10 ms for
+  ScreenCaptureKit, which LanKVM uses (`scripts/capture-bench.sh`). Most of the rest of its
+  latency is a fixed cost before the frame leaves the host: Moonlight's own decode and render
+  take ~3 ms, Sunshine's network send under 1 ms. Moonlight's renderer and V-Sync settings don't
+  change that; Sunshine's `vt_realtime = disabled` makes it worse.
+- On one Mac, LanKVM's viewer window slows the source animation to 80-90 fps (it shares the GPU
+  with the host), which caps the frames LanKVM can show there; with the headless probe the source
+  keeps 119 fps and LanKVM shows 109 of them, decoded 25 ms after they're drawn.
+
 ## Testing a connection on one Mac
 
 Connecting LanKVM to itself isn't a real test: one process plays both roles with one identity.
@@ -301,6 +358,21 @@ loopback as the internet, so its connections over `127.0.0.1` go through the gat
 the internet checks; the router is left alone. Pair the two instances without it first (pairing
 never runs over the internet), then restart both with it. `crates/core/tests/internet_loopback.rs`
 does the same in `cargo test`.
+
+**Comparing the engines.** `scripts/engine-bench.sh lankvm|moonlight [MODE [LABEL]]` measures
+each engine the same way: Frame Source animates a virtual display of the host copy, the viewer
+(LanKVM 2, or Moonlight started by the probe through Sunshine) shows it in a window on this
+Mac's screen, and LanKVM's screen scope (the app run with `LANKVM_SCOPE_LOG`, for its Screen
+Recording permission) films that window and reads each frame's number off the glass.
+`python3 scripts/engine-report.py target/e2e/bench/RUN...` puts runs side by side: source→glass
+latency, distinct frames shown, frames skipped, Moonlight's own stats, and CPU per process.
+`scripts/capture-bench.sh` compares only the capture: ScreenCaptureKit against
+AVCaptureScreenInput set up as Sunshine sets it up. Test knobs: `LANKVM_SUNSHINE_PORT`,
+`LANKVM_SUNSHINE_INPUT=0` (Sunshine posts no input), `LANKVM_SUNSHINE_LOG_LEVEL`,
+`LANKVM_SUNSHINE_CONFIG="key = value; ..."` (more Sunshine settings), `LANKVM_MOONLIGHT_RENDERER`
+(`metal` or `avsample`), `LANKVM_MOONLIGHT_VSYNC=0|1`, `LANKVM_MOONLIGHT_BITRATE` (kbit/s) and
+`LANKVM_MOONLIGHT_ARGS`. Leave the Mac alone and unlocked while it runs: Moonlight takes the
+keyboard focus.
 
 ## Security model
 
@@ -404,6 +476,8 @@ does the same in `cargo test`.
 | `scripts/bundle.sh` | Builds and signs `LanKVM.app` |
 | `scripts/make-icon.swift` | Regenerates `macos/Resources/AppIcon.icns` |
 | `scripts/e2e-control.sh`, `scripts/e2e/`, `scripts/input-lab.swift` | One-Mac remote-control tests |
+| `crates/core/src/sunshine.rs`, `crates/core/src/moonlight.rs` | The Sunshine + Moonlight engine: Sunshine on the host, Moonlight on the viewer |
+| `scripts/engine-bench.sh`, `scripts/engine-report.py`, `scripts/capture-bench.sh`, `macos/Sources/LanKVM/BenchScope.swift` | Comparing the engines on one Mac |
 
 The remote screen never goes through SwiftUI. The viewer window hosts a `CAMetalLayer`, and the
 Rust core renders each decoded frame into it from its own thread as soon as it arrives.

@@ -1,3 +1,6 @@
 /target
 /macos/.build
 .DS_Store
+# Claude Code: per-session git worktrees and local settings
+/.claude/worktrees/
+/.claude/settings.local.json

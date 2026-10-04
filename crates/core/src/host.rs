@@ -16,8 +16,9 @@ use platform_mac::encoder::{EncodedFrame, Encoder, EncoderConfig};
 use platform_mac::tiler::{TileCopy, Tiler, tiles_touched};
 use platform_mac::{CVPixelBuffer, clock, permissions, system, virtual_display};
 use protocol::{
-    Arrangement, ClientMsg, Codec, ControlReason, ControlState, CursorState, DisplayChoice, DisplayReason, DisplayState, HostMsg,
-    FULL_FRAME_TILE, MAX_TILES, PROTOCOL_VERSION, TILE_MAX_WIDTH, TileRect, VideoFrame, VirtualDisplaySpec, tile_layout,
+    Arrangement, ClientMsg, Codec, ControlReason, ControlState, CursorState, DisplayChoice, DisplayReason, DisplayState, Engine, EngineState,
+    HostMsg, FULL_FRAME_TILE, MAX_TILES, PROTOCOL_VERSION, SunshineInfo, TILE_MAX_WIDTH, TileRect, VideoFrame, VirtualDisplaySpec,
+    tile_layout,
 };
 use quinn::{Connection, ConnectionError, Incoming, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -32,6 +33,7 @@ use crate::control::{Backend, HostSettings, InputCmdSender, InputConfig, InputFa
 use crate::displays::{Acquired, DisplayNotice, Displays, VirtualDisplayView};
 use crate::internet::{HostInternet, InternetView};
 use crate::rate::{self, RateControl, Sample};
+use crate::sunshine::{self, Sunshine, SunshineView};
 use crate::{Event, EventSink, Trust};
 
 /// Minimum spacing between keyframes (and re-sent tiles) produced on request or after a loss; a
@@ -167,6 +169,8 @@ pub struct HostCtx {
     /// Handshakes in progress by whether they came from the internet, and address (see
     /// [`MAX_HANDSHAKES`]).
     pub(crate) handshakes: Mutex<HashMap<(bool, IpAddr), usize>>,
+    /// Sunshine, the other streaming engine (one session at a time).
+    pub(crate) sunshine: Arc<Sunshine>,
 }
 
 /// Host status as the UI sees it.
@@ -184,6 +188,8 @@ pub struct HostStatusView {
     pub virtual_displays: Vec<VirtualDisplayView>,
     /// Whether paired Macs can reach this one over the internet.
     pub internet: InternetView,
+    /// Sunshine, the other streaming engine: installed, running, and for whom.
+    pub sunshine: SunshineView,
 }
 
 #[derive(Serialize)]
@@ -222,6 +228,7 @@ impl HostCtx {
         let allow_control = self.settings.lock().unwrap().allow_control;
         let virtual_displays = self.displays.summary();
         let internet = self.internet.view();
+        let sunshine = self.sunshine.view();
         let status = self.status.lock().unwrap();
         HostStatusView {
             viewers: status
@@ -251,6 +258,7 @@ impl HostCtx {
             control_permission,
             virtual_displays,
             internet,
+            sunshine,
         }
     }
 
@@ -515,6 +523,10 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         ctx: ctx.clone(),
         conn: conn.clone(),
         session_id,
+        viewer: device_name.clone(),
+        same_mac,
+        engine: Arc::default(),
+        closed: Arc::default(),
         viewer_max: (max_width, max_height),
         viewer_fps: fps,
         video: ctx.video,
@@ -526,6 +538,8 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         generation: Arc::default(),
         events: evt_tx.clone(),
     };
+    // Sunshine is this session's only while it lives (from here on, until this drops).
+    let _sunshine = SunshineLease { sunshine: ctx.sunshine.clone(), session_id, closed: streamer.closed.clone() };
     let showing = match adopted {
         Some(acquired) => match streamer.show_virtual(acquired).await {
             Ok(showing) => showing,
@@ -654,6 +668,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
             evt = client_rx.recv() => evt,
             _ = permission_check.tick() => {
                 control.check_permission();
+                screen.check_engine();
                 // QUIC follows a viewer to a new network. A session from the local network
                 // doesn't follow it onto the internet: that takes a knock (and internet access
                 // on), and its settings are the local network's.
@@ -665,12 +680,19 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
             }
         };
         let Some(evt) = evt else { break };
-        if let SessionEvt::Client(ClientMsg::SetControl { .. } | ClientMsg::Focus { .. } | ClientMsg::SetDisplay { .. }) = evt
+        if let SessionEvt::Client(
+            ClientMsg::SetControl { .. }
+            | ClientMsg::Focus { .. }
+            | ClientMsg::SetDisplay { .. }
+            | ClientMsg::SetEngine { .. }
+            | ClientMsg::SunshinePair { .. },
+        ) = evt
             && !requests.allow(Instant::now(), MAX_CONTROL_REQUESTS_PER_SEC)
         {
             bail!("more than {MAX_CONTROL_REQUESTS_PER_SEC} control requests a second");
         }
-        if let SessionEvt::Client(ClientMsg::SetDisplay { .. }) = evt
+        // An engine switch costs as much as a display switch (and starts or stops Sunshine).
+        if let SessionEvt::Client(ClientMsg::SetDisplay { .. } | ClientMsg::SetEngine { .. }) = evt
             && !display_requests.allow(Instant::now(), MAX_DISPLAY_REQUESTS_PER_SEC)
         {
             bail!("more than {MAX_DISPLAY_REQUESTS_PER_SEC} display requests a second");
@@ -693,6 +715,8 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
             SessionEvt::Client(ClientMsg::SetControl { on, request, take_over }) => control.set(on, take_over, request),
             SessionEvt::Client(ClientMsg::Focus { forwarding }) => control.focus(forwarding),
             SessionEvt::Client(ClientMsg::SetDisplay { request, display }) => screen.request(request, display),
+            SessionEvt::Client(ClientMsg::SetEngine { request, engine }) => screen.set_engine(request, engine),
+            SessionEvt::Client(ClientMsg::SunshinePair { pin }) => screen.sunshine_pair(pin),
             SessionEvt::Client(other) => bail!("unexpected message {other:?}"),
             SessionEvt::Closed(None) => break,
             SessionEvt::Closed(Some(e)) => return Err(e),
@@ -706,8 +730,13 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
                     return Err(e);
                 }
             }
-            SessionEvt::Availability => screen.availability_changed(),
+            SessionEvt::Availability => {
+                screen.availability_changed();
+                // Whether Sunshine may post input follows the same setting.
+                screen.check_engine();
+            }
             SessionEvt::CaptureStopped(generation) => screen.capture_stopped(generation),
+            SessionEvt::Engine(outcome) => screen.engine_outcome(outcome),
         }
     }
     Ok(())
@@ -848,6 +877,8 @@ pub(crate) enum SessionEvt {
     Availability,
     /// ScreenCaptureKit stopped the capture of this generation of the stream by itself.
     CaptureStopped(u64),
+    /// A stream switch started this engine (see [`Streamer::swap_now`]).
+    Engine(EngineOutcome),
 }
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -2632,6 +2663,14 @@ struct Streamer {
     ctx: Arc<HostCtx>,
     conn: Connection,
     session_id: u64,
+    /// The viewer's name (from `Hello`).
+    viewer: String,
+    /// The viewer runs on this Mac (a second copy of LanKVM).
+    same_mac: bool,
+    /// LanKVM's own stream, or Sunshine's.
+    engine: Arc<EngineSlot>,
+    /// The session ended: nothing starts Sunshine for it any more.
+    closed: Arc<AtomicBool>,
     /// The viewer's screen (from `Hello`): the main display is streamed at most this size.
     viewer_max: (u32, u32),
     viewer_fps: u32,
@@ -2684,14 +2723,41 @@ impl Streamer {
         tokio::task::spawn_blocking(move || this.swap_now(display_id, width, height, fps)).await?
     }
 
+    /// With the Sunshine engine, Sunshine streams the display instead (started, or started again
+    /// for another display, in place of LanKVM's own stream); if it can't, LanKVM's own stream
+    /// takes over. Either way the session hears which engine streams ([`SessionEvt::Engine`]).
     fn swap_now(&self, display_id: u32, width: u32, height: u32, fps: u32) -> Result<()> {
         // No cursor change applies to the old stream while it goes, or gets lost while the new one
         // starts: they wait for this lock.
         let _cursor = self.cursor.apply.lock().unwrap();
         let old = self.stream.0.lock().unwrap().take();
         drop(old);
+        // Each switch counts, so a stop reported by the stream before (if any) is ignored.
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let choice = self.engine.get();
+        let mut message = String::new();
+        if choice.sunshine && !self.closed.load(Ordering::Acquire) {
+            let key = sunshine::Key { session: self.session_id, display_id, width, height, fps, input: self.sunshine_input() };
+            match self.ctx.sunshine.show(key, &self.viewer) {
+                Ok(info) => {
+                    if self.closed.load(Ordering::Acquire) {
+                        // The session ended while Sunshine started.
+                        self.ctx.sunshine.release_now(self.session_id);
+                    }
+                    self.input.set_display(display_id);
+                    let _ = self.events.send(SessionEvt::Engine(EngineOutcome { epoch: choice.epoch, sunshine: Some(info), message }));
+                    return Ok(());
+                }
+                Err(why) => {
+                    tracing::warn!(display = display_id, "Sunshine: {why}");
+                    self.engine.fall_back(choice.epoch);
+                    message = why;
+                }
+            }
+        }
+        // LanKVM's own stream: Sunshine is this session's no more (nothing to do unless it was).
+        self.ctx.sunshine.release_now(self.session_id);
         if self.video {
-            let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
             let show_cursor = self.cursor.wanted.load(Ordering::Acquire);
             let capture = CaptureConfig { display_id, width, height, fps, show_cursor };
             // The bit budget stays at 60 fps worth, so bandwidth doesn't double at 120. Over the
@@ -2722,7 +2788,21 @@ impl Streamer {
             }
         }
         self.input.set_display(display_id);
+        let _ = self.events.send(SessionEvt::Engine(EngineOutcome { epoch: choice.epoch, sunshine: None, message }));
         Ok(())
+    }
+
+    /// Whether Sunshine may post the viewer's keyboard and mouse input on this Mac: only where
+    /// LanKVM's own control could (paired Macs may control this one, LanKVM has Accessibility,
+    /// the viewer is another Mac), with input really posted (not recorded by a test), and unless
+    /// a test turned it off (`LANKVM_SUNSHINE_INPUT=0`). Moonlight's input then isn't gated by
+    /// the viewer's View/Control choice: Sunshine has no such switch.
+    fn sunshine_input(&self) -> bool {
+        self.ctx.backend == Backend::Hid
+            && !self.same_mac
+            && std::env::var("LANKVM_SUNSHINE_INPUT").map_or(true, |v| v.trim() != "0")
+            && self.ctx.settings.lock().unwrap().allow_control
+            && permissions::input_control_allowed()
     }
 
     /// Runs one display change; the result goes back to the session as [`SessionEvt::Switched`].
@@ -2879,6 +2959,17 @@ struct Screen {
     stopped: Option<u64>,
     /// The display worker's newest news this session follows: older news is stale.
     seq_seen: u64,
+    /// The engine the viewer was last told streams: Sunshine's (as it is), or None for LanKVM's.
+    engine_told: Option<SunshineInfo>,
+    /// The engine request waiting for its stream switch, with the choice's epoch.
+    engine_pending: Option<(u32, u64)>,
+    /// The viewer chose another engine: the stream starts again with it (after the change in
+    /// progress, unless that one switches anyway).
+    engine_restart: bool,
+    /// Said with the next engine news: why the host changed the engine by itself.
+    engine_note: Option<String>,
+    /// Moonlight's pairing with Sunshine is in progress (one at a time).
+    pairing: Arc<AtomicBool>,
 }
 
 enum NextRequest {
@@ -2904,6 +2995,11 @@ impl Screen {
             restarts: 0,
             stopped: None,
             seq_seen: 0,
+            engine_told: None,
+            engine_pending: None,
+            engine_restart: false,
+            engine_note: None,
+            pairing: Arc::default(),
         };
         screen.available = screen.availability();
         screen
@@ -3112,6 +3208,9 @@ impl Screen {
                 if let Some(job) = self.check_layout() {
                     self.start(job);
                 }
+            } else if std::mem::take(&mut self.engine_restart) {
+                // Another engine for the same display: the stream starts again with it.
+                self.start(Job::Restart { delay: Duration::ZERO });
             } else {
                 return;
             }
@@ -3137,6 +3236,142 @@ impl Screen {
         }
     }
 
+    /// Why Sunshine can't stream to this viewer, if it can't (shown on the viewer).
+    fn sunshine_refusal(&self) -> Option<String> {
+        let ctx = &self.streamer.ctx;
+        let host = system::device_name();
+        if sunshine::binary().is_none() {
+            return Some(sunshine::not_installed(&host));
+        }
+        if !ctx.video {
+            return Some(format!("{host} doesn't stream its screen, so Sunshine can't either."));
+        }
+        // Moonlight would need Sunshine's ports open to the internet, which LanKVM keeps closed.
+        if self.streamer.internet {
+            return Some(format!("Sunshine streams only on the local network: connect to {host} there to use it."));
+        }
+        if let Some(viewer) = ctx.sunshine.other_owner(self.streamer.session_id) {
+            return Some(format!("Sunshine on {host} is streaming to {viewer} already."));
+        }
+        None
+    }
+
+    /// The viewer asks for an engine: refused at once, answered at once if nothing changes, else
+    /// answered once the stream switched (the display stays as it is).
+    fn set_engine(&mut self, request: u32, engine: Engine) {
+        let sunshine = engine == Engine::Sunshine;
+        if sunshine && let Some(message) = self.sunshine_refusal() {
+            tracing::info!(viewer = %self.streamer.viewer, "Sunshine refused: {message}");
+            self.send_engine(request, message);
+            return;
+        }
+        let before = self.streamer.engine.get();
+        let epoch = self.streamer.engine.choose(sunshine);
+        self.engine_note = None;
+        if before.sunshine == sunshine && self.engine_told.is_some() == sunshine && !self.engine_restart && self.engine_pending.is_none() {
+            // Already so (a viewer re-applying its choice).
+            self.send_engine(request, String::new());
+            return;
+        }
+        tracing::info!(viewer = %self.streamer.viewer, ?engine, request, "switching the engine");
+        self.engine_pending = Some((request, epoch));
+        self.engine_restart = true;
+        if self.switching.is_none() {
+            self.run_next();
+        }
+    }
+
+    /// A stream switch started an engine: the viewer hears about it if it answers its request,
+    /// changed the engine (or Sunshine's generation), or comes with a message.
+    fn engine_outcome(&mut self, outcome: EngineOutcome) {
+        let EngineOutcome { epoch, sunshine, message } = outcome;
+        if epoch == self.streamer.engine.get().epoch {
+            self.engine_restart = false;
+        }
+        let request = match self.engine_pending {
+            Some((request, pending)) if pending == epoch => {
+                self.engine_pending = None;
+                request
+            }
+            _ => 0,
+        };
+        let changed = sunshine != self.engine_told;
+        self.engine_told = sunshine;
+        let message = if message.is_empty() && (changed || request != 0) { self.engine_note.take().unwrap_or_default() } else { message };
+        if request != 0 || changed || !message.is_empty() {
+            self.send_engine(request, message);
+        }
+        if changed {
+            self.streamer.ctx.changed();
+        }
+    }
+
+    fn send_engine(&self, request: u32, message: String) {
+        let sunshine = self.engine_told.clone();
+        let engine = if sunshine.is_some() { Engine::Sunshine } else { Engine::LanKvm };
+        self.send(HostMsg::Engine(EngineState { request, engine, sunshine, message }));
+    }
+
+    /// Sends a message the viewer needs to stay in sync; a viewer that doesn't read them is
+    /// disconnected (see [`Screen::announce`]).
+    fn send(&self, msg: HostMsg) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.out.try_send(msg) {
+            tracing::warn!("viewer isn't reading its control stream; disconnecting");
+            self.streamer.conn.close(4u32.into(), b"viewer not reading");
+        }
+    }
+
+    /// While Sunshine streams (checked every second, and when the settings change): if it quit
+    /// by itself, LanKVM streams again; if whether it may post input changed (it reads that only
+    /// at start), it starts again.
+    fn check_engine(&mut self) {
+        if self.engine_told.is_none() || self.switching.is_some() || self.engine_restart {
+            return;
+        }
+        let Some((alive, input)) = self.streamer.ctx.sunshine.status(self.streamer.session_id) else { return };
+        if !alive {
+            tracing::warn!(viewer = %self.streamer.viewer, "Sunshine quit by itself; LanKVM streams again");
+            self.streamer.engine.choose(false);
+            self.engine_note = Some(format!("Sunshine on {} quit, so LanKVM streams again.", system::device_name()));
+            self.engine_restart = true;
+            self.run_next();
+        } else if input != self.streamer.sunshine_input() {
+            tracing::info!(viewer = %self.streamer.viewer, input = !input, "Sunshine starts again: input allowed changed");
+            self.engine_restart = true;
+            self.run_next();
+        }
+    }
+
+    /// Moonlight on the viewer shows `pin`: Sunshine gets it (in a task: it waits for Moonlight's
+    /// request, then for the handshake), and the viewer hears how it went.
+    fn sunshine_pair(&mut self, pin: String) {
+        let ctx = self.streamer.ctx.clone();
+        let host = system::device_name();
+        if self.engine_told.is_none() || !ctx.sunshine.owned_by(self.streamer.session_id) {
+            self.send(HostMsg::SunshinePaired { ok: false, message: format!("Sunshine on {host} isn't streaming to this Mac.") });
+            return;
+        }
+        if self.pairing.swap(true, Ordering::AcqRel) {
+            self.send(HostMsg::SunshinePaired { ok: false, message: format!("Moonlight is pairing with {host} already.") });
+            return;
+        }
+        let (out, pairing, viewer) = (self.out.clone(), self.pairing.clone(), self.streamer.viewer.clone());
+        let (label, address) = (sunshine::label(&self.client_fp), self.streamer.conn.remote_address().ip());
+        tokio::task::spawn_blocking(move || {
+            let result = ctx.sunshine.pair(&pin, &label, address);
+            pairing.store(false, Ordering::Release);
+            match &result {
+                Ok(()) => tracing::info!(%viewer, label, "Moonlight paired with Sunshine"),
+                Err(e) => tracing::warn!(%viewer, "Moonlight didn't pair with Sunshine: {e}"),
+            }
+            let (ok, message) = match result {
+                Ok(()) => (true, String::new()),
+                Err(message) => (false, message),
+            };
+            let _ = out.try_send(HostMsg::SunshinePaired { ok, message });
+        });
+    }
+
     /// ScreenCaptureKit stopped the capture by itself (the display changed or went away under it):
     /// start it again, waiting longer each time in a row so a display that keeps failing can't
     /// keep the Mac busy.
@@ -3152,6 +3387,65 @@ impl Screen {
         let delay = (Duration::from_millis(250) * 2u32.saturating_pow(self.restarts)).min(MAX_CAPTURE_RESTART_DELAY);
         self.restarts += 1;
         self.start(Job::Restart { delay });
+    }
+}
+
+/// Which engine a session's streams use, read by every stream switch ([`Streamer::swap_now`]).
+/// `epoch` counts the choices, so a switch made for an older one answers no request.
+#[derive(Default)]
+struct EngineSlot(Mutex<EngineChoice>);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct EngineChoice {
+    sunshine: bool,
+    epoch: u64,
+}
+
+impl EngineSlot {
+    fn get(&self) -> EngineChoice {
+        *self.0.lock().unwrap()
+    }
+
+    /// The viewer chose (or the host chose for it); returns the new choice's epoch.
+    fn choose(&self, sunshine: bool) -> u64 {
+        let mut choice = self.0.lock().unwrap();
+        choice.sunshine = sunshine;
+        choice.epoch += 1;
+        choice.epoch
+    }
+
+    /// Sunshine couldn't stream for choice `epoch`: LanKVM's own stream from now on, unless the
+    /// viewer chose again since.
+    fn fall_back(&self, epoch: u64) {
+        let mut choice = self.0.lock().unwrap();
+        if choice.epoch == epoch {
+            choice.sunshine = false;
+        }
+    }
+}
+
+/// What a stream switch started (see [`SessionEvt::Engine`]).
+pub(crate) struct EngineOutcome {
+    /// The choice it followed.
+    epoch: u64,
+    /// Sunshine streams, as it is; None: LanKVM's own stream.
+    sunshine: Option<SunshineInfo>,
+    /// Why it isn't what the choice asked for, in words for the viewer.
+    message: String,
+}
+
+/// Lets go of Sunshine when the session ends, however it ends: Sunshine ends its stream (the
+/// viewer's Moonlight quits by itself) and stops, in the background.
+struct SunshineLease {
+    sunshine: Arc<Sunshine>,
+    session_id: u64,
+    closed: Arc<AtomicBool>,
+}
+
+impl Drop for SunshineLease {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        self.sunshine.release(self.session_id);
     }
 }
 

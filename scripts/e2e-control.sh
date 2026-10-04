@@ -28,7 +28,10 @@
 # Test knobs pass through when set: LANKVM_TILES, LANKVM_FULL_FRAME_AT, LANKVM_MOTION,
 # LANKVM_ENCODER_PROPS, LANKVM_LOG_STATS and LANKVM_TEST_LOOPBACK_IS_INTERNET to the host copy;
 # those and LANKVM_CONNECT_DISPLAY,
-# LANKVM_KEEP_WARM_MS and MTL_HUD_ENABLED to the viewer (scripts/second-instance.sh).
+# LANKVM_KEEP_WARM_MS and MTL_HUD_ENABLED to the viewer (scripts/second-instance.sh). Every
+# LANKVM_SUNSHINE_* (Sunshine engine: port, binary, input, log level) goes to the host copy, and
+# every LANKVM_MOONLIGHT_* (renderer, vsync, bitrate, args) to the viewer; the probe gets the
+# whole environment.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -105,7 +108,8 @@ host)
     *) echo "error: mode is record, hid or pid" >&2; exit 2 ;;
     esac
     knobs=()
-    for var in LANKVM_TILES LANKVM_FULL_FRAME_AT LANKVM_MOTION LANKVM_ENCODER_PROPS LANKVM_LOG_STATS LANKVM_TEST_LOOPBACK_IS_INTERNET; do
+    for var in LANKVM_TILES LANKVM_FULL_FRAME_AT LANKVM_MOTION LANKVM_ENCODER_PROPS LANKVM_LOG_STATS LANKVM_TEST_LOOPBACK_IS_INTERNET \
+        $(compgen -e | grep '^LANKVM_SUNSHINE_' || true); do
         if [[ -n "${!var:-}" ]]; then knobs+=(--env "$var=${!var}"); fi
     done
     # -j: launched hidden, so its window stays off the screen (it's only a host).
@@ -122,6 +126,13 @@ viewer)
     # latency) every second to $E2E/viewer/lankvm.log. The overlay itself stays off unless
     # STATS=1: text changing over the video slows what it measures.
     defaults write dev.lankvm.LanKVM.second showStats -bool "$([[ "${STATS:-0}" == 1 ]] && echo true || echo false)"
+    # It starts on LanKVM's own stream, which is what the benches measure: Sunshine + Moonlight,
+    # if picked for the host copy before, isn't put back (`engine.<host id>`; the Engine menu
+    # still picks it).
+    host_fp="$(awk '$2 == "e2e-host" { print $1; exit }' "$E2E/viewer/trusted-hosts.txt" 2>/dev/null || true)"
+    if [[ ${#host_fp} -ge 16 ]]; then
+        defaults delete dev.lankvm.LanKVM.second "engine.${host_fp:0:4}:${host_fp:4:4}:${host_fp:8:4}:${host_fp:12:4}" 2>/dev/null || true
+    fi
     LANKVM_NO_PROMPTS=1 LANKVM_CONNECT="127.0.0.1:$HOST_PORT" LANKVM_LOG_STATS=1 LANKVM_APP="$APP" PORT="$VIEWER_PORT" \
         DATA_DIR="$E2E/viewer" ./scripts/second-instance.sh --restart
     echo "viewer: connecting to 127.0.0.1:$HOST_PORT; stats in $E2E/viewer/lankvm.log"

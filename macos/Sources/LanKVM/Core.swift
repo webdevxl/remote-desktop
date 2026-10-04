@@ -38,10 +38,11 @@ final class CoreModel: ObservableObject {
     }
 
     /// Sample state for UI snapshots (`--snapshot`), without starting the network core.
-    /// `displays`: two Macs added displays here, one of them still connected.
-    func loadSampleState(screenAllowed: Bool, displays: Bool = false, internet: SampleInternet = .off) {
+    /// `displays`: two Macs added displays here, one of them still connected. `sunshine`: Sunshine
+    /// streams this screen to one of them.
+    func loadSampleState(screenAllowed: Bool, displays: Bool = false, internet: SampleInternet = .off, sunshine: Bool = false) {
         thisMac = ThisMac(name: "Alex's MacBook Pro", addresses: ["192.168.1.23", "10.0.0.7"], port: 47800, deviceId: "724e:b7c8:8a63:ada8")
-        var viewers = [Viewer(id: 1, name: "Studio", address: "192.168.1.31", deviceId: "9f12:0ab3:77c1:e402", controlling: screenAllowed,
+        var viewers = [Viewer(id: 1, name: "Studio", address: "192.168.1.31", deviceId: "9f12:0ab3:77c1:e402", controlling: screenAllowed && !sunshine,
                               displayId: displays ? 5 : 1, virtualDisplay: displays)]
         var pairedViewers = [PairedDevice(fingerprint: "aa", deviceId: "9f12:0ab3:77c1:e402", name: "Studio")]
         if internet == .open {
@@ -58,7 +59,8 @@ final class CoreModel: ObservableObject {
                 VirtualDisplay(displayId: 5, owner: "Studio", width: 6144, height: 2560, hidpi: true, arrangement: .only, inUse: true),
                 VirtualDisplay(displayId: 6, owner: "Mac mini", width: 3840, height: 2160, hidpi: true, arrangement: .extend, inUse: false),
             ] : [],
-            internet: Self.sampleInternet(internet)
+            internet: Self.sampleInternet(internet),
+            sunshine: SunshineStatus(installed: true, running: sunshine, viewer: sunshine ? "Studio" : nil)
         )
         paired = PairedDevices(
             viewers: pairedViewers,
@@ -139,7 +141,7 @@ final class CoreModel: ObservableObject {
             }
         case .trustChanged:
             refreshPaired()
-        case .pinNeeded, .connected, .ended, .control, .cursorShape, .cursor, .display, .streamError:
+        case .pinNeeded, .connected, .ended, .control, .cursorShape, .cursor, .display, .streamError, .engine, .moonlight:
             guard let id = event.session, let session = sessions[id] else { return }
             // Each kind of a session's event has its own case: a kind missing here must not end
             // the session.
@@ -151,11 +153,18 @@ final class CoreModel: ObservableObject {
                     session.wasConnected = true
                     session.hostId = info.hostId
                     session.sameMachine = info.sameMachine
-                    // Pick up where the user left off with this Mac.
+                    // Pick up where the user left off with this Mac. Control is LanKVM's stream's:
+                    // with Sunshine + Moonlight to put back, it waits until that's settled.
+                    let restoringEngine = Self.restoresEngine(info)
                     if UserDefaults.standard.string(forKey: Self.modeKey(info.hostId)) == "control" {
-                        setControl(true, for: id, remember: false)
+                        if restoringEngine {
+                            session.resumeControl = true
+                        } else {
+                            setControl(true, for: id, remember: false)
+                        }
                     }
                     restoreDisplay(for: session, info: info)
+                    if restoringEngine { restoreEngine(for: session) }
                 }
                 refreshRecents()
             case .ended:
@@ -163,6 +172,15 @@ final class CoreModel: ObservableObject {
                 session.control = .off
                 session.mode = .view
                 session.display = .idle
+                // The host stops its Sunshine with the session, and Moonlight quits.
+                session.engine = .lankvm
+                session.sunshine = nil
+                session.engineSwitch = nil
+                session.unansweredEngineSwitch = nil
+                session.engineAfterDisplay = false
+                session.engineNotice = nil
+                session.moonlight = nil
+                session.resumeControl = false
             case .control:
                 let request = event.request ?? 0
                 // The core already drops answers to replaced requests; this is the UI's own guard.
@@ -203,10 +221,24 @@ final class CoreModel: ObservableObject {
                 session.phase = .connected(info)
                 displayChanged(session, from: before.display, to: info, request: event.request ?? 0,
                                reason: event.reason ?? DisplayReason.none, message: event.message ?? "")
+                // The display remembered for this host is settled: Sunshine may start on it.
+                applyEngineAfterDisplay(session)
             case .streamError:
                 guard case .connected = session.phase else { return }
                 session.streamError = event.message ?? "This Mac can't show the picture “\(session.hostName)” sends."
                 session.streamErrorSize = event.width.flatMap { w in event.height.map { (UInt32(w), UInt32($0)) } }
+            case .engine:
+                guard case .connected(let info) = session.phase else { return }
+                engineChanged(session, info: info, request: event.request ?? 0,
+                              engine: event.engine.flatMap(StreamEngine.init) ?? .lankvm,
+                              sunshine: event.sunshine ?? event.port.map { SunshineStream(port: $0) },
+                              message: Self.plainWords(event.message ?? ""))
+            case .moonlight:
+                // Moonlight's last words after the session went back to LanKVM's stream are old news.
+                guard case .connected = session.phase, session.engine == .sunshine,
+                      let state = event.state.flatMap(MoonlightState.init) else { return }
+                moonlightChanged(session, state: state, message: Self.plainWords(event.message ?? ""),
+                                 pid: event.pid.map { pid_t(bitPattern: $0) }, log: event.log)
             case .hostChanged, .trustChanged:
                 break
             }
@@ -341,6 +373,7 @@ final class CoreModel: ObservableObject {
                 guard let session, session.latestDisplayRequest == request, session.display.isSwitching else { return }
                 // A late answer still applies (`displayChanged`); the window stops waiting for it.
                 session.display = .failed(DisplayReason.failed, "“\(session.hostName)” didn't answer.", retry: display)
+                CoreModel.shared.applyEngineAfterDisplay(session)
             }
         }
     }
@@ -395,7 +428,9 @@ final class CoreModel: ObservableObject {
         // (Put back on connecting, the window shows no picture yet, so its screen isn't known:
         // the one in front.)
         let controls = session.sessionControl
-        if let fit = controls.thisScreen ?? ScreenFit.main(), asked?.matchedScreen == fit.size, !controls.isFullScreen {
+        // (Moonlight shows it in its own window: nothing to say about this one's.)
+        if let fit = controls.thisScreen ?? ScreenFit.main(), asked?.matchedScreen == fit.size, !controls.isFullScreen,
+           !session.streamsInMoonlight {
             // While controlling, ⌃⌘F goes to the remote Mac: release first.
             text += controls.isForwarding ? " · ⌃⌥⌘, then ⌃⌘F, shows it full screen pixel for pixel"
                 : " · Enter Full Screen (⌃⌘F) to see it pixel for pixel"
@@ -429,6 +464,217 @@ final class CoreModel: ObservableObject {
         case DisplayReason.tooMany: "\(host) already has as many displays for other Macs as it can make."
         default: "\(host) couldn't add the display. Try again in a moment."
         }
+    }
+
+    // MARK: Engines
+
+    /// The host gets this long to switch engines (Sunshine takes seconds to start); then the
+    /// session stops waiting. A later answer still applies, and settles the switch after all.
+    private static let engineTimeout: TimeInterval = 30
+    /// Moonlight gets this long to say anything after being opened again.
+    private static let moonlightOpenTimeout: TimeInterval = 30
+
+    /// Asks a session's host to stream with `engine`: LanKVM's own, into this window, or its
+    /// Sunshine, shown by Moonlight in its own window (full screen when the Engine menu says so).
+    /// The window follows once the host answers. The user's LanKVM is remembered for the host at
+    /// once, Sunshine once the host streams with it. `fromConnect`: put back on connecting.
+    func setEngine(_ engine: StreamEngine, for id: UInt64, fromConnect: Bool = false) {
+        guard let session = sessions[id], case .connected = session.phase else { return }
+        // A newer pick replaces one the host never answered in time: its late answer then only
+        // brings the engine.
+        session.unansweredEngineSwitch = nil
+        if !fromConnect {
+            // The user's pick replaces putting Sunshine back.
+            session.engineAfterDisplay = false
+            if engine == .lankvm { RememberedEngine.save(.lankvm, for: session.hostId) }
+        }
+        let target = session.engineSwitch?.engine ?? session.engine
+        guard engine != target else {
+            // Already so, or about to be. Moonlight closed: choosing it again opens it again.
+            if engine == .sunshine, session.engineSwitch == nil, let state = session.moonlight?.state,
+               state == .ended || state == .failed {
+                openMoonlight(for: id)
+            }
+            if engine == .lankvm { resumeLanKVMControl(session) }
+            return
+        }
+        session.engineNotice = nil
+        let fullScreen = engine == .sunshine && UserDefaults.standard.bool(forKey: EngineMenu.fullScreenKey)
+        let request = lk_set_engine(id, engine.code, fullScreen)
+        guard request != 0 else {
+            resumeLanKVMControl(session)
+            return
+        }
+        session.latestEngineRequest = request
+        session.engineSwitch = SessionModel.EngineSwitch(request: request, engine: engine, fromConnect: fromConnect)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.engineTimeout) { [weak session] in
+            MainActor.assumeIsolated {
+                guard let session, let asked = session.engineSwitch, asked.request == request else { return }
+                session.engineSwitch = nil
+                // Its answer may still come (Sunshine's start and stop add up): it settles this then.
+                session.unansweredEngineSwitch = asked
+                let text = Self.noAnswer(session.hostName)
+                if asked.fromConnect { session.showToast(text) } else { session.engineNotice = text }
+                if session.engine == .lankvm { CoreModel.shared.resumeLanKVMControl(session) }
+            }
+        }
+    }
+
+    /// What the window says when the host didn't answer an engine request in time.
+    private static func noAnswer(_ host: String) -> String {
+        "“\(host)” didn't answer."
+    }
+
+    /// Opens Moonlight again on the session's Sunshine stream, after it closed or couldn't start.
+    func openMoonlight(for id: UInt64) {
+        guard let session = sessions[id], session.engine == .sunshine else { return }
+        // Something to show at once; Moonlight's own news follows within seconds.
+        let opening = SessionModel.MoonlightStatus(state: .starting)
+        session.moonlight = opening
+        session.moonlightRestarting = false
+        lk_open_moonlight(id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.moonlightOpenTimeout) { [weak session] in
+            MainActor.assumeIsolated {
+                guard let session, session.moonlight == opening, session.engine == .sunshine else { return }
+                session.moonlight = SessionModel.MoonlightStatus(
+                    state: .failed, message: "Moonlight didn't open. Try again, or use LanKVM's stream.")
+            }
+        }
+    }
+
+    /// Brings Moonlight's window to the front.
+    func showMoonlight(for id: UInt64) {
+        guard let pid = sessions[id]?.moonlight?.pid, let app = NSRunningApplication(processIdentifier: pid) else { return }
+        // macOS lets the active app hand activation over; Moonlight then comes forward.
+        NSApp.yieldActivation(to: app)
+        _ = app.activate(options: [])
+    }
+
+    /// An `engine` event: the engine streaming now. That's the truth however old the request it
+    /// answers (like `display`). Ends the switch it answers and says how it went; otherwise it's
+    /// the host's own change (Sunshine started again for another display, or quit).
+    private func engineChanged(_ session: SessionModel, info: SessionInfo, request: UInt32, engine: StreamEngine,
+                               sunshine: SunshineStream?, message: String) {
+        let before = session.engine
+        let generationBefore = session.sunshine?.generation
+        session.engine = engine
+        session.sunshine = engine == .sunshine ? sunshine : nil
+        if engine != before {
+            // Moonlight starts afresh with Sunshine, and quits without it: what it said is over.
+            session.moonlight = nil
+            session.moonlightRestarting = false
+            // LanKVM's input stops with its picture: Moonlight has its own (control comes back
+            // with LanKVM's stream).
+            if engine == .sunshine { pauseLanKVMControl(session) }
+        } else if engine == .sunshine, let generationBefore, let now = sunshine?.generation, now != generationBefore,
+                  let state = session.moonlight?.state, state != .ended, state != .failed {
+            // Sunshine started again (another display): Moonlight closes and reconnects by itself.
+            session.moonlightRestarting = true
+        }
+        defer {
+            if session.engine == .lankvm, session.engineSwitch == nil, !session.engineAfterDisplay { resumeLanKVMControl(session) }
+        }
+        // The switch it answers: still waited for, or one the window stopped waiting for (that
+        // late answer settles it all the same, in place of "didn't answer").
+        guard request != 0, request == session.latestEngineRequest,
+              let asked = session.engineSwitch ?? session.unansweredEngineSwitch, asked.request == request else {
+            // Answers to replaced requests only bring the engine (applied above).
+            guard request == 0, !message.isEmpty else { return }
+            // Back on LanKVM's stream without being asked (Sunshine quit): worth keeping until read.
+            if before == .sunshine && engine == .lankvm { session.engineNotice = message } else { session.showToast(message) }
+            return
+        }
+        if session.engineSwitch == nil, session.engineNotice == Self.noAnswer(session.hostName) {
+            session.engineNotice = nil
+        }
+        session.engineSwitch = nil
+        session.unansweredEngineSwitch = nil
+        guard engine == asked.engine else {
+            // Not the engine asked for: the host's (or this Mac's) words say why. On connecting,
+            // only news: the window goes on with LanKVM's stream.
+            let text = message.isEmpty ? "“\(info.hostName)” can't stream with Sunshine now." : message
+            if asked.fromConnect { session.showToast(text) } else { session.engineNotice = text }
+            return
+        }
+        if engine == .sunshine && !asked.fromConnect { RememberedEngine.save(.sunshine, for: session.hostId) }
+        if !message.isEmpty { session.showToast(message) }
+    }
+
+    /// A `moonlight` event while the session streams with Sunshine.
+    private func moonlightChanged(_ session: SessionModel, state: MoonlightState, message: String, pid: pid_t?, log: String?) {
+        var state = state
+        if session.moonlightRestarting {
+            // Closed for Sunshine's new stream: it opens again by itself.
+            if state == .ended { state = .starting } else { session.moonlightRestarting = false }
+        }
+        let wasStreaming = session.moonlight?.state == .streaming
+        let before = session.moonlight?.state
+        session.moonlight = SessionModel.MoonlightStatus(state: state, message: message, pid: pid, log: log)
+        // The window says it quietly: VoiceOver reads out what matters.
+        if state != before {
+            switch state {
+            case .streaming: AccessibilityNotification.Announcement("Moonlight shows “\(session.hostName)”").post()
+            case .ended: AccessibilityNotification.Announcement("Moonlight closed").post()
+            case .failed: AccessibilityNotification.Announcement(message.isEmpty ? "Moonlight couldn't start" : message).post()
+            case .pairing, .starting: break
+            }
+        }
+        // Its window may open behind this one: while LanKVM is in front (the user just chose
+        // it, or opened it again), bring it forward.
+        if state == .streaming && !wasStreaming && NSApp.isActive {
+            showMoonlight(for: session.id)
+        }
+    }
+
+    /// Whether connecting puts Sunshine + Moonlight back: it was last used with this host, and
+    /// could stream now. Not over the internet (the host keeps Sunshine's ports closed to it) or
+    /// without Moonlight here, like the Engine menu: the window stays on LanKVM's stream, and
+    /// the memory stays for a connection where it works.
+    private static func restoresEngine(_ info: SessionInfo) -> Bool {
+        RememberedEngine.load(info.hostId) == .sunshine && !info.internet && lk_moonlight_installed()
+    }
+
+    /// On connecting, when `restoresEngine` says so: Sunshine + Moonlight. Asked for once the
+    /// display remembered for the host is shown (Sunshine streams the display it starts on, and
+    /// finds the encoders it offers then), right away otherwise.
+    private func restoreEngine(for session: SessionModel) {
+        if session.display.isSwitching {
+            session.engineAfterDisplay = true
+        } else {
+            setEngine(.sunshine, for: session.id, fromConnect: true)
+        }
+    }
+
+    /// The display put back on connecting is shown, or the window stopped waiting for it (news
+    /// from the host meanwhile doesn't count).
+    fileprivate func applyEngineAfterDisplay(_ session: SessionModel) {
+        guard session.engineAfterDisplay, !session.display.isSwitching else { return }
+        session.engineAfterDisplay = false
+        setEngine(.sunshine, for: session.id, fromConnect: true)
+    }
+
+    /// Entering Sunshine + Moonlight: LanKVM's control is let go, quietly and without changing
+    /// what's remembered for the host, to be asked for again with LanKVM's stream.
+    private func pauseLanKVMControl(_ session: SessionModel) {
+        guard session.mode == .control else { return }
+        session.resumeControl = true
+        session.mode = .view
+        session.control = .off
+        session.cursor.reset()
+        session.latestRequest = lk_set_control(session.id, false, false)
+    }
+
+    /// Back on LanKVM's stream (or Sunshine didn't start): control again if it was let go for it.
+    private func resumeLanKVMControl(_ session: SessionModel) {
+        guard session.resumeControl else { return }
+        session.resumeControl = false
+        guard session.mode != .control, case .connected = session.phase else { return }
+        setControl(true, for: session.id, remember: false)
+    }
+
+    /// The core's words for the screen: commands come in backquotes, which read better without.
+    private static func plainWords(_ text: String) -> String {
+        text.replacingOccurrences(of: "`", with: "")
     }
 
     /// Before quitting: releases keys held on remote Macs and for remote viewers.
@@ -588,6 +834,23 @@ final class SessionModel: ObservableObject, Identifiable {
         var remember: Bool
     }
 
+    /// An engine asked for, waiting for the host's answer.
+    struct EngineSwitch: Equatable {
+        var request: UInt32
+        var engine: StreamEngine
+        /// Put back on connecting, not the user's pick.
+        var fromConnect: Bool
+    }
+
+    /// What Moonlight said last, while the session streams with Sunshine.
+    struct MoonlightStatus: Equatable {
+        var state: MoonlightState
+        var message = ""
+        /// Its process (the pairing one while pairing), to bring its window forward.
+        var pid: pid_t?
+        var log: String?
+    }
+
     let id: UInt64
     let target: String
     @Published var phase: Phase = .connecting
@@ -616,6 +879,31 @@ final class SessionModel: ObservableObject, Identifiable {
     @Published var streamError: String?
     /// The size of the picture it is about.
     var streamErrorSize: (UInt32, UInt32)?
+    /// The engine streaming the picture, as the host last said: with Sunshine, Moonlight shows it
+    /// in its own window and this one says how that's going.
+    @Published var engine = StreamEngine.lankvm
+    /// Sunshine's stream while it's the engine.
+    var sunshine: SunshineStream?
+    /// The engine asked for, until the host answers (or the window stops waiting).
+    @Published var engineSwitch: EngineSwitch?
+    /// Id of the latest engine request (numbered apart from the others): only its answer ends a
+    /// switch.
+    var latestEngineRequest: UInt32 = 0
+    /// The switch the window stopped waiting for (the host didn't answer in time), until its late
+    /// answer or a newer pick: that answer is then remembered, or says why not, all the same.
+    var unansweredEngineSwitch: EngineSwitch?
+    /// Sunshine + Moonlight, remembered for this host, is asked for once the display put back on
+    /// connecting is shown.
+    var engineAfterDisplay = false
+    /// Why the engine isn't the one asked for, or the host's news about it, until dismissed.
+    @Published var engineNotice: String?
+    /// Moonlight, while streaming with Sunshine (nil until it says something).
+    @Published var moonlight: MoonlightStatus?
+    /// Sunshine started again for another display: Moonlight closes and opens again by itself.
+    var moonlightRestarting = false
+    /// Control was let go (or not asked for on connecting) for Sunshine + Moonlight: asked for
+    /// again once LanKVM streams.
+    var resumeControl = false
     let cursor = RemoteCursor()
     /// The floating control over the remote screen (and the Control menu's actions).
     private(set) lazy var sessionControl = SessionControlModel(session: self)
@@ -630,6 +918,9 @@ final class SessionModel: ObservableObject, Identifiable {
     }
 
     var isControlling: Bool { control == .active }
+
+    /// Moonlight shows the picture, in its own window.
+    var streamsInMoonlight: Bool { engine == .sunshine }
 
     var hostName: String {
         if case .connected(let info) = phase { return info.hostName }

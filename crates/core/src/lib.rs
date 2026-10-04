@@ -8,9 +8,11 @@ mod displays;
 pub mod ffi;
 mod host;
 mod internet;
+mod moonlight;
 pub mod rate;
 mod render;
 mod stats;
+mod sunshine;
 mod view;
 
 use std::collections::HashMap;
@@ -22,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use platform_mac::{permissions, system};
-use protocol::{CursorState, DEFAULT_PORT, DisplayChoice, InputMsg};
+use protocol::{CursorState, DEFAULT_PORT, DisplayChoice, Engine, InputMsg, SunshineInfo};
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -31,7 +33,9 @@ use transport::identity::{DeviceIdentity, Fingerprint, short_hex};
 use transport::pairing::TrustStore;
 
 pub use crate::client::{FrameProbe, ProbeFrame};
+pub use crate::moonlight::{DisplayMode as MoonlightDisplay, MoonlightOptions, Renderer as MoonlightRenderer};
 pub use crate::stats::FrameTiming;
+pub use crate::sunshine::SunshineView;
 use crate::client::{Session, SessionEvent, SessionInfo};
 use crate::internet::{HostInternet, InternetHosts};
 
@@ -72,6 +76,16 @@ pub enum Event {
     /// The session's video of `width` × `height` pixels can't be shown (e.g. this Mac can't
     /// decode that size).
     StreamError { session: u64, message: String, width: u32, height: u32 },
+    /// Which engine streams the session's picture now, answering `request` (0: the host changed
+    /// it on its own, e.g. Sunshine started again for another display): "lankvm", or "sunshine"
+    /// at Sunshine's `port` (and in `sunshine` the rest of what Moonlight connects with: a new
+    /// `generation` means a new stream). `message` says why it isn't the one asked for, or what
+    /// happened.
+    Engine { session: u64, request: u32, engine: &'static str, port: Option<u16>, message: String, sunshine: Option<SunshineInfo> },
+    /// Moonlight, while the session streams with the host's Sunshine: `state` is "pairing",
+    /// "starting", "streaming" (the stream is up), "ended" (it quit, or was closed: it can be
+    /// opened again) or "failed", with its process id and log file.
+    Moonlight { session: u64, state: &'static str, message: String, pid: Option<u32>, log: Option<String> },
 }
 
 /// Serializes bytes as standard base64 (what Swift's `JSONDecoder` expects for `Data`).
@@ -238,6 +252,7 @@ impl Core {
         if backend != control::Backend::Hid {
             tracing::warn!(?backend, "injected input is redirected (LANKVM_INJECT)");
         }
+        let sunshine = Arc::new(sunshine::Sunshine::new(dir.join("sunshine"), trust.clone(), events.clone()));
         let host = Arc::new_cyclic(|weak| host::HostCtx {
             displays: displays::Displays::new(weak.clone(), identity.fingerprint, Box::new(displays::RealScreens::default())),
             console_active: std::sync::atomic::AtomicBool::new(true),
@@ -259,6 +274,7 @@ impl Core {
             pairing_throttle: Default::default(),
             pending: Default::default(),
             handshakes: Default::default(),
+            sunshine,
         });
         if guard_pid.is_some() || control_ttl.is_some() {
             tracing::warn!(?guard_pid, ?control_ttl, "test limits on remote control");
@@ -300,10 +316,15 @@ impl Core {
         // First, so sessions ending below don't start removing displays: quitting removes them.
         self.host.displays.shutdown();
         self.host.release_all_input(std::time::Duration::from_millis(300));
+        // Sunshine ends its stream (the viewer's Moonlight quits by itself), then stops.
+        self.host.sunshine.shutdown();
         let sessions: Vec<_> = self.sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
         for s in &sessions {
             s.close();
         }
+        // The hosts end their Sunshine streams as the sessions close, and Moonlight quits: give
+        // it a moment, then kill what's left.
+        moonlight::shutdown(std::time::Duration::from_secs(3));
         // Tell every peer (viewers of this Mac included) the connection is over, rather than
         // leaving them to time out, and give that a moment to go out.
         self.network.endpoint.close(0u32.into(), b"LanKVM quit");
@@ -389,6 +410,18 @@ impl Core {
                 SessionEvent::Display { request, info, reason, message } => Event::Display { session: id, request, info, reason, message },
                 SessionEvent::StreamError { message, width, height } => Event::StreamError { session: id, message, width, height },
                 SessionEvent::TrustChanged => Event::TrustChanged,
+                SessionEvent::Engine { request, engine, sunshine, message } => Event::Engine {
+                    session: id,
+                    request,
+                    engine: match engine {
+                        Engine::LanKvm => "lankvm",
+                        Engine::Sunshine => "sunshine",
+                    },
+                    port: sunshine.as_ref().map(|s| s.port),
+                    message,
+                    sunshine,
+                },
+                SessionEvent::Moonlight { state, message, pid, log } => Event::Moonlight { session: id, state, message, pid, log },
             };
             (core.events)(event);
         });
@@ -425,6 +458,21 @@ impl Core {
     /// [`Event::Display`] carries (0 if there's no such session).
     pub fn set_display(&self, id: u64, display: DisplayChoice) -> u32 {
         self.session(id).map_or(0, |s| s.set_display(display))
+    }
+
+    /// Asks the session's host to stream with `engine`: LanKVM's own, or its Sunshine with
+    /// Moonlight here (run as `moonlight` says; None: only switch the host's engine, run no
+    /// Moonlight). Returns the request id the answering [`Event::Engine`] carries (0 if there's
+    /// no such session).
+    pub fn set_engine(&self, id: u64, engine: Engine, moonlight: Option<MoonlightOptions>) -> u32 {
+        self.session(id).map_or(0, |s| s.set_engine(engine, moonlight))
+    }
+
+    /// Opens Moonlight again on the session's Sunshine stream, after it ended.
+    pub fn open_moonlight(&self, id: u64) {
+        if let Some(s) = self.session(id) {
+            s.open_moonlight();
+        }
     }
 
     /// While controlling: whether the session's window has the focus.
@@ -553,6 +601,8 @@ impl Core {
             // Its knocks go unanswered from now on.
             self.host.internet.sync_keys();
             self.host.close_viewers_with(&fp);
+            // And its Moonlight can't connect to Sunshine any more.
+            self.host.sunshine.revoke(fp);
             self.host.displays.forget(fp, format!("{} forgot this Mac.", system::device_name()));
         }
         (self.events)(Event::TrustChanged);
@@ -567,6 +617,16 @@ impl Core {
     pub fn verify_screen_capture(&self) -> bool {
         host::can_capture()
     }
+}
+
+/// Whether Sunshine (the host side of the Sunshine engine) is installed on this Mac.
+pub fn sunshine_installed() -> bool {
+    sunshine::binary().is_some()
+}
+
+/// Whether Moonlight (the viewer side of the Sunshine engine) is installed on this Mac.
+pub fn moonlight_installed() -> bool {
+    moonlight::binary().is_some()
 }
 
 #[derive(Serialize)]

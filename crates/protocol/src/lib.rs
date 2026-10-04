@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const DEFAULT_PORT: u16 = 47800;
 pub const ALPN: &[u8] = b"lankvm/1";
 /// Upper bound for a single control message; protects against garbage length prefixes.
@@ -67,6 +67,14 @@ pub enum ClientMsg {
     /// tiles (its decoder refuses the whole picture's size): send every change as tiles, for the
     /// rest of the connection.
     NoFullFrame,
+    /// Which engine streams the picture: LanKVM's own, or Sunshine on the host with Moonlight on
+    /// the client. The host answers with [`HostMsg::Engine`] carrying the same `request` (1, 2, 3...
+    /// per session, like [`ClientMsg::SetControl`]). Displays, pairing and control stay LanKVM's.
+    SetEngine { request: u32, engine: Engine },
+    /// The 4-digit PIN Moonlight on the client is pairing with, for the host to give its Sunshine
+    /// (only while this session streams with [`Engine::Sunshine`]). The host answers with
+    /// [`HostMsg::SunshinePaired`].
+    SunshinePair { pin: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -106,6 +114,53 @@ pub enum HostMsg {
     /// ("203.0.113.7:47800", "home.example.com:47800"), empty while internet access is off. Sent
     /// after the first [`HostMsg::Display`].
     InternetAccess { key: Vec<u8>, addresses: Vec<String> },
+    /// The engine streaming to this client now, answering [`ClientMsg::SetEngine`] or because it
+    /// changed on the host's side (request 0: Sunshine restarted for another display, or stopped).
+    Engine(EngineState),
+    /// Whether the host's Sunshine accepted the PIN of [`ClientMsg::SunshinePair`], and if not, why
+    /// in words.
+    SunshinePaired { ok: bool, message: String },
+}
+
+/// What streams the picture to a client.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// LanKVM's own: changed tiles over QUIC datagrams.
+    LanKvm,
+    /// Sunshine on the host, Moonlight on the client (both installed separately). LanKVM's own
+    /// stream stops; the session stays for displays and control.
+    Sunshine,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct EngineState {
+    /// The [`ClientMsg::SetEngine`] request this answers; 0 when the host changed it on its own.
+    pub request: u32,
+    /// The engine streaming now (LanKVM's when Sunshine couldn't start).
+    pub engine: Engine,
+    /// Where Moonlight connects while [`Engine::Sunshine`] streams.
+    pub sunshine: Option<SunshineInfo>,
+    /// Why the engine isn't the one asked for, or what happened, in words naming the host; empty
+    /// if all is well.
+    pub message: String,
+}
+
+/// The host's Sunshine, as a client's Moonlight needs it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SunshineInfo {
+    /// Sunshine's HTTP port (its "port" setting; the others follow from it). Moonlight connects to
+    /// the host's address with this port.
+    pub port: u16,
+    /// Counts Sunshine (re)starts on the host. A new value means the old stream is gone (e.g. the
+    /// display changed): the client starts Moonlight again.
+    pub generation: u32,
+    /// The app to stream ("Desktop").
+    pub app: String,
+    /// The display Sunshine captures, as its size in pixels and refresh rate: what to ask Moonlight
+    /// for so it isn't scaled.
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
 }
 
 /// Which of the host's displays a client watches.
@@ -976,6 +1031,26 @@ mod tests {
         assert_eq!(encode(&InputMsg::Relayed { depth: 2 }).unwrap(), [7, 2]);
         assert_eq!(encode(&InputMsg::Gesture(GestureInput::SmartMagnify { x: 1, y: 2 })).unwrap(), [8, 3, 1, 2]);
         assert_eq!(encode(&InputMsg::System(SystemAction::MISSION_CONTROL)).unwrap(), [9, 1]);
+        assert_eq!(encode(&ClientMsg::SetEngine { request: 1, engine: Engine::Sunshine }).unwrap(), [10, 1, 1]);
+        assert_eq!(encode(&ClientMsg::SunshinePair { pin: "1".into() }).unwrap(), [11, 1, 49]);
+        let state = EngineState { request: 2, engine: Engine::LanKvm, sunshine: None, message: String::new() };
+        assert_eq!(encode(&HostMsg::Engine(state)).unwrap(), [12, 2, 0, 0, 0]);
+        assert_eq!(encode(&HostMsg::SunshinePaired { ok: true, message: String::new() }).unwrap(), [13, 1, 0]);
+    }
+
+    #[test]
+    fn engine_messages_round_trip() {
+        let info = SunshineInfo { port: 48989, generation: 3, app: "Desktop".into(), width: 2560, height: 1600, fps: 120 };
+        for m in [
+            HostMsg::Engine(EngineState { request: 1, engine: Engine::Sunshine, sunshine: Some(info), message: String::new() }),
+            HostMsg::Engine(EngineState { request: 0, engine: Engine::LanKvm, sunshine: None, message: "Sunshine isn't installed on Mini.".into() }),
+            HostMsg::SunshinePaired { ok: false, message: "no pairing".into() },
+        ] {
+            assert_eq!(decode::<HostMsg>(&encode(&m).unwrap()).unwrap(), m);
+        }
+        for m in [ClientMsg::SetEngine { request: 4, engine: Engine::LanKvm }, ClientMsg::SunshinePair { pin: "0042".into() }] {
+            assert_eq!(decode::<ClientMsg>(&encode(&m).unwrap()).unwrap(), m);
+        }
     }
 
     #[test]
