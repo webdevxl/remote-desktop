@@ -53,6 +53,10 @@ const REQUEST_SENDS: usize = 4;
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(4500);
 /// How long a handshake through a relay may take: a few round trips by way of the server.
 const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long punching toward a host behind this Mac's own router may take, in place of
+/// [`PUNCH_TIMEOUT`]: the router either sends packets for its public address back inside at once
+/// (hairpinning) or never does, and the relay shouldn't wait on one that doesn't.
+const SAME_ROUTER_PUNCH_TIMEOUT: Duration = Duration::from_millis(600);
 /// A viewer's relay session stays this long after the session it carried is over, so the packets
 /// that close the connection still reach the host.
 const RELAY_LINGER: Duration = Duration::from_secs(1);
@@ -659,8 +663,18 @@ impl Rendezvous {
                     {
                         return Err(Elsewhere { name: name.to_string(), ip }.into());
                     }
+                    // Behind this Mac's own router (the server sees both at one public IP), a
+                    // path straight there needs the router to hairpin; the Mac's address on the
+                    // local network is the way, which the caller tries alongside.
+                    let same_router = self.host_observed().is_some_and(|me| me.ip().to_canonical() == host.ip().to_canonical());
+                    let wait = if same_router {
+                        tracing::info!(%host, "the host is behind this Mac's router: punching only briefly");
+                        SAME_ROUTER_PUNCH_TIMEOUT
+                    } else {
+                        PUNCH_TIMEOUT
+                    };
                     if !self.force_relay
-                        && let Some(conn) = self.punch_through(host, nonce, key).await
+                        && let Some(conn) = self.punch_through(host, nonce, key, wait).await
                     {
                         return Ok(Introduced { conn, relay: None });
                     }
@@ -689,9 +703,8 @@ impl Rendezvous {
         }
     }
 
-    /// Punches toward the host at `host` and connects to it there, if that works within
-    /// [`PUNCH_TIMEOUT`].
-    async fn punch_through(&self, host: SocketAddr, nonce: Nonce, key: AccessKey) -> Option<Connection> {
+    /// Punches toward the host at `host` and connects to it there, if that works within `wait`.
+    async fn punch_through(&self, host: SocketAddr, nonce: Nonce, key: AccessKey, wait: Duration) -> Option<Connection> {
         let started = Instant::now();
         for _ in 0..VIEWER_PUNCHES {
             let _ = self.network.send_raw(host, &punch(&nonce)).await;
@@ -703,7 +716,7 @@ impl Rendezvous {
                 return None;
             }
         };
-        match timeout_at(started + PUNCH_TIMEOUT, connecting).await {
+        match timeout_at(started + wait, connecting).await {
             Ok(Ok(conn)) => Some(conn),
             Ok(Err(e)) => {
                 tracing::info!(%host, "no direct path: {e}; asking the LanKVM server for a relay");

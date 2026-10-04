@@ -27,6 +27,12 @@
 //! address go to the server, wrapped, and never to the address itself: with no session behind it,
 //! they are dropped. Punches between Macs are dropped. Without a server, all of this costs one
 //! flag check per receive and a look at the destination address per send.
+//!
+//! A relayed connection can move straight to its peer later, when the peer turns out to be
+//! reachable after all (both Macs on one network behind a router that doesn't hairpin): see
+//! [`DirectPath`]. quinn still knows the peer by the relay session's address; its packets go from
+//! a socket of their own, and only what comes from the peer there reaches quinn, as from that
+//! address.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,7 +41,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use quinn::udp::{RecvMeta, Transmit};
@@ -620,12 +626,103 @@ fn initial_has_token(rest: &[u8]) -> Option<bool> {
 pub(crate) struct GatedSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     gate: Arc<Gate>,
+    /// Relayed connections that go straight to their peer instead (see [`DirectPath`]).
+    directs: RwLock<Vec<Arc<Direct>>>,
+    /// The task receiving for quinn, woken when a direct path starts: from then on it must poll
+    /// that path's socket too.
+    receiving: Mutex<Option<Waker>>,
+}
+
+/// A relayed connection going straight to its peer.
+#[derive(Debug)]
+struct Direct {
+    /// The relay session's address: the connection's peer as quinn knows it.
+    relay: SocketAddr,
+    /// Where the peer is, reached from a socket of this path's own.
+    peer: SocketAddr,
+    socket: Arc<dyn AsyncUdpSocket>,
+    /// Datagrams that came from the peer this way.
+    heard: AtomicU64,
+}
+
+impl Direct {
+    fn send(&self, transmit: &Transmit) -> io::Result<()> {
+        let sent = self.socket.try_send(&Transmit {
+            destination: self.peer,
+            ecn: transmit.ecn,
+            contents: transmit.contents,
+            segment_size: transmit.segment_size,
+            src_ip: None,
+        });
+        match sent {
+            // quinn would wait for room on the endpoint's socket, not this one: lost on the way.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            result => result,
+        }
+    }
+
+    /// Hands quinn what came from the peer, as from the relay session; drops anything else.
+    fn received(&self, meta: &mut RecvMeta) {
+        if canonical(meta.addr) == self.peer {
+            meta.addr = self.relay;
+            self.heard.fetch_add(1, Relaxed);
+        } else {
+            meta.len = 0;
+        }
+    }
+}
+
+/// A relayed connection going straight to its peer, from [`Network::go_direct`](crate::endpoint::Network::go_direct),
+/// until this is dropped: then it goes through the relay again (if the session still runs).
+#[derive(Debug)]
+pub struct DirectPath {
+    socket: Arc<GatedSocket>,
+    direct: Arc<Direct>,
+}
+
+impl DirectPath {
+    /// Where the peer is reached.
+    pub fn peer(&self) -> SocketAddr {
+        self.direct.peer
+    }
+
+    /// Datagrams that came from the peer this way so far.
+    pub fn heard(&self) -> u64 {
+        self.direct.heard.load(Relaxed)
+    }
+}
+
+impl Drop for DirectPath {
+    fn drop(&mut self) {
+        self.socket.directs.write().unwrap().retain(|d| !Arc::ptr_eq(d, &self.direct));
+    }
 }
 
 impl GatedSocket {
     pub(crate) fn new(inner: Arc<dyn AsyncUdpSocket>, gate: Arc<Gate>) -> Self {
         gate.socket_v6.store(inner.local_addr().is_ok_and(|addr| addr.is_ipv6()), Relaxed);
-        Self { inner, gate }
+        Self { inner, gate, directs: RwLock::default(), receiving: Mutex::default() }
+    }
+
+    /// Sends what quinn sends to relay session address `relay` to `peer` from `socket` instead,
+    /// and hands quinn what comes from `peer` there as from `relay` (see [`DirectPath`]).
+    pub(crate) fn go_direct(self: &Arc<Self>, relay: SocketAddr, peer: SocketAddr, socket: Arc<dyn AsyncUdpSocket>) -> DirectPath {
+        let direct = Arc::new(Direct { relay, peer: canonical(peer), socket, heard: AtomicU64::new(0) });
+        {
+            let mut directs = self.directs.write().unwrap();
+            directs.retain(|d| d.relay != relay);
+            directs.push(direct.clone());
+        }
+        if let Some(waker) = self.receiving.lock().unwrap().take() {
+            waker.wake();
+        }
+        DirectPath { socket: self.clone(), direct }
+    }
+
+    /// The direct path of the connection with relay session address `relay`, if it has one.
+    fn direct(&self, relay: SocketAddr) -> Option<Arc<Direct>> {
+        let directs = self.directs.read().unwrap();
+        directs.iter().find(|d| d.relay == relay).cloned()
     }
 
     /// Sends `bytes` to `destination` as one datagram, past quinn: rendezvous control messages
@@ -673,6 +770,11 @@ impl AsyncUdpSocket for GatedSocket {
     }
 
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        if relay_ip(transmit.destination).is_some()
+            && let Some(direct) = self.direct(transmit.destination)
+        {
+            return direct.send(transmit);
+        }
         // Even without a server: quinn keeps a relayed connection after its session has ended
         // (internet access turned off, say), and a router would send its packets on toward
         // 240.0.0.0/4.
@@ -687,13 +789,33 @@ impl AsyncUdpSocket for GatedSocket {
     /// anything. Returns after one receive even if all of it was dropped, so quinn's limit on
     /// time spent receiving still holds during a flood.
     fn poll_recv(&self, cx: &mut Context, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> Poll<io::Result<usize>> {
-        let n = ready!(self.inner.poll_recv(cx, bufs, meta))?;
-        for (meta, buf) in meta[..n].iter_mut().zip(bufs.iter_mut()) {
-            if !self.gate.accept_received(buf, meta) {
-                meta.len = 0;
+        if let Poll::Ready(received) = self.inner.poll_recv(cx, bufs, meta) {
+            let n = received?;
+            for (meta, buf) in meta[..n].iter_mut().zip(bufs.iter_mut()) {
+                if !self.gate.accept_received(buf, meta) {
+                    meta.len = 0;
+                }
+            }
+            return Poll::Ready(Ok(n));
+        }
+        {
+            let mut receiving = self.receiving.lock().unwrap();
+            if !receiving.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+                *receiving = Some(cx.waker().clone());
             }
         }
-        Poll::Ready(Ok(n))
+        for direct in self.directs.read().unwrap().iter() {
+            match direct.socket.poll_recv(cx, bufs, meta) {
+                Poll::Ready(Ok(n)) => {
+                    meta[..n].iter_mut().for_each(|meta| direct.received(meta));
+                    return Poll::Ready(Ok(n));
+                }
+                // The endpoint's socket is what quinn must hear about.
+                Poll::Ready(Err(e)) => tracing::debug!(peer = %direct.peer, "receive on a direct path: {e}"),
+                Poll::Pending => {}
+            }
+        }
+        Poll::Pending
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {

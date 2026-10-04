@@ -18,6 +18,7 @@ use quinn::{Connection, ConnectionError, RecvStream, SendStream};
 use tokio::sync::mpsc;
 use transport::endpoint::{Network, peer_fingerprint};
 use transport::framing::{read_msg, write_msg};
+use transport::gate::DirectPath;
 use transport::identity::Fingerprint;
 use transport::knock::AccessKey;
 use transport::rendezvous::RendezvousId;
@@ -33,6 +34,11 @@ use crate::view::{TileImage, ViewHandle, ViewSlot};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The same over the internet, where a host that doesn't take this Mac's knock never answers.
 const CONNECT_TIMEOUT_INTERNET: Duration = Duration::from_secs(10);
+/// When a paired host's address on its own network is on this Mac's network too, a connection
+/// over the internet that comes first (a router that sends its public address back inside, or the
+/// LanKVM server's relay) waits this much longer for that one: the same Macs, a few ms apart
+/// instead of a trip out to the internet, and with the local network's settings.
+const LAN_GRACE: Duration = Duration::from_millis(300);
 /// A target naming a paired host by its fingerprint, as Paired Devices connects to one.
 const PAIRED_TARGET: &str = "lankvm:";
 const PING_INTERVAL: Duration = Duration::from_millis(500);
@@ -394,7 +400,7 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     // How messages name the host: by its name when connecting to it as a paired Mac, looked up
     // first, as this Mac may forget it meanwhile.
     let name = paired.and_then(|host| host_name(&ctx.trust, &host));
-    let (conn, addr, internet, _relay) = match paired {
+    let (conn, addr, internet, relay) = match paired {
         Some(host) => {
             let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, None).await?;
             let addr = conn.remote_address();
@@ -532,12 +538,18 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     // Where it was reached, to try first next time (and show under Paired Devices). A paired
     // host connected to by name was reached at one of the addresses known already, or through
     // its server.
-    let remembered = internet && paired.is_none() && trust.internet_hosts.lock().unwrap().remember_used(&host_fp, target);
+    // Not one the session went through the server's relay for: that address never answered.
+    let remembered = internet && !info.relayed && paired.is_none() && trust.internet_hosts.lock().unwrap().remember_used(&host_fp, target);
     *shared.info.lock().unwrap() = Some(info.clone());
     events(SessionEvent::Connected(info));
     if remembered {
         events(SessionEvent::TrustChanged);
     }
+    // Through the LanKVM server's relay, though the host may be on this Mac's network after all:
+    // it says where it is there as the session starts.
+    let shortcut = relay.is_some().then(|| {
+        tokio::spawn(take_the_shortcut(network.clone(), conn.clone(), trust.clone(), host_fp, shared.clone(), events.clone()))
+    });
     let host = PairedHost { trust, fingerprint: host_fp };
     if let Some(msg) = early {
         handle_host_msg(msg, &shared, &events, &host);
@@ -582,12 +594,91 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     });
 
     let result = receive_video(&conn, internet, &shared, &ctl_tx, &events).await;
+    // The shortcut, if any, ends with the connection.
+    drop(shortcut);
+    drop(relay);
     pinger.abort();
     reader.abort();
     writer.abort();
     input.abort();
     shared.controlling.store(false, Ordering::Release);
     result
+}
+
+/// How often a session through a relay looks for a way straight to the host on this Mac's
+/// network, and for how long: the host says where it is there as the session starts.
+const SHORTCUT_EVERY: Duration = Duration::from_secs(1);
+const SHORTCUT_CHECKS: u32 = 10;
+/// How long checking that an address on this Mac's network is the host's may take.
+const SHORTCUT_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the host has to answer straight before the session goes back through the relay.
+const SHORTCUT_ANSWER: Duration = Duration::from_millis(500);
+/// The way straight to the host stays this long after the connection closed, so the packets that
+/// close it reach the host (the server may have ended the relay session by then).
+const SHORTCUT_LINGER: Duration = Duration::from_secs(1);
+
+/// A session through the LanKVM server's relay moves straight to the host when the host is on
+/// this Mac's network after all: two Macs behind one router that doesn't send its public address
+/// back inside, reached through the server the first time (this Mac didn't know the host's
+/// address on that network yet) or since it got another one. The host's addresses there are
+/// checked first, each with a connection of its own, as whoever is at one gets the session's
+/// packets. The session's connection then carries on as it was, a few ms apart instead of a trip
+/// to the server and back (see `Network::go_direct`). Ends with the connection.
+async fn take_the_shortcut(network: Network, conn: Connection, trust: Arc<Trust>, host: Fingerprint, shared: Arc<Shared>, events: SessionEvents) {
+    let found = tokio::select! {
+        found = find_the_shortcut(&network, &conn, &trust, host) => found,
+        _ = conn.closed() => None,
+    };
+    let Some((path, addr)) = found else { return };
+    tracing::info!(%addr, "the session left the relay: straight to the host on the local network");
+    shared.set_route(false, addr.to_string(), &events);
+    conn.closed().await;
+    tokio::time::sleep(SHORTCUT_LINGER).await;
+    drop(path);
+}
+
+/// Looks for the host at its addresses on this Mac's network, as it announces them, a few times;
+/// moves the connection to the first that answers as the host.
+async fn find_the_shortcut(network: &Network, conn: &Connection, trust: &Trust, host: Fingerprint) -> Option<(DirectPath, SocketAddr)> {
+    let mut tried: Vec<SocketAddr> = Vec::new();
+    for _ in 0..SHORTCUT_CHECKS {
+        tokio::time::sleep(SHORTCUT_EVERY).await;
+        let lan = trust.internet_hosts.lock().unwrap().way_to(&host).map(|way| way.lan).unwrap_or_default();
+        let fresh: Vec<SocketAddr> = lan
+            .iter()
+            .filter_map(|a| a.parse::<SocketAddr>().ok())
+            .filter(|a| !tried.contains(a) && crate::on_this_network(a.ip()))
+            .collect();
+        tried.extend(&fresh);
+        // All at once: one that doesn't answer mustn't hold up the others.
+        let mut checks = tokio::task::JoinSet::new();
+        for addr in fresh {
+            let Ok(connecting) = network.endpoint.connect(addr, "lankvm") else { continue };
+            checks.spawn(async move {
+                let checked = tokio::time::timeout(SHORTCUT_CHECK_TIMEOUT, connecting).await.ok()?.ok()?;
+                let is_host = peer_fingerprint(&checked) == Some(host);
+                checked.close(0u32.into(), b"checked the way");
+                is_host.then_some(addr)
+            });
+        }
+        while let Some(checked) = checks.join_next().await {
+            let Ok(Some(addr)) = checked else { continue };
+            let path = match network.go_direct(conn.remote_address(), addr) {
+                Ok(path) => path,
+                Err(e) => {
+                    tracing::info!(%addr, "couldn't go straight to the host: {e:#}");
+                    return None;
+                }
+            };
+            tokio::time::sleep(SHORTCUT_ANSWER).await;
+            if path.heard() > 0 {
+                return Some((path, addr));
+            }
+            // Dropped: back through the relay.
+            tracing::info!(%addr, "the host didn't answer straight: staying with the relay");
+        }
+    }
+    None
 }
 
 /// Connects to a host outside the local network. It answers only a knock made with the key it
@@ -665,8 +756,10 @@ struct Reached {
 /// Connects to paired host `host` over the internet, as Paired Devices does: at every address it
 /// announced or was reached at, through its LanKVM server, and at its addresses on its own local
 /// network (in case this Mac is there too), all at once. The first to reach that host wins, and
-/// the others are given up (a relay session one of them started ends). `typed`: an address the
-/// user typed for it, tried too.
+/// the others are given up (a relay session one of them started ends), except that a connection
+/// over the internet that comes first waits up to [`LAN_GRACE`] for one at an address on this
+/// Mac's network, still being tried, which wins if it comes in time. `typed`: an address the user
+/// typed for it, tried too.
 async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trust: &Trust, host: Fingerprint, typed: Option<&str>) -> Result<Reached> {
     if !trust.hosts.lock().unwrap().contains(&host) {
         bail!("This Mac isn't paired with that Mac any more. Connect to it on the same network and enter its code to pair again.");
@@ -690,8 +783,15 @@ async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trus
         addresses.insert(0, typed.trim().to_string());
     }
     let mut attempts = tokio::task::JoinSet::new();
+    // Its addresses on its own network that are on this Mac's network too: the way to it when both
+    // are at home, tried along with the others but waited for (see LAN_GRACE).
+    let mut nearby = 0;
     if !rendezvous.force_relay() {
-        let lan = way.lan.into_iter().map(|address| (Attempt::Lan, address));
+        let lan = way.lan.into_iter().map(|address| {
+            let near = address.parse::<SocketAddr>().is_ok_and(|a| crate::on_this_network(a.ip()));
+            nearby += usize::from(near);
+            (Attempt::Lan { near }, address)
+        });
         for (kind, address) in addresses.into_iter().map(|address| (Attempt::Direct, address)).chain(lan) {
             let (network, within) = (network.clone(), within.clone());
             attempts.spawn(async move { (kind, connect_at(&network, &within, &address, key).await) });
@@ -708,28 +808,70 @@ async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trus
             (Attempt::Server, reached)
         });
     }
-    // Dropping the set (on an answer) gives up on the other attempts.
+    // Dropping the set (on an answer) gives up on the other attempts. A connection over the
+    // internet that comes first is kept while the nearby ones may still win.
     let (mut through_server, mut direct, mut on_lan) = (None, None, None);
-    while let Some(attempt) = attempts.join_next().await {
+    let mut first: Option<(Reached, Attempt, Instant)> = None;
+    loop {
+        let next = match &first {
+            Some((_, _, deadline)) => match tokio::time::timeout_at((*deadline).into(), attempts.join_next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+            None => attempts.join_next().await,
+        };
+        let Some(attempt) = next else { break };
         let Ok((kind, result)) = attempt else { continue };
+        let near = matches!(kind, Attempt::Lan { near: true });
+        nearby -= usize::from(near);
         let error = match result {
-            Ok(reached) if peer_fingerprint(&reached.conn) == Some(host) => return Ok(reached),
+            Ok(reached) if peer_fingerprint(&reached.conn) == Some(host) => {
+                if !reached.internet || nearby == 0 {
+                    if let Some((other, ..)) = first.take() {
+                        other.conn.close(0u32.into(), b"");
+                    }
+                    log_reached(&within, &reached, kind);
+                    return Ok(reached);
+                }
+                match &first {
+                    Some(_) => reached.conn.close(0u32.into(), b""),
+                    None => first = Some((reached, kind, Instant::now() + LAN_GRACE)),
+                }
+                continue;
+            }
             Ok(reached) => {
                 reached.conn.close(0u32.into(), b"");
                 anyhow!("The Mac that answered isn't {within}.")
             }
             Err(e) => e,
         };
+        tracing::info!(attempt = kind.name(), "couldn't reach {within} this way: {error:#}");
         match kind {
             Attempt::Server => &mut through_server,
             Attempt::Direct => &mut direct,
-            Attempt::Lan => &mut on_lan,
+            Attempt::Lan { .. } => &mut on_lan,
         }
         .get_or_insert(error);
+        if nearby == 0
+            && let Some((reached, kind, _)) = first.take()
+        {
+            log_reached(&within, &reached, kind);
+            return Ok(reached);
+        }
+    }
+    if let Some((reached, kind, _)) = first {
+        log_reached(&within, &reached, kind);
+        return Ok(reached);
     }
     // What the server said is the surer news (the host isn't online, or doesn't answer); then
     // what the address tried first came to. Its local network is likely not this Mac's: last.
     Err(through_server.or(direct).or(on_lan).unwrap_or_else(|| anyhow!("Couldn't connect to {within}.")))
+}
+
+/// Says in the log which way a paired host was reached.
+fn log_reached(within: &str, reached: &Reached, kind: Attempt) {
+    let way = if reached.relay.is_some() { "relayed" } else if reached.internet { "internet" } else { "local network" };
+    tracing::info!(attempt = kind.name(), way, address = %reached.conn.remote_address(), "reached {within}");
 }
 
 /// How [`connect_to_paired`] tries a host.
@@ -739,8 +881,18 @@ enum Attempt {
     Server,
     /// At an address it announced or was reached at.
     Direct,
-    /// At its address on its own local network.
-    Lan,
+    /// At its address on its own local network; `near` when that is on this Mac's network too.
+    Lan { near: bool },
+}
+
+impl Attempt {
+    fn name(self) -> &'static str {
+        match self {
+            Attempt::Server => "server",
+            Attempt::Direct => "direct",
+            Attempt::Lan { .. } => "local network",
+        }
+    }
 }
 
 /// Connects to the paired Mac at `addr`, a public IP typed as `target` that this Mac doesn't
@@ -902,6 +1054,7 @@ fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents, host: 
 fn on_display(state: DisplayState, shared: &Shared, events: &SessionEvents) {
     let (width, height) = (state.width, state.height);
     let mut before = (width, height);
+    let mut pending = shared.pending_display.lock().unwrap();
     let Some(info) = ({
         let mut current = shared.info.lock().unwrap();
         current.as_mut().map(|info| {
@@ -915,7 +1068,6 @@ fn on_display(state: DisplayState, shared: &Shared, events: &SessionEvents) {
     let DisplayState { request, display: shown, fps, reason, message, .. } = state;
     tracing::info!(request, width, height, fps, ?shown, ?reason, "display");
     let event = (request, info, reason.0, message);
-    let mut pending = shared.pending_display.lock().unwrap();
     // A change still waiting for its picture is overtaken: say it now, in order.
     if let Some(older) = pending.take() {
         emit_display(older.event, events);
@@ -941,6 +1093,26 @@ fn apply_display(info: &mut SessionInfo, state: &DisplayState) {
 
 fn emit_display((request, info, reason, message): (u32, SessionInfo, u16, String), events: &SessionEvents) {
     events(SessionEvent::Display { request, info, reason, message });
+}
+
+impl Shared {
+    /// The session's connection now goes to the host `relayed` or not, at `address`: told to the
+    /// app with the display change waiting for its first frame, if there is one (it carries the
+    /// whole session info, which would undo it otherwise), or now.
+    fn set_route(&self, relayed: bool, address: String, events: &SessionEvents) {
+        // In the order `on_display` takes them, so an info it copied can't come after this.
+        let mut pending = self.pending_display.lock().unwrap();
+        let info = self.info.lock().unwrap().as_mut().map(|info| {
+            info.relayed = relayed;
+            info.address = address.clone();
+            info.clone()
+        });
+        if let Some(waiting) = pending.as_mut() {
+            (waiting.event.1.relayed, waiting.event.1.address) = (relayed, address);
+        } else if let Some(info) = info {
+            emit_display((0, info, DisplayReason::NONE.0, String::new()), events);
+        }
+    }
 }
 
 /// Sends a waiting display change once a frame of its size is shown, or once it waited too long.

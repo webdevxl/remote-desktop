@@ -21,6 +21,7 @@ use protocol::{
 };
 use quinn::{Connection, ConnectionError, Incoming, RecvStream, SendStream};
 use tokio::sync::mpsc;
+use transport::cc::Pace;
 use transport::endpoint::{Network, peer_fingerprint};
 use transport::framing::{read_msg, write_msg};
 use transport::identity::{Fingerprint, short_hex};
@@ -99,7 +100,6 @@ const MAX_CAPTURE_RESTART_DELAY: Duration = Duration::from_secs(8);
 pub struct Viewer {
     pub id: u64,
     pub name: String,
-    pub addr: SocketAddr,
     pub fingerprint: Fingerprint,
     pub conn: Connection,
     /// It connected over the internet, not from the local network.
@@ -232,16 +232,18 @@ impl HostCtx {
                 .iter()
                 .map(|v| {
                     let display_id = v.watching.load(Ordering::Acquire);
+                    // Where it is now: QUIC follows a viewer that moves (off a relay, say).
+                    let addr = v.conn.remote_address();
                     ViewerView {
                         id: v.id,
                         name: v.name.clone(),
-                        address: v.addr.ip().to_string(),
+                        address: addr.ip().to_string(),
                         device_id: short_hex(&v.fingerprint),
                         controlling: v.controlling.load(Ordering::Acquire),
                         display_id,
                         virtual_display: virtual_displays.iter().any(|d| d.display_id == display_id),
                         internet: v.internet,
-                        relayed: self.internet.is_relayed(v.addr),
+                        relayed: self.internet.is_relayed(addr),
                     }
                 })
                 .collect(),
@@ -332,7 +334,7 @@ impl HostCtx {
         // Sessions through the old server's relay end: this Mac stops listening to it in a
         // moment (see `Rendezvous::set_host_addr`).
         if self.internet.set_rendezvous_server(&address) {
-            for v in self.status.lock().unwrap().viewers.iter().filter(|v| self.internet.is_relayed(v.addr)) {
+            for v in self.status.lock().unwrap().viewers.iter().filter(|v| self.internet.is_relayed(v.conn.remote_address())) {
                 v.conn.close(8u32.into(), b"LanKVM server changed");
             }
         }
@@ -426,7 +428,8 @@ pub async fn run(network: Network, ctx: Arc<HostCtx>) {
                 incoming.ignore();
                 continue;
             };
-            Some(Internet { viewer, config: network.internet_server_config() })
+            let pace = Pace::new();
+            Some(Internet { viewer, config: network.internet_server_config(&pace), pace })
         } else {
             None
         };
@@ -463,6 +466,8 @@ struct Internet {
     /// The viewer whose key made the knock.
     viewer: Fingerprint,
     config: Arc<quinn::ServerConfig>,
+    /// How fast the connection sends, set from the video's bitrate ceiling.
+    pace: Pace,
 }
 
 async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, internet: Option<Internet>) -> Result<()> {
@@ -483,7 +488,8 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         conn.close(0u32.into(), b"");
         bail!("turned away a device from the internet: not the paired viewer that knocked");
     }
-    let internet = internet.is_some();
+    let pace = internet.map(|internet| internet.pace);
+    let internet = pace.is_some();
     // The handshake proved the device holds its key, so trust can't be faked here.
     let pending = if ctx.trust.viewers.lock().unwrap().contains(&client_fp) {
         None
@@ -546,7 +552,10 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         video: ctx.video,
         internet,
         stream: Arc::default(),
-        video_out: Arc::new(VideoOut::new(conn.clone(), internet)),
+        video_out: Arc::new(match pace {
+            Some(pace) => VideoOut::over_the_internet(conn.clone(), pace),
+            None => VideoOut::new(conn.clone(), false),
+        }),
         input: Arc::new(InputShared::default()),
         cursor: CursorWish::default(),
         generation: Arc::default(),
@@ -582,7 +591,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         }
     }));
     // Over the internet, the video follows what the connection carries.
-    let _rate = internet.then(|| AbortOnDrop(tokio::spawn(follow_the_connection(conn.clone(), streamer.video_out.clone()))));
+    let _rate = internet.then(|| AbortOnDrop(tokio::spawn(follow_the_connection(conn.clone(), streamer.video_out.clone(), ctx.internet.clone()))));
     // What the viewer sends is read only as fast as the session handles it.
     let (client_tx, mut client_rx) = mpsc::channel::<SessionEvt>(CLIENT_QUEUE);
     let _reader = AbortOnDrop(tokio::spawn(async move {
@@ -617,7 +626,6 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         Viewer {
             id: session_id,
             name: device_name.clone(),
-            addr: conn.remote_address(),
             fingerprint: client_fp,
             conn: conn.clone(),
             internet,
@@ -674,6 +682,8 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
 
     // While controlled, notice within a second if the Accessibility permission is withdrawn.
     let mut permission_check = tokio::time::interval(PERMISSION_CHECK);
+    // Where the viewer is, as This Mac lists it: it can move (off a relay, say).
+    let mut listed_at = conn.remote_address();
     let mut requests = RateLimit::default();
     let mut display_requests = RateLimit::default();
     loop {
@@ -689,6 +699,11 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
                 if !internet && ctx.internet.is_internet(conn.remote_address()) {
                     conn.close(9u32.into(), b"left the local network");
                     bail!("the viewer left the local network (now at {})", conn.remote_address());
+                }
+                if conn.remote_address() != listed_at {
+                    listed_at = conn.remote_address();
+                    tracing::info!(addr = %listed_at, relayed = ctx.internet.is_relayed(listed_at), "the viewer moved");
+                    ctx.changed();
                 }
                 continue;
             }
@@ -1341,8 +1356,8 @@ fn bitrate_for(width: u32, height: u32, fps: u32) -> u32 {
 /// Each tile's bitrate. Tiles that moved lately (`active`) share the stream's budget by area, so
 /// a video playing in one tile may get all of it; the others keep their area's share, enough for
 /// a sharp keyframe if one is asked for. Still tiles send nothing, so the stream as a whole stays
-/// near its budget. Every tile gets at least [`MIN_TILE_BITRATE`].
-fn tile_bitrates(stream_bps: u32, tiles: &[TileRect], active: u64) -> Vec<u32> {
+/// near its budget. Every tile gets at least `floor` (see [`tile_floor`]).
+fn tile_bitrates(stream_bps: u32, tiles: &[TileRect], active: u64, floor: u32) -> Vec<u32> {
     let area = |t: &TileRect| u64::from(t.width) * u64::from(t.height);
     let total: u64 = tiles.iter().map(area).sum();
     let moving: u64 = tiles.iter().enumerate().filter(|&(i, _)| active & tile_bit(i) != 0).map(|(_, t)| area(t)).sum();
@@ -1352,15 +1367,25 @@ fn tile_bitrates(stream_bps: u32, tiles: &[TileRect], active: u64) -> Vec<u32> {
         .map(|(i, t)| {
             let among = if active & tile_bit(i) != 0 { moving } else { total };
             let share = u64::from(stream_bps) * area(t) / among.max(1);
-            (share.min(u64::from(u32::MAX)) as u32).max(MIN_TILE_BITRATE)
+            (share.min(u64::from(u32::MAX)) as u32).max(floor)
         })
         .collect()
+}
+
+/// The least bitrate a tile of a `stream_bps` stream in `tiles` tiles gets: [`MIN_TILE_BITRATE`],
+/// enough for a sharp keyframe. Over the internet (`wan`) the stream's bitrate is what the
+/// connection carries, so all the tiles at their least must fit in it: when the whole picture
+/// moves, a floor over its share would make the stream overshoot, and the excess would queue.
+fn tile_floor(stream_bps: u32, tiles: usize, wan: bool) -> u32 {
+    if wan { MIN_TILE_BITRATE.min(stream_bps / tiles.max(1) as u32) } else { MIN_TILE_BITRATE }
 }
 
 /// Where the picture moved lately, and the bitrates the tile encoders were given for it.
 struct Motion {
     stream_bps: u32,
     tiles: Vec<TileRect>,
+    /// Over the internet (see [`tile_floor`]).
+    wan: bool,
     changed_at: Vec<Option<Instant>>,
     /// As the encoders have them.
     bitrates: Vec<u32>,
@@ -1370,9 +1395,18 @@ struct Motion {
 }
 
 impl Motion {
-    fn new(stream_bps: u32, tiles: Vec<TileRect>, now: Instant) -> Self {
-        let bitrates = tile_bitrates(stream_bps, &tiles, 0);
-        Self { stream_bps, changed_at: vec![None; tiles.len()], tiles, bitrates, next_check: now + RETARGET_INTERVAL, budget_changed: false }
+    /// `wan`: over the internet (see [`tile_floor`]).
+    fn new(stream_bps: u32, tiles: Vec<TileRect>, wan: bool, now: Instant) -> Self {
+        let bitrates = tile_bitrates(stream_bps, &tiles, 0, tile_floor(stream_bps, tiles.len(), wan));
+        Self {
+            stream_bps,
+            changed_at: vec![None; tiles.len()],
+            tiles,
+            wan,
+            bitrates,
+            next_check: now + RETARGET_INTERVAL,
+            budget_changed: false,
+        }
     }
 
     /// The stream's bitrate is now `stream_bps` (over the internet it follows the connection):
@@ -1408,7 +1442,8 @@ impl Motion {
             .filter(|(_, at)| at.is_some_and(|at| now.saturating_duration_since(at) < MOTION_WINDOW))
             .fold(0, |mask, (i, _)| mask | tile_bit(i));
         let mut changes = Vec::new();
-        for (i, target) in tile_bitrates(self.stream_bps, &self.tiles, active).into_iter().enumerate() {
+        let floor = tile_floor(self.stream_bps, self.tiles.len(), self.wan);
+        for (i, target) in tile_bitrates(self.stream_bps, &self.tiles, active, floor).into_iter().enumerate() {
             let current = self.bitrates[i];
             if (f64::from(target) - f64::from(current)).abs() > RETARGET_MIN_CHANGE * f64::from(current)
                 || (self.budget_changed && target != current)
@@ -1501,14 +1536,29 @@ struct WanLimits {
     keyframe_gap_us: AtomicU64,
     /// Free space in the datagram send buffer while nothing waits there.
     empty_space: usize,
+    /// How fast the connection sends (see [`rate::pace_for`]).
+    pace: Pace,
+    /// The connection goes through a LanKVM server's relay, which carries only so much (see
+    /// [`rate::RELAYED_MAX_BPS`]).
+    relayed: AtomicBool,
 }
 
 impl VideoOut {
     /// Over the `internet`, streams send tiles only: a full frame is hundreds of packets, and on
     /// a path that loses one now and then most would arrive incomplete.
     fn new(conn: Connection, internet: bool) -> Self {
+        Self::with_pace(conn, internet.then(Pace::new))
+    }
+
+    /// Over the internet, on a connection sending at `pace` (see [`Network::internet_server_config`]).
+    fn over_the_internet(conn: Connection, pace: Pace) -> Self {
+        Self::with_pace(conn, Some(pace))
+    }
+
+    fn with_pace(conn: Connection, pace: Option<Pace>) -> Self {
         let packetizers = (0..MAX_TILES).map(|i| Mutex::new(Packetizer::for_tile(i as u8))).collect();
-        let wan = internet.then(|| WanLimits {
+        let internet = pace.is_some();
+        let wan = pace.map(|pace| WanLimits {
             ceiling_bps: AtomicU32::new(rate::START_BPS),
             changed: AtomicBool::new(false),
             cap_bps: AtomicU32::new(rate::START_BPS),
@@ -1516,6 +1566,8 @@ impl VideoOut {
             keyframe_gap_us: AtomicU64::new(rate::keyframe_gap(conn.rtt()).as_micros() as u64),
             // Nothing was sent yet: the connection's video goes out through here only.
             empty_space: conn.datagram_send_buffer_space(),
+            pace,
+            relayed: AtomicBool::new(false),
         });
         Self {
             conn,
@@ -1536,18 +1588,24 @@ impl VideoOut {
             None => lan_bps,
             Some(wan) => {
                 wan.cap_bps.store(lan_bps, Ordering::Release);
-                lan_bps.min(wan.ceiling_bps.load(Ordering::Acquire))
+                self.wan_cap().min(wan.ceiling_bps.load(Ordering::Acquire))
             }
         }
+    }
+
+    /// Over the internet, the most the stream may use: its LAN bitrate, and through a relay no
+    /// more than that carries.
+    fn wan_cap(&self) -> u32 {
+        let Some(wan) = &self.wan else { return u32::MAX };
+        let cap = wan.cap_bps.load(Ordering::Acquire);
+        if wan.relayed.load(Ordering::Acquire) { cap.min(rate::RELAYED_MAX_BPS) } else { cap }
     }
 
     /// The stream's new bitrate, if the ceiling changed since the last call (never on the local
     /// network).
     fn take_ceiling(&self) -> Option<u32> {
         let wan = self.wan.as_ref()?;
-        wan.changed
-            .swap(false, Ordering::AcqRel)
-            .then(|| wan.ceiling_bps.load(Ordering::Acquire).min(wan.cap_bps.load(Ordering::Acquire)))
+        wan.changed.swap(false, Ordering::AcqRel).then(|| wan.ceiling_bps.load(Ordering::Acquire).min(self.wan_cap()))
     }
 
     /// Bytes of datagrams waiting in QUIC's send buffer (over the internet only).
@@ -1649,12 +1707,18 @@ impl VideoOut {
 }
 
 /// Over the internet: every [`rate::TICK`], samples what the connection did and sets `video`'s
-/// limits to what it carries (see [`crate::rate`]). Runs as long as the session.
-async fn follow_the_connection(conn: Connection, video: Arc<VideoOut>) {
+/// limits to what it carries (see [`crate::rate`]), and the connection's pace to match. Runs as
+/// long as the session.
+async fn follow_the_connection(conn: Connection, video: Arc<VideoOut>, internet: Arc<HostInternet>) {
     let Some(wan) = video.wan.as_ref() else { return };
-    let mut control = RateControl::new(wan.cap_bps.load(Ordering::Acquire));
+    // The connection's path, and whether it goes through a relay: it can move off one (or onto
+    // one) mid-session.
+    let mut path = conn.remote_address();
+    wan.relayed.store(internet.is_relayed(path), Ordering::Release);
+    let mut control = RateControl::new(video.wan_cap());
     let publish = |ceiling: u32| {
         wan.backlog_limit.store(rate::backlog_limit(ceiling), Ordering::Relaxed);
+        wan.pace.set(rate::pace_for(ceiling));
         wan.ceiling_bps.store(ceiling, Ordering::Release);
         wan.changed.store(true, Ordering::Release);
     };
@@ -1669,7 +1733,12 @@ async fn follow_the_connection(conn: Connection, video: Arc<VideoOut>) {
         let sample = Sample::between(&stats, &next, now - at, video.backlog());
         (at, stats) = (now, next);
         wan.keyframe_gap_us.store(rate::keyframe_gap(sample.rtt).as_micros() as u64, Ordering::Relaxed);
-        let capped = control.set_cap(wan.cap_bps.load(Ordering::Acquire));
+        if conn.remote_address() != path {
+            path = conn.remote_address();
+            wan.relayed.store(internet.is_relayed(path), Ordering::Release);
+            control.path_changed();
+        }
+        let capped = control.set_cap(video.wan_cap());
         if let Some(ceiling) = control.on_sample(&sample).or(capped) {
             tracing::debug!(
                 ceiling_mbps = f64::from(ceiling) / 1e6,
@@ -1778,7 +1847,7 @@ impl TileEncoders {
         if with_full {
             rects.push(whole);
         }
-        let bitrates = tile_bitrates(cfg.bitrate_bps, &tiles, 0);
+        let bitrates = tile_bitrates(cfg.bitrate_bps, &tiles, 0, tile_floor(cfg.bitrate_bps, tiles.len(), video.wan.is_some()));
         let mut tracks: Vec<Arc<Track>> = rects.iter().map(|_| Arc::default()).collect();
         // Making a session takes some 20 ms, mostly waiting for the media server: together, a
         // display switch waits for the slowest instead of all of them in turn.
@@ -2306,7 +2375,7 @@ enum Route {
 
 impl Pipeline {
     fn new(tiler: Tiler, encoders: TileEncoders, on_broken: Arc<dyn Fn(String) + Send + Sync>) -> Self {
-        let motion = Motion::new(encoders.bitrate_bps, encoders.tiles.clone(), Instant::now());
+        let motion = Motion::new(encoders.bitrate_bps, encoders.tiles.clone(), encoders.video.wan.is_some(), Instant::now());
         let failures = vec![0; encoders.tiles.len() + 1];
         let rebuilds_failed = vec![0; encoders.tiles.len()];
         Self {
@@ -3278,16 +3347,16 @@ mod tests {
         let (w, h) = (6144, 2560);
         let total = bitrate_for(w, h, 60);
         let tiles = tile_layout(w, h, None);
-        let shares = tile_bitrates(total, &tiles, 0);
+        let shares = tile_bitrates(total, &tiles, 0, MIN_TILE_BITRATE);
         assert!(shares.iter().all(|&s| s == total / 16), "{shares:?}");
         let sum: u64 = shares.iter().map(|&s| u64::from(s)).sum();
         assert!(sum <= u64::from(total) && sum + 16 >= u64::from(total));
         // A small stream's tiles still get a usable bitrate each.
         let tiles = tile_layout(640, 480, Some((8, 7)));
-        assert!(tile_bitrates(bitrate_for(640, 480, 60), &tiles, 0).iter().all(|&s| s == MIN_TILE_BITRATE));
+        assert!(tile_bitrates(bitrate_for(640, 480, 60), &tiles, 0, MIN_TILE_BITRATE).iter().all(|&s| s == MIN_TILE_BITRATE));
         let whole = TileRect { index: 0, x: 0, y: 0, width: w, height: h };
-        assert_eq!(tile_bitrates(total, &[whole], 0), [total]);
-        assert_eq!(tile_bitrates(total, &[whole], 1), [total]);
+        assert_eq!(tile_bitrates(total, &[whole], 0, MIN_TILE_BITRATE), [total]);
+        assert_eq!(tile_bitrates(total, &[whole], 1, MIN_TILE_BITRATE), [total]);
     }
 
     #[test]
@@ -3296,18 +3365,18 @@ mod tests {
         let total = bitrate_for(w, h, 60);
         let tiles = tile_layout(w, h, None);
         // One tile moves: it may use the whole budget, the still ones keep their share.
-        let one = tile_bitrates(total, &tiles, 1 << 5);
+        let one = tile_bitrates(total, &tiles, 1 << 5, MIN_TILE_BITRATE);
         assert_eq!(one[5], total);
         assert!(one.iter().enumerate().all(|(i, &s)| i == 5 || s == total / 16), "{one:?}");
         // Four move: a quarter each.
-        let four = tile_bitrates(total, &tiles, 0b1111 << 4);
+        let four = tile_bitrates(total, &tiles, 0b1111 << 4, MIN_TILE_BITRATE);
         assert!((4..8).all(|i| four[i] == total / 4) && four[0] == total / 16, "{four:?}");
         // All move: by area, as when all are still.
-        assert_eq!(tile_bitrates(total, &tiles, u64::MAX >> 48), tile_bitrates(total, &tiles, 0));
+        assert_eq!(tile_bitrates(total, &tiles, u64::MAX >> 48, MIN_TILE_BITRATE), tile_bitrates(total, &tiles, 0, MIN_TILE_BITRATE));
         // Uneven tiles: by area among the moving ones.
         let tiles = tile_layout(1000, 640, Some((2, 1)));
         let (a, b) = (u64::from(tiles[0].width) * 640, u64::from(tiles[1].width) * 640);
-        let both = tile_bitrates(40_000_000, &tiles, 0b11);
+        let both = tile_bitrates(40_000_000, &tiles, 0b11, MIN_TILE_BITRATE);
         assert_eq!(both, [(40_000_000 * a / (a + b)) as u32, (40_000_000 * b / (a + b)) as u32]);
     }
 
@@ -3317,7 +3386,7 @@ mod tests {
         let total = bitrate_for(w, h, 60);
         let tiles = tile_layout(w, h, None);
         let t0 = Instant::now();
-        let mut motion = Motion::new(total, tiles.clone(), t0);
+        let mut motion = Motion::new(total, tiles.clone(), false, t0);
         assert!(motion.bitrates.iter().all(|&s| s == total / 16));
         motion.changed(1 << 3, t0);
         // Not before the interval is up.
@@ -3337,7 +3406,7 @@ mod tests {
         motion.changed(1 << 9, t3 - RETARGET_INTERVAL);
         assert_eq!(motion.retarget(t3), [(3, total / 16), (9, total)]);
         // Below the threshold: left alone.
-        let mut motion = Motion::new(total, tile_layout(1000, 640, Some((2, 1))), t0);
+        let mut motion = Motion::new(total, tile_layout(1000, 640, Some((2, 1))), false, t0);
         motion.changed(0b11, t0);
         let before = motion.bitrates.clone();
         assert!(motion.retarget(t1).is_empty(), "{before:?}");
@@ -3351,11 +3420,11 @@ mod tests {
         let total = bitrate_for(w, h, 60);
         let tiles = tile_layout(w, h, None);
         let t0 = Instant::now();
-        let mut motion = Motion::new(total, tiles.clone(), t0);
+        let mut motion = Motion::new(total, tiles.clone(), false, t0);
         // 10% less, before the interval is up.
         let cut = total / 10 * 9;
         motion.set_stream_bps(cut, t0);
-        let expected: Vec<_> = tile_bitrates(cut, &tiles, 0).into_iter().enumerate().collect();
+        let expected: Vec<_> = tile_bitrates(cut, &tiles, 0, MIN_TILE_BITRATE).into_iter().enumerate().collect();
         assert_eq!(motion.retarget(t0), expected);
         // Then by the threshold again.
         motion.set_stream_bps(cut, t0);

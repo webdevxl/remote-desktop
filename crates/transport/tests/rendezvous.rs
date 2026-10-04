@@ -11,6 +11,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
+use transport::cc::Pace;
 use transport::endpoint::{Network, peer_fingerprint};
 use transport::gate::ValidRequest;
 use transport::identity::{DeviceIdentity, Fingerprint};
@@ -137,7 +138,7 @@ fn accept(host: &Network, viewer: Fingerprint) -> JoinHandle<Connection> {
             } else if !incoming.remote_address_validated() {
                 incoming.retry().unwrap();
             } else {
-                return incoming.accept_with(host.internet_server_config()).unwrap().await.unwrap();
+                return incoming.accept_with(host.internet_server_config(&Pace::new())).unwrap().await.unwrap();
             }
         }
     })
@@ -278,6 +279,53 @@ async fn relay_when_punching_fails(name: &str, bind: &str) {
     assert_eq!(viewer.gate.remove_relay(server.addr(), &sid), Some(relay));
     conn.send_datagram(Bytes::from_static(b"after")).unwrap();
     assert!(timeout(SILENCE / 2, host_conn.read_datagram()).await.is_err());
+    agent.abort();
+}
+
+#[tokio::test]
+async fn a_relayed_connection_moves_straight_to_the_host() {
+    let server = TestServer::start().await.unwrap();
+    let (viewer, mut viewer_control, viewer_id) = mac("direct-viewer", &server, V4);
+    let (host, host_control, _, id) = open_host("direct-host", &server, &viewer_id, V4).await;
+    let (agent, mut events) = host_agent(host.clone(), id, host_control);
+    let accepting = accept(&host, viewer_id.fingerprint);
+    let key = access_key(&SECRET, &viewer_id.fingerprint);
+    let nonce = random_bytes();
+    let request = Message::RelayRequest { id, nonce, token: token(&key, &id, &nonce, now_unix()) };
+    viewer.send_raw(server.addr(), &request.encode()).await.unwrap();
+    let (_, Message::RelayReady { sid, .. }) = next_message(&mut viewer_control).await else { panic!("no relay") };
+    let Some(HostEvent::Relayed(_, host_side)) = timeout(WAIT, events.recv()).await.unwrap() else { panic!("the host didn't relay") };
+    let relay = viewer.gate.add_relay(server.addr(), sid);
+    let connecting = viewer.endpoint.connect_with(viewer.internet_client_config(key), relay, "lankvm").unwrap();
+    let conn = timeout(WAIT, connecting).await.expect("connected in time").unwrap();
+    let host_conn = timeout(WAIT, accepting).await.expect("accepted in time").unwrap();
+    exchange(&conn, &host_conn, 1).await;
+    assert_eq!(host_conn.remote_address(), host_side);
+
+    // The host turns out to be reachable straight (on the same network): the connection moves
+    // there and carries on, the host following the viewer's packets to their new address.
+    let path = viewer.go_direct(relay, addr(&host)).unwrap();
+    exchange(&conn, &host_conn, 2).await;
+    exchange(&conn, &host_conn, 3).await;
+    assert!(path.heard() > 0);
+    assert_eq!(conn.remote_address(), relay, "the viewer's quinn still knows the host by the relay's address");
+    assert!(!host.gate.is_relayed(host_conn.remote_address()), "the host moved to {}", host_conn.remote_address());
+    let through_server = server.stats().relayed;
+    exchange(&conn, &host_conn, 4).await;
+    assert!(server.stats().relayed <= through_server + 2, "{} more went through the server", server.stats().relayed - through_server);
+
+    // Without the direct path, back through the relay: the host follows the viewer's next
+    // packets (keep-alives) there. What it sent the other way meanwhile is lost.
+    drop(path);
+    timeout(WAIT, async {
+        while host_conn.remote_address() != host_side {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("back through the relay in time");
+    exchange(&conn, &host_conn, 5).await;
+    assert!(server.stats().relayed > through_server + 2);
     agent.abort();
 }
 

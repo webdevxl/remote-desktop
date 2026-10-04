@@ -12,7 +12,7 @@
 //! ([`Network::send_raw`]); connections relayed by a server are internet ones like any other.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,9 +26,9 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
-use crate::cc::LanControllerFactory;
+use crate::cc::{LanControllerFactory, Pace, WanControllerFactory};
 use crate::cid::MacCidGenerator;
-use crate::gate::{Gate, GatedSocket};
+use crate::gate::{DirectPath, Gate, GatedSocket};
 use crate::identity::{DeviceIdentity, Fingerprint, fingerprint};
 use crate::knock::{AccessKey, knock_cid, now_unix};
 
@@ -71,11 +71,11 @@ impl Network {
         server_crypto.alpn_protocols = vec![protocol::ALPN.to_vec()];
         let mut server_config =
             quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
-        server_config.transport_config(transport_config(false));
+        server_config.transport_config(transport_config(None));
         // A clone, so both share the key for Retry tokens: the endpoint sends Retry with its
         // default config before the host picks this one.
         let mut internet_server = server_config.clone();
-        internet_server.transport_config(transport_config(true));
+        internet_server.transport_config(transport_config(Some(&Pace::new())));
 
         let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -102,9 +102,12 @@ impl Network {
         Ok(Self { endpoint, gate, socket, internet_server: Arc::new(internet_server), internet_client })
     }
 
-    /// Server config for a connection from the internet (`Incoming::accept_with`).
-    pub fn internet_server_config(&self) -> Arc<quinn::ServerConfig> {
-        self.internet_server.clone()
+    /// Server config for a connection from the internet (`Incoming::accept_with`), which sends
+    /// at `pace` (see [`crate::cc::WanController`]): one per connection.
+    pub fn internet_server_config(&self, pace: &Pace) -> Arc<quinn::ServerConfig> {
+        let mut config = (*self.internet_server).clone();
+        config.transport_config(transport_config(Some(pace)));
+        Arc::new(config)
     }
 
     /// Client config for connecting to a host over the internet: each connection attempt knocks
@@ -113,6 +116,22 @@ impl Network {
         let mut config = self.internet_client.clone();
         config.initial_dst_cid_provider(Arc::new(move || ConnectionId::new(&knock_cid(&key, now_unix()))));
         config
+    }
+
+    /// Moves the connection whose peer quinn knows as relay session address `relay` (one through
+    /// a rendezvous server's relay) straight to `peer`, where that peer turned out to be
+    /// reachable after all: on this Mac's local network, say. Its packets go there from a socket
+    /// of their own, and what comes back there reaches quinn as from `relay`, so the connection
+    /// carries on as it was; the peer, the QUIC server, follows its packets to their new address.
+    /// Check that `peer` is the peer first: whoever is there gets the connection's packets. Until
+    /// the returned path is dropped.
+    pub fn go_direct(&self, relay: SocketAddr, peer: SocketAddr) -> Result<DirectPath> {
+        anyhow::ensure!(self.gate.is_relayed(relay), "{relay} isn't a relay session's address");
+        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
+        let local = SocketAddr::new(if peer.is_ipv4() { Ipv4Addr::UNSPECIFIED.into() } else { Ipv6Addr::UNSPECIFIED.into() }, 0);
+        let socket = bind_socket(local).with_context(|| format!("bind UDP {local}"))?;
+        let socket = quinn::default_runtime().context("no async runtime")?.wrap_udp_socket(socket)?;
+        Ok(self.socket.go_direct(relay, peer, socket))
     }
 
     /// Sends `bytes` to `destination` from the endpoint's socket as one datagram, past quinn: a
@@ -138,9 +157,13 @@ fn bind_socket(bind: SocketAddr) -> Result<std::net::UdpSocket> {
 
 /// Hosts accept exactly one control stream and one input stream from each viewer (two input
 /// streams while a replaced one winds down) and never read datagrams. Tight limits keep a peer,
-/// paired or not, from making the host buffer data it never reads.
-fn transport_config(internet: bool) -> Arc<TransportConfig> {
-    let mut t = base_transport_config(internet);
+/// paired or not, from making the host buffer data it never reads. Over the internet (`pace`) the
+/// video goes out at the pace the host sets.
+fn transport_config(pace: Option<&Pace>) -> Arc<TransportConfig> {
+    let mut t = base_transport_config(pace.is_some());
+    if let Some(pace) = pace {
+        t.congestion_controller_factory(Arc::new(WanControllerFactory { pace: pace.clone() }));
+    }
     t.max_concurrent_bidi_streams(1u32.into());
     t.max_concurrent_uni_streams(2u32.into());
     t.receive_window((8u32 * 1024 * 1024).into());
@@ -176,9 +199,9 @@ fn base_transport_config(internet: bool) -> TransportConfig {
         // Video waiting here for the congestion window is already late; a smaller buffer drops
         // the oldest sooner.
         t.datagram_send_buffer_size(4 * 1024 * 1024);
-        // The path is shared and far slower than a LAN, so back off on loss instead of the LAN
-        // controller's fixed, never-full window. Starts at 128 KiB rather than Cubic's ~14 KiB,
-        // so the first keyframe doesn't take several round trips to get out.
+        // What a viewer sends (input, acknowledgements) is little, and backs off on loss like
+        // anything else on a shared path. Starts at 128 KiB rather than Cubic's ~14 KiB. A host's
+        // video goes out at its pace instead (see `transport_config`).
         let mut cubic = CubicConfig::default();
         cubic.initial_window(128 * 1024);
         t.congestion_controller_factory(Arc::new(cubic));

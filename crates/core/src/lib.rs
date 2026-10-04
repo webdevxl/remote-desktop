@@ -748,6 +748,34 @@ pub(crate) fn is_this_mac(ip: IpAddr) -> bool {
     ip.is_loopback() || if_addrs::get_if_addrs().unwrap_or_default().iter().any(|i| i.ip() == ip)
 }
 
+/// Whether `ip` is another device on one of this Mac's local networks: inside the subnet of one
+/// of its interfaces (loopback and point-to-point links aside), and not this Mac itself. A host's
+/// address on its own network leads to it only then: elsewhere the same private address is
+/// someone else's, or nobody's. Link-local addresses never count: every link has the same
+/// subnet, so it says nothing about being on the same one.
+pub(crate) fn on_this_network(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    let link_local = match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    };
+    let interfaces = if_addrs::get_if_addrs().unwrap_or_default();
+    if link_local || ip.is_loopback() || ip.is_unspecified() || interfaces.iter().any(|i| i.ip() == ip) {
+        return false;
+    }
+    interfaces.iter().filter(|i| !i.is_loopback() && !i.is_p2p).any(|i| match (&i.addr, ip) {
+        (if_addrs::IfAddr::V4(a), IpAddr::V4(ip)) => {
+            let mask = u32::from(a.netmask);
+            a.prefixlen > 0 && u32::from(a.ip) & mask == u32::from(ip) & mask
+        }
+        (if_addrs::IfAddr::V6(a), IpAddr::V6(ip)) => {
+            let mask = u128::from(a.netmask);
+            a.prefixlen > 0 && u128::from(a.ip) & mask == u128::from(ip) & mask
+        }
+        _ => false,
+    })
+}
+
 /// Private IPv4 addresses of this Mac, i.e. what to type on the other machine.
 pub(crate) fn local_addresses() -> Vec<String> {
     let mut addrs: Vec<String> = if_addrs::get_if_addrs()
@@ -780,6 +808,28 @@ mod tests {
         assert_eq!(enc(b"fo"), "\"Zm8=\"");
         assert_eq!(enc(b"foo"), "\"Zm9v\"");
         assert_eq!(enc(b"\x89PNG\r\n"), "\"iVBORw0K\"");
+    }
+
+    #[test]
+    fn this_network_is_the_subnets_of_this_macs_interfaces() {
+        assert!(!on_this_network("127.0.0.1".parse().unwrap()));
+        assert!(!on_this_network("203.0.113.7".parse().unwrap()));
+        assert!(!on_this_network("169.254.3.4".parse().unwrap()), "every link has that subnet");
+        // Another address in the subnet of each of this Mac's interfaces that has one with room:
+        // on this network. The interface's own address: this Mac, not another device.
+        let interfaces = if_addrs::get_if_addrs().unwrap_or_default();
+        for i in interfaces.iter().filter(|i| !i.is_loopback() && !i.is_p2p) {
+            let if_addrs::IfAddr::V4(a) = &i.addr else { continue };
+            if !(1..=30).contains(&a.prefixlen) || a.ip.is_link_local() {
+                continue;
+            }
+            let neighbour = std::net::Ipv4Addr::from(u32::from(a.ip) ^ 1);
+            if interfaces.iter().any(|other| other.ip() == IpAddr::V4(neighbour)) {
+                continue;
+            }
+            assert!(on_this_network(neighbour.into()), "{neighbour} next to {} on {}", a.ip, i.name);
+            assert!(!on_this_network(a.ip.into()), "{} is this Mac", a.ip);
+        }
     }
 
     #[test]

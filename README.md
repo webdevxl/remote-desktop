@@ -24,11 +24,14 @@ mouse as if they were plugged into it.
   rate, never latency.
 - **UDP, never TCP, for video.** One QUIC connection (quinn) carries TLS 1.3, a reliable control
   stream, and unreliable datagrams for video. A fixed-window congestion controller is used
-  because the LAN doesn't need Cubic's backoff (connections over the internet use Cubic). Lost
-  frames are dropped, never retransmitted: the viewer asks for a keyframe of just the tile that
-  lost one (1/16 of a whole keyframe), and knows from every frame which tiles its update had, so
-  even a tile lost whole on a still screen is asked for again. Each side sends a tiny packet
-  every 20 ms when idle, so a Wi-Fi radio never dozes off between clicks.
+  because the LAN doesn't need Cubic's backoff. Over the internet the window paces packets at a
+  few times the video's bitrate, so a frame leaves in a fraction of a frame interval, and the
+  bitrate itself backs off on loss and queueing (Cubic spread each frame over most of a round
+  trip, and shrank on every random loss). Lost frames are dropped, never retransmitted: the
+  viewer asks for a keyframe of just the tile that lost one (1/16 of a whole keyframe), and
+  knows from every frame which tiles its update had, so even a tile lost whole on a still screen
+  is asked for again. Each side sends a tiny packet every 20 ms when idle, so a Wi-Fi radio
+  never dozes off between clicks.
 - **Decode → display with zero copies.** Each tile has its own hardware decoder, decoding as soon
   as the tile arrives, in parallel with the others. The render thread copies decoded tiles into a
   picture on the GPU with Metal and draws it as soon as every tile of a frame is in, so a frame
@@ -224,6 +227,13 @@ carrier-grade NAT or strict firewalls block it), the server passes the session's
 instead: still encrypted end to end, so the server can't read them, and the viewer window says
 *Internet · relayed*. A direct path has the lower latency.
 
+Two Macs on one network connect there, even when one is told the other's public address or
+goes through the server: the host says where it is on its network every time a viewer connects,
+and the viewer tries that too, at the same time, and prefers it when it is on the viewer's own
+network. Routers rarely send traffic for their own public address back inside, so without that
+the session would go out to the LanKVM server and back. A session that went through the relay anyway (the first time, before
+the viewer knew that address) moves onto the local network a moment later, without starting over.
+
 The **LanKVM server** field under internet access on This Mac picks another server (`host:port`),
 or none when left empty: then paired Macs reach the Mac only directly, as below. It has to be on
 the internet (paired Macs don't use one on a local network), and changing it ends the sessions
@@ -249,8 +259,9 @@ network carry on.
 
 Over the internet the picture follows the connection: changes go out as tiles only, at up to
 60 fps, and the bitrate starts at 12 Mbit/s and rises as far as the connection allows, backing off
-when packets get lost or start to queue. On a slow connection the frame rate drops rather than the
-picture falling behind. What limits it is usually the upload of the Mac you're looking at: for the
+when packets get lost or start to queue (through the LanKVM server's relay, to at most 32 Mbit/s,
+under what the server passes). On a slow connection the picture gets softer rather than falling
+behind: the bitrate comes down to what the connection delivers. What limits it is usually the upload of the Mac you're looking at: for the
 best picture, give that Mac a fast upload.
 
 ## Testing a connection on one Mac

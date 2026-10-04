@@ -10,6 +10,7 @@ use quinn::{ConnectionError, ConnectionId, TokenStore, TransportErrorCode};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+use transport::cc::Pace;
 use transport::endpoint::{Network, peer_fingerprint};
 use transport::identity::DeviceIdentity;
 use transport::knock::{AccessKey, access_key};
@@ -116,7 +117,7 @@ async fn paired_viewer_knocks_and_gets_in() {
             assert!(incoming.remote_address_validated());
             // Still the knock: quinn carries it through the Retry token.
             assert_eq!(host.gate.admit(&incoming.orig_dst_cid(), incoming.remote_address()), Some(viewer_fp));
-            let conn = incoming.accept_with(host.internet_server_config()).unwrap().await.unwrap();
+            let conn = incoming.accept_with(host.internet_server_config(&Pace::new())).unwrap().await.unwrap();
             assert_eq!(peer_fingerprint(&conn), Some(viewer_fp));
             conn
         })
@@ -128,7 +129,8 @@ async fn paired_viewer_knocks_and_gets_in() {
     assert_eq!(peer_fingerprint(&conn), Some(host_id.fingerprint));
     let host_conn = timeout(Duration::from_secs(5), server).await.expect("accepted in time").unwrap();
 
-    // Both ends use the internet settings: Cubic's window, not the LAN controller's 32 MiB.
+    // Both ends use the internet settings: the viewer's Cubic and the host's paced window, not the
+    // LAN controller's 32 MiB.
     assert!(conn.congestion_state().window() < 32 * 1024 * 1024);
     assert!(host_conn.congestion_state().window() < 32 * 1024 * 1024);
     host_conn.send_datagram(bytes::Bytes::from_static(b"frame")).unwrap();
@@ -224,7 +226,7 @@ async fn retry_token_copied_off_the_wire_gets_no_answer() {
             incoming.retry().unwrap();
             let incoming = host.endpoint.accept().await.unwrap();
             assert_eq!(host.gate.admit(&incoming.orig_dst_cid(), incoming.remote_address()), Some(viewer_fp));
-            incoming.accept_with(host.internet_server_config()).unwrap().await.unwrap()
+            incoming.accept_with(host.internet_server_config(&Pace::new())).unwrap().await.unwrap()
         })
     };
     let key = access_key(&SECRET, &viewer_fp);
