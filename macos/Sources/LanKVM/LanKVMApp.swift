@@ -7,7 +7,7 @@ struct LanKVMApp: App {
     @StateObject private var core = CoreModel.shared
 
     init() {
-        // With LANKVM_SCOPE_LOG set this binary is scripts/engine-bench.sh's screen scope (it
+        // With LANKVM_SCOPE_LOG set this binary is scripts/viewer-bench.sh's screen scope (it
         // borrows LanKVM's Screen Recording grant): it never returns, so the core never starts.
         BenchScope.runIfRequested()
     }
@@ -68,9 +68,8 @@ private struct ControlCommands: Commands {
             if session?.mode == .control {
                 Button("View Only") { controls?.viewOnly() }
             } else {
-                // With Sunshine + Moonlight, Moonlight's window has the keyboard and mouse.
                 Button("Control") { controls?.requestControl() }
-                    .disabled(!connected || session?.streamsInMoonlight == true)
+                    .disabled(!connected)
             }
             Menu("Remote Mac") {
                 ForEach(RemoteAction.allCases) { action in
@@ -83,13 +82,6 @@ private struct ControlCommands: Commands {
                     .disabled(!connected)
             } else {
                 Menu("Display") {}
-                    .disabled(true)
-            }
-            if let session {
-                EngineMenu(session: session)
-                    .disabled(!connected)
-            } else {
-                Menu("Engine") {}
                     .disabled(true)
             }
             Divider()

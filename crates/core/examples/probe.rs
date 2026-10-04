@@ -69,20 +69,6 @@
 //! display's own scale). `--trace` writes a JSON line per finished update: {update, n,
 //! capture_local_us, decoded_us, tiles, bytes, new, full, motion} (n null where unreadable; new:
 //! the first update showing n; bytes null until the frame probe sees encoded sizes).
-//!
-//! The Sunshine engine (Sunshine on the host, Moonlight here; both installed separately):
-//!
-//!   probe HOST [--virtual 2560x1600@2x --refresh 120 --arrange extend] --engine sunshine [--moonlight windowed|fullscreen] [--seconds 15]
-//!
-//! shows the virtual display first (Sunshine streams the display it starts on), then asks for the
-//! Sunshine engine and prints `engine: sunshine port=P generation=G size=WxH fps=F`, or
-//! `engine: refused <why>` and exits 1. `--moonlight` also runs Moonlight as the app does
-//! (pairing it with the host's Sunshine the first time), printing `moonlight: <state> pid=<pid>
-//! log=<path> <message>` at each change. It holds the session for --seconds (from when Moonlight
-//! streams, with --moonlight), then switches back to LanKVM's engine, so the host ends Sunshine's
-//! stream and Moonlight quits by itself (writing its stats to its log). Passes if the engine was
-//! granted, Moonlight streamed (with --moonlight) and everything ended cleanly; no frames are
-//! decoded here.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Seek, Write};
@@ -90,12 +76,12 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use lankvm_core::{Core, Event, MoonlightDisplay, MoonlightOptions, ProbeFrame};
+use lankvm_core::{Core, Event, ProbeFrame};
 use objc2_core_foundation::Type;
 use platform_mac::{CFRetained, CVPixelBuffer, clock};
 use protocol::{
-    Arrangement, DisplayChoice, DockAxis, Engine, FULL_FRAME_TILE, GestureInput, GesturePhase, InputMsg, MOTION_FRAME_TILE, POS_MAX,
-    ScrollInput, SunshineInfo, SystemAction, TileRect, VirtualDisplaySpec,
+    Arrangement, DisplayChoice, DockAxis, FULL_FRAME_TILE, GestureInput, GesturePhase, InputMsg, MOTION_FRAME_TILE, POS_MAX, ScrollInput,
+    SystemAction, TileRect, VirtualDisplaySpec,
 };
 use serde_json::Value;
 
@@ -125,10 +111,6 @@ struct Args {
     barcode_scale: Option<f64>,
     /// One JSON line per finished update goes here.
     trace: Option<String>,
-    /// Ask for the Sunshine engine (`--engine sunshine`).
-    sunshine: bool,
-    /// And run Moonlight on it, in a window or full screen.
-    moonlight: Option<MoonlightDisplay>,
 }
 
 enum Barcode {
@@ -178,8 +160,6 @@ fn parse_args() -> Result<Args, String> {
         barcode: None,
         barcode_scale: None,
         trace: None,
-        sunshine: false,
-        moonlight: None,
     };
     let mut target = None;
     let mut arrangement = Arrangement::EXTEND;
@@ -215,38 +195,18 @@ fn parse_args() -> Result<Args, String> {
                 a.barcode_scale = Some(args.next().and_then(|s| s.parse().ok()).filter(|s: &f64| *s > 0.0).ok_or("--barcode-scale needs a number")?)
             }
             "--trace" => a.trace = Some(args.next().ok_or("--trace needs a file")?),
-            "--engine" => {
-                a.sunshine = match args.next().as_deref() {
-                    Some("sunshine") => true,
-                    Some("lankvm") => false,
-                    _ => return Err("--engine needs sunshine or lankvm".into()),
-                }
-            }
-            "--moonlight" => {
-                a.moonlight = Some(match args.next().as_deref() {
-                    Some("windowed") => MoonlightDisplay::Windowed,
-                    Some("fullscreen") => MoonlightDisplay::Fullscreen,
-                    _ => return Err("--moonlight needs windowed or fullscreen".into()),
-                })
-            }
             _ if target.is_none() && !arg.starts_with('-') => target = Some(arg),
             _ => return Err(format!("unexpected argument {arg}")),
         }
     }
     a.target = target.ok_or(
-        "usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--virtual WxH[@2x] [--arrange extend|main|only] [--refresh HZ]] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]] [--barcode-log FILE | --barcode X,Y,W,H [--barcode-scale S]] [--trace FILE] [--engine sunshine [--moonlight windowed|fullscreen]]",
+        "usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--virtual WxH[@2x] [--arrange extend|main|only] [--refresh HZ]] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]] [--barcode-log FILE | --barcode X,Y,W,H [--barcode-scale S]] [--trace FILE]",
     )?;
     if (a.script.is_some() || a.latency.is_some()) && !a.control {
         return Err("--script and --input-latency need --control".into());
     }
     if a.latency.is_some() && a.rect.is_none() && a.lab.is_none() {
         return Err("--input-latency needs --rect (or --lab, to use its patch)".into());
-    }
-    if a.moonlight.is_some() && !a.sunshine {
-        return Err("--moonlight needs --engine sunshine".into());
-    }
-    if a.sunshine && (a.control || a.barcode.is_some() || a.then_main) {
-        return Err("--engine sunshine doesn't go with --control, --barcode or --then-main".into());
     }
     for spec in &mut a.virtual_displays {
         spec.arrangement = arrangement;
@@ -772,12 +732,6 @@ impl Probe {
         if let Err(code) = self.connect() {
             return code;
         }
-        if args.sunshine {
-            let code = self.run_sunshine(args);
-            // Nothing of Moonlight's stays behind (the probe exits without tearing down).
-            self.core.shutdown();
-            return code;
-        }
         if !args.virtual_displays.is_empty() {
             let size = Arc::new(Mutex::new(None));
             let (sink, watch) = (size.clone(), self.watch.clone());
@@ -874,181 +828,6 @@ impl Probe {
         }
         println!("PASS: decoded frames are {}x{}", want.0, want.1);
         if code == 0 { Ok(()) } else { Err(code) }
-    }
-
-    /// The next event, those that waited first.
-    fn next_event(&mut self, timeout: Duration) -> Option<Event> {
-        if !self.pending.is_empty() {
-            return Some(self.pending.remove(0));
-        }
-        self.events.recv_timeout(timeout).ok()
-    }
-
-    /// Waits for the `engine` event answering `request`.
-    fn engine(&mut self, request: u32, timeout: Duration) -> Option<EngineAnswer> {
-        let answer = |e: &Event| matches!(e, Event::Engine { request: r, .. } if *r == request);
-        let take = |e: Event| match e {
-            Event::Engine { engine, message, sunshine, .. } => EngineAnswer { engine, message, sunshine },
-            _ => unreachable!(),
-        };
-        if let Some(i) = self.pending.iter().position(answer) {
-            return Some(take(self.pending.remove(i)));
-        }
-        let deadline = Instant::now() + timeout;
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            match self.events.recv_timeout(left) {
-                Ok(e) if answer(&e) => return Some(take(e)),
-                Ok(e) => self.pending.push(e),
-                Err(_) => break,
-            }
-        }
-        None
-    }
-
-    /// `--engine sunshine`: the virtual display, then the Sunshine engine (and Moonlight on it),
-    /// held for `--seconds`, then LanKVM's engine again. See the doc at the top.
-    fn run_sunshine(&mut self, args: &Args) -> i32 {
-        // The display first: Sunshine probes its encoders (HEVC) on the display it starts with.
-        for spec in &args.virtual_displays {
-            let started = Instant::now();
-            let request = self.core.set_display(self.id, DisplayChoice::Virtual(*spec));
-            match self.display(request, Duration::from_secs(30)) {
-                Some(shown) if shown.reason == 0 => {
-                    println!("{shown} after {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
-                    self.shown = Some(shown);
-                }
-                Some(shown) => {
-                    println!("FAIL: {shown}");
-                    return 1;
-                }
-                None => {
-                    println!("FAIL: no answer about the display");
-                    return 1;
-                }
-            }
-        }
-        let started = Instant::now();
-        let options = args.moonlight.map(|mode| MoonlightOptions::new(mode == MoonlightDisplay::Fullscreen));
-        let request = self.core.set_engine(self.id, Engine::Sunshine, options);
-        match self.engine(request, SUNSHINE_START_WAIT) {
-            Some(EngineAnswer { engine: "sunshine", sunshine: Some(info), .. }) => {
-                println!("{} after {:.0} ms", engine_line(&info), started.elapsed().as_secs_f64() * 1000.0);
-            }
-            Some(answer) => {
-                println!("engine: refused {}", if answer.message.is_empty() { "(no reason given)" } else { &answer.message });
-                return 1;
-            }
-            None => {
-                println!("engine: refused (no answer from the host within {} s)", SUNSHINE_START_WAIT.as_secs());
-                return 1;
-            }
-        }
-        let mut code = 0;
-        // Held for --seconds once Moonlight streams (at once without Moonlight).
-        let mut held_from = args.moonlight.is_none().then(Instant::now);
-        let give_up = Instant::now() + MOONLIGHT_START_WAIT;
-        let mut moonlight_running = false;
-        let mut ended_at: Option<Instant> = None;
-        loop {
-            let now = Instant::now();
-            let until = held_from.map_or(give_up, |t| t + Duration::from_secs(args.seconds));
-            if now >= until {
-                if held_from.is_none() {
-                    println!("FAIL: Moonlight didn't start streaming within {} s", MOONLIGHT_START_WAIT.as_secs());
-                    code = 1;
-                }
-                break;
-            }
-            if ended_at.is_some_and(|at| now.duration_since(at) > MOONLIGHT_RESTART_WAIT) {
-                println!("FAIL: Moonlight ended while the session streamed with Sunshine");
-                code = 1;
-                break;
-            }
-            match self.next_event((until - now).min(Duration::from_millis(500))) {
-                Some(Event::Moonlight { state, message, pid, log, .. }) => {
-                    println!("{}", moonlight_line(state, pid, log.as_deref(), &message));
-                    match state {
-                        "streaming" => {
-                            held_from.get_or_insert_with(Instant::now);
-                            moonlight_running = true;
-                            ended_at = None;
-                        }
-                        "starting" | "pairing" => {
-                            moonlight_running = true;
-                            ended_at = None;
-                        }
-                        "ended" => {
-                            moonlight_running = false;
-                            // Moonlight starts again after a new generation (it says "starting"
-                            // as soon as that comes); otherwise it's gone.
-                            ended_at = Some(Instant::now());
-                        }
-                        "failed" => {
-                            println!("FAIL: Moonlight: {message}");
-                            moonlight_running = false;
-                            code = 1;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                Some(Event::Engine { engine: "sunshine", sunshine: Some(info), message, .. }) => {
-                    println!("{}{}", engine_line(&info), if message.is_empty() { String::new() } else { format!(" — {message}") });
-                }
-                Some(Event::Engine { engine, message, .. }) => {
-                    println!("FAIL: the host switched to the {engine} engine: {message}");
-                    code = 1;
-                    break;
-                }
-                Some(Event::Ended { error, .. }) => {
-                    println!("FAIL: session ended: {}", error.unwrap_or_else(|| "closed by host".into()));
-                    return 1;
-                }
-                _ => {}
-            }
-        }
-        // Back to LanKVM's engine: the host ends Sunshine's stream (Moonlight quits by itself,
-        // writing its stats) and stops it.
-        let started = Instant::now();
-        let request = self.core.set_engine(self.id, Engine::LanKvm, None);
-        match self.engine(request, Duration::from_secs(30)) {
-            Some(EngineAnswer { engine: "lankvm", message, .. }) => {
-                println!("engine: lankvm after {:.0} ms{}", started.elapsed().as_secs_f64() * 1000.0, if message.is_empty() { String::new() } else { format!(" — {message}") });
-            }
-            Some(answer) => {
-                println!("FAIL: the host answered {} switching back: {}", answer.engine, answer.message);
-                code = 1;
-            }
-            None => {
-                println!("FAIL: no answer switching back to LanKVM's engine");
-                code = 1;
-            }
-        }
-        if args.moonlight.is_some() && (moonlight_running || ended_at.is_none()) {
-            let deadline = Instant::now() + MOONLIGHT_EXIT_WAIT;
-            let mut ended = false;
-            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-                match self.next_event(left) {
-                    Some(Event::Moonlight { state, message, pid, log, .. }) => {
-                        println!("{}", moonlight_line(state, pid, log.as_deref(), &message));
-                        if state == "ended" || state == "failed" {
-                            ended = true;
-                            break;
-                        }
-                    }
-                    Some(_) => {}
-                    None => break,
-                }
-            }
-            if !ended {
-                println!("FAIL: Moonlight didn't end within {} s of switching back", MOONLIGHT_EXIT_WAIT.as_secs());
-                code = 1;
-            }
-        }
-        if code == 0 {
-            println!("PASS: the Sunshine engine streamed{} and ended cleanly", if args.moonlight.is_some() { " to Moonlight" } else { "" });
-        }
-        code
     }
 
     /// Waits for the `display` event answering `request`.
@@ -1683,31 +1462,6 @@ impl Probe {
 
 /// How often to look for Frame Source's strip in its log until it's there.
 const STRIP_LOOK_INTERVAL: Duration = Duration::from_millis(100);
-
-/// The host starts Sunshine (it probes its encoders for seconds) before it answers.
-const SUNSHINE_START_WAIT: Duration = Duration::from_secs(60);
-/// Pairing Moonlight the first time, then its connecting, before it streams.
-const MOONLIGHT_START_WAIT: Duration = Duration::from_secs(120);
-/// Moonlight quits once the host ended the stream (or its runner kills it after 3 s).
-const MOONLIGHT_EXIT_WAIT: Duration = Duration::from_secs(5);
-/// Moonlight that quit opens again if the host's Sunshine started again (another display) by
-/// then: the host ends the stream before it stops and restarts Sunshine (the runner's grace).
-const MOONLIGHT_RESTART_WAIT: Duration = Duration::from_secs(30);
-
-/// The host's answer to an engine request.
-struct EngineAnswer {
-    engine: &'static str,
-    message: String,
-    sunshine: Option<SunshineInfo>,
-}
-
-fn engine_line(info: &SunshineInfo) -> String {
-    format!("engine: sunshine port={} generation={} size={}x{} fps={}", info.port, info.generation, info.width, info.height, info.fps)
-}
-
-fn moonlight_line(state: &str, pid: Option<u32>, log: Option<&str>, message: &str) -> String {
-    format!("moonlight: {state} pid={} log={} {message}", pid.map_or("-".into(), |p| p.to_string()), log.unwrap_or("-"))
-}
 
 /// The mean luma of a region of the stream, which may span several tiles: each tile's part is
 /// measured when that tile is decoded, and the region's mean is the area-weighted mean of the

@@ -6,12 +6,10 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, OnceLock};
 
-use protocol::{
-    Arrangement, DisplayChoice, DockAxis, Engine, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction, VirtualDisplaySpec,
-};
+use protocol::{Arrangement, DisplayChoice, DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction, VirtualDisplaySpec};
 use serde::Serialize;
 
-use crate::{Core, Event, MoonlightOptions};
+use crate::{Core, Event};
 
 static CORE: OnceLock<Arc<Core>> = OnceLock::new();
 
@@ -218,47 +216,6 @@ pub extern "C" fn lk_show_main_display(session: u64) -> u32 {
 pub extern "C" fn lk_show_virtual_display(session: u64, width: u32, height: u32, hidpi: bool, refresh_hz: u32, arrangement: u8) -> u32 {
     let spec = VirtualDisplaySpec { width, height, hidpi, refresh_hz, arrangement: Arrangement(arrangement) };
     core().map_or(0, |c| c.set_display(session, DisplayChoice::Virtual(spec)))
-}
-
-// MARK: Streaming engine (viewer side)
-
-/// `lk_set_engine`'s engines.
-const ENGINE_LANKVM: u8 = 0;
-const ENGINE_SUNSHINE: u8 = 1;
-
-/// Asks the host to stream with LanKVM's own engine (`LK_ENGINE_LANKVM`) or with its Sunshine,
-/// shown here by Moonlight (`LK_ENGINE_SUNSHINE`), in a window or `fullscreen`. Returns the request
-/// id the answering `engine` event carries (0 if there's no such session, or no such engine).
-#[unsafe(no_mangle)]
-pub extern "C" fn lk_set_engine(session: u64, engine: u8, fullscreen: bool) -> u32 {
-    let (engine, moonlight) = match engine {
-        ENGINE_LANKVM => (Engine::LanKvm, None),
-        ENGINE_SUNSHINE => (Engine::Sunshine, Some(MoonlightOptions::new(fullscreen))),
-        _ => return 0,
-    };
-    core().map_or(0, |c| c.set_engine(session, engine, moonlight))
-}
-
-/// Opens Moonlight again on the session's Sunshine stream, after it ended.
-#[unsafe(no_mangle)]
-pub extern "C" fn lk_open_moonlight(session: u64) {
-    if let Some(c) = core() {
-        c.open_moonlight(session);
-    }
-}
-
-/// Whether Sunshine (needed on a Mac others stream from with the Sunshine engine) is installed
-/// on this Mac. Works before `lk_start`.
-#[unsafe(no_mangle)]
-pub extern "C" fn lk_sunshine_installed() -> bool {
-    crate::sunshine_installed()
-}
-
-/// Whether Moonlight (needed on a Mac that views with the Sunshine engine) is installed on this
-/// Mac. Works before `lk_start`.
-#[unsafe(no_mangle)]
-pub extern "C" fn lk_moonlight_installed() -> bool {
-    crate::moonlight_installed()
 }
 
 // MARK: Remote control (viewer side). Called for every input event, so no JSON here.
@@ -566,17 +523,6 @@ mod tests {
         assert_eq!(header_value("LK_DISPLAY_MAX_SIDE"), u64::from(VirtualDisplaySpec::MAX_SIDE));
         assert_eq!(header_value("LK_DISPLAY_MAX_PIXELS"), VirtualDisplaySpec::MAX_PIXELS);
         assert_eq!(header_value("LK_DISPLAY_MAX_ASPECT"), u64::from(VirtualDisplaySpec::MAX_ASPECT));
-    }
-
-    #[test]
-    fn header_engines_are_the_ffis() {
-        assert_eq!(header_value("LK_ENGINE_LANKVM"), u64::from(ENGINE_LANKVM));
-        assert_eq!(header_value("LK_ENGINE_SUNSHINE"), u64::from(ENGINE_SUNSHINE));
-        let header = include_str!("../../../macos/Sources/CLanKVM/include/lankvm.h");
-        for f in ["lk_set_engine(", "lk_open_moonlight(", "lk_sunshine_installed(", "lk_moonlight_installed("] {
-            assert!(header.contains(f), "{f} isn't declared in lankvm.h");
-        }
-        assert_eq!(lk_set_engine(1, 7, false), 0, "no such engine");
     }
 
     #[test]

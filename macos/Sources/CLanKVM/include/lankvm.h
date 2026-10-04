@@ -59,21 +59,6 @@ uint32_t lk_show_virtual_display(uint64_t session, uint32_t width, uint32_t heig
 #define LK_DISPLAY_NO_VIDEO 9
 #define LK_DISPLAY_TOO_MANY 10
 
-// Which engine streams a session's picture: LanKVM's own, or the host's Sunshine shown here by
-// Moonlight (both installed separately; LanKVM's session stays up for displays and control).
-// lk_set_engine returns the request id that the answering `engine` event carries (0 if there's no
-// such session). With Sunshine, `moonlight` events follow (pairing, starting, streaming, ended,
-// failed); after "ended", lk_open_moonlight opens it again. `fullscreen` opens Moonlight full
-// screen (system keys then go to the host) instead of in a window.
-#define LK_ENGINE_LANKVM 0
-#define LK_ENGINE_SUNSHINE 1
-uint32_t lk_set_engine(uint64_t session, uint8_t engine, bool fullscreen);
-void lk_open_moonlight(uint64_t session);
-// Whether Sunshine (host side) and Moonlight (viewer side) are installed on this Mac. Work
-// before lk_start.
-bool lk_sunshine_installed(void);
-bool lk_moonlight_installed(void);
-
 // Rendering into a CAMetalLayer, sized in pixels. The layer is retained until detach.
 void lk_attach_view(uint64_t session, void *metal_layer, uint32_t width, uint32_t height);
 void lk_resize_view(uint64_t session, uint32_t width, uint32_t height);

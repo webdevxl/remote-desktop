@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Summarizes scripts/engine-bench.sh runs side by side, one column per run.
+"""Summarizes scripts/viewer-bench.sh runs side by side, one column per run.
 
-    python3 scripts/engine-report.py target/e2e/bench/RUN... [--json]
+    python3 scripts/viewer-report.py target/e2e/bench/RUN... [--json]
 
 From a run's scope.jsonl (every frame the screen scope read off the viewer window, with when it
 reached the glass) joined by frame number with frame-source.jsonl (when each source frame was
@@ -14,15 +14,13 @@ committed on the host's virtual display; a virtual display reports no presentati
                     number after a newer one), frames committed in that span never shown, and the
                     share of captured frames the scope couldn't read
   source            frames committed while measured, and their rate
-From moonlight.log: Moonlight's "Global video stats" (averages over its whole session, startup
-included). From viewer-stats.log: the median of the LanKVM viewer's per-second stats while frames
-flowed (as latency-report.py). From cpu.log: median CPU % (CPU time over each second) and RSS per
+From viewer-stats.log: the median of the viewer's per-second stats while frames flowed (as
+latency-report.py). From cpu.log: median CPU % (CPU time over each second) and RSS per
 process while the scope measured. --json prints the numbers instead of the table (host stats too).
 """
 
 import bisect
 import importlib.util
-import re
 import sys
 from pathlib import Path
 
@@ -38,27 +36,6 @@ quantile, read_jsonl, read_meta, fmt = latency.quantile, latency.read_jsonl, lat
 MAX_FRAME_JUMP = latency.MAX_FRAME_JUMP
 # The strip carries n modulo 2^16.
 WRAP = 1 << 16
-# Moonlight's end-of-session block: (key, pattern), in its order.
-MOONLIGHT_STATS = [
-    ("incoming_fps", r"Incoming frame rate from network: ([\d.]+) FPS"),
-    ("decoding_fps", r"Decoding frame rate: ([\d.]+) FPS"),
-    ("rendering_fps", r"Rendering frame rate: ([\d.]+) FPS"),
-    ("host_latency_ms", r"Host processing latency min/max/average: [\d.]+/[\d.]+/([\d.]+) ms"),
-    ("network_drop_pct", r"Frames dropped by your network connection: ([\d.]+)%"),
-    ("jitter_drop_pct", r"Frames dropped due to network jitter: ([\d.]+)%"),
-    ("network_latency_ms", r"Average network latency: (\d+) ms"),
-    ("network_variance_ms", r"Average network latency: \d+ ms \(variance: (\d+) ms\)"),
-    ("decode_ms", r"Average decoding time: ([\d.]+) ms"),
-    ("queue_ms", r"Average frame queue delay: ([\d.]+) ms"),
-    ("render_ms", r"Average rendering time \(including monitor V-sync latency\): ([\d.]+) ms"),
-]
-# Lines in Moonlight's log worth a note: (pattern, note).
-MOONLIGHT_NOTES = [
-    ("Avoiding Metal renderer", "AVSampleBufferDisplayLayer"),
-    ("Disabling V-sync because refresh rate limit exceeded", "V-sync off (refresh limit)"),
-    ("Packet size capped at 1024", "treated as remote"),
-]
-
 
 def unwrap(frames, commits):
     """Absolute frame numbers for the scope's frame lines (n modulo 2^16), in place ("abs").
@@ -171,44 +148,6 @@ def scope_numbers(run):
     return out
 
 
-def moonlight_numbers(run):
-    try:
-        text = (run / "moonlight.log").read_text(errors="replace")
-    except OSError:
-        return {}
-    out = {}
-    notes = [note for pattern, note in MOONLIGHT_NOTES if pattern in text]
-    if notes:
-        out["moonlight_notes"] = ", ".join(notes)
-    # The last block: one is written whenever the decoder goes (stream end, resets).
-    at = text.rfind("Global video stats")
-    if at < 0:
-        return out
-    block = "\n".join(text[at:].splitlines()[:16])
-    for key, pattern in MOONLIGHT_STATS:
-        found = re.search(pattern, block)
-        if found:
-            out[f"moonlight_{key}"] = float(found.group(1))
-    out["moonlight_blocks"] = text.count("Global video stats")
-    return out
-
-
-def probe_lines(run):
-    """The probe's first `engine: sunshine port=.. size=WxH fps=..` line and its verdict (moonlight runs)."""
-    try:
-        lines = (run / "probe.txt").read_text().splitlines()
-    except OSError:
-        return {}
-    out = {}
-    engine = next((l for l in lines if l.startswith("engine: ")), None)
-    if engine:
-        out["engine_line"] = engine[len("engine: "):]
-    verdicts = [l for l in lines if l.startswith(("PASS", "FAIL"))]
-    if verdicts:
-        out["probe_verdict"] = "; ".join(verdicts)
-    return out
-
-
 def cpu_seconds(text):
     """ps's cumulative CPU time ([[dd-]hh:]mm:ss.ss) in seconds."""
     days, _, rest = text.rpartition("-")
@@ -255,8 +194,6 @@ def summarize(run):
     run = Path(run)
     numbers = {"run": run.name, **{f"meta_{k}": v for k, v in read_meta(run).items()}}
     numbers.update(scope_numbers(run))
-    numbers.update(probe_lines(run))
-    numbers.update(moonlight_numbers(run))
     numbers.update(latency.viewer_numbers(run))
     numbers.update(latency.host_numbers(run))
     numbers.update(cpu_numbers(run, numbers.get("scope_epoch")))
@@ -264,7 +201,7 @@ def summarize(run):
 
 
 # Processes in cpu.log, in the order they're shown.
-PROCESSES = ["host", "sunshine", "viewer", "moonlight", "probe", "frame-source", "scope"]
+PROCESSES = ["host", "viewer", "frame-source", "scope"]
 
 
 def rows(runs):
@@ -286,21 +223,12 @@ def rows(runs):
             return None
         return f"{r.get('scope_frames', '-')} ({r['scope_readable']} / {r['scope_unreadable']} / {fmt(r.get('scope_idle'))})"
 
-    def ml(*keys, digits=1):
-        def cell(r):
-            values = [r.get(f"moonlight_{k}") for k in keys]
-            return None if all(v is None for v in values) else " / ".join(fmt(v, digits) for v in values)
-        return cell
-
     out = [
-        row("engine", lambda r: r.get("meta_engine")),
         row("mode", lambda r: r.get("meta_mode")),
         row("app", lambda r: r.get("meta_app")),
         row("app built", lambda r: r.get("meta_app_built")),
         row("client", lambda r: r.get("meta_client")),
         row("display", lambda r: f"{r['meta_size']} @ {r.get('meta_refresh', '?')} Hz" if "meta_size" in r else None),
-        row("stream", lambda r: r.get("engine_line")),
-        row("probe", lambda r: r.get("probe_verdict")),
         row("power", lambda r: r.get("meta_power")),
         row("knobs", lambda r: " ".join(f"{k[5:]}={v}" for k, v in r.items() if k.startswith("meta_LANKVM_")) or None),
         row("viewer window", lambda r: r.get("window") and f"{r['window']}, strip ×{fmt(r.get('strip_scale'), 2)}"),
@@ -316,12 +244,6 @@ def rows(runs):
         row("  late", lambda r: fmt(r.get("frames_late"))),
         row("  committed, never shown", lambda r: fmt(r.get("frames_never_shown"))),
         row("source committed (fps measured)", lambda r: f"{r['source_drawn']} ({fmt(r.get('source_fps'))} fps)" if "source_drawn" in r else None),
-        row("moonlight in / decoded / rendered fps", ml("incoming_fps", "decoding_fps", "rendering_fps")),
-        row("moonlight drops network / jitter %", ml("network_drop_pct", "jitter_drop_pct", digits=2)),
-        row("moonlight network latency ms", ml("network_latency_ms", "network_variance_ms")),
-        row("moonlight decode / queue / render ms", ml("decode_ms", "queue_ms", "render_ms", digits=2)),
-        row("moonlight host latency ms", ml("host_latency_ms")),
-        row("moonlight notes", lambda r: r.get("moonlight_notes")),
         row("viewer seconds", lambda r: fmt(r.get("viewer_seconds"))),
     ]
     out += [row(f"viewer {key} (p50)", lambda r, k=key: fmt(r.get(f"viewer_{k}"))) for key in latency.VIEWER_MEDIANS]

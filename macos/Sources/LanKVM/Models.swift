@@ -21,8 +21,6 @@ struct HostStatus: Decodable, Equatable {
     var virtualDisplays: [VirtualDisplay] = []
     /// Whether paired Macs can reach this one over the internet.
     var internet = InternetStatus()
-    /// Sunshine, the other engine a viewer may stream this screen with.
-    var sunshine = SunshineStatus()
 
     /// Who controls this Mac right now, if anyone.
     var controller: Viewer? { viewers.first(where: \.controlling) }
@@ -30,7 +28,7 @@ struct HostStatus: Decodable, Equatable {
 
 extension HostStatus {
     private enum CodingKeys: String, CodingKey {
-        case viewers, pairing, screenCaptureAllowed, allowControl, controlPermission, virtualDisplays, internet, sunshine
+        case viewers, pairing, screenCaptureAllowed, allowControl, controlPermission, virtualDisplays, internet
     }
 
     /// Newer fields are optional: a status without them (or with one this app can't read) still
@@ -44,29 +42,6 @@ extension HostStatus {
         controlPermission = try c.decode(Bool.self, forKey: .controlPermission)
         virtualDisplays = c.lenient([VirtualDisplay].self, .virtualDisplays) ?? []
         internet = c.lenient(InternetStatus.self, .internet) ?? InternetStatus()
-        sunshine = c.lenient(SunshineStatus.self, .sunshine) ?? SunshineStatus()
-    }
-}
-
-/// Sunshine on this Mac (`SunshineView` in crates/core sunshine.rs). LanKVM starts it for one
-/// viewer at a time, while that viewer streams with Sunshine + Moonlight, and stops it after.
-struct SunshineStatus: Equatable {
-    var installed = false
-    var running = false
-    /// The name of the Mac it streams to.
-    var viewer: String?
-}
-
-extension SunshineStatus: Decodable {
-    private enum CodingKeys: String, CodingKey {
-        case installed, running, viewer
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        installed = c.lenient(Bool.self, .installed) ?? false
-        running = c.lenient(Bool.self, .running) ?? false
-        viewer = c.lenient(String.self, .viewer).flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 
@@ -420,21 +395,20 @@ struct SessionStats: Decodable, Equatable {
 /// Events pushed by the core (see `Event` in crates/core/src/lib.rs).
 struct CoreEvent: Decodable {
     enum Kind: String, Decodable {
-        case hostChanged, trustChanged, pinNeeded, connected, ended, control, cursorShape, cursor, display, streamError, engine, moonlight
+        case hostChanged, trustChanged, pinNeeded, connected, ended, control, cursorShape, cursor, display, streamError
     }
     var type: Kind
     var session: UInt64?
     /// connected, display
     var info: SessionInfo?
     var error: String?
-    // control, display, engine
+    // control, display
     var request: UInt32?
     var active: Bool?
     /// control: a `ControlReason` code (see crates/protocol), why control isn't active. display: a
     /// `DisplayReason` code, why the session doesn't show what it asked for.
     var reason: Int?
-    /// control, display, engine: the reason in words, or news. streamError: why the video can't
-    /// be shown. moonlight: how Moonlight is doing, in words.
+    /// control, display: the reason in words, or news. streamError: why the video can't be shown.
     var message: String?
     var injectedTag: Int64?
     var hostPid: Int64?
@@ -445,62 +419,7 @@ struct CoreEvent: Decodable {
     var height: Double?
     var hotX: Double?
     var hotY: Double?
-    /// cursor: how to show it. moonlight: a `MoonlightState`.
     var state: String?
-    /// engine: a `StreamEngine`, the one streaming now.
-    var engine: String?
-    /// engine: Sunshine's port while it streams.
-    var port: UInt16?
-    /// engine: the rest of what Moonlight connects with (a new generation is a new stream).
-    var sunshine: SunshineStream?
-    // moonlight: its process and log file.
-    var pid: UInt32?
-    var log: String?
-}
-
-/// Which engine streams a session's picture (`Engine` in crates/protocol): LanKVM's own, into
-/// the viewer window, or the host's Sunshine, shown here by Moonlight in its own window.
-enum StreamEngine: String {
-    case lankvm, sunshine
-}
-
-/// How Moonlight is doing while a session streams with Sunshine (the `moonlight` event).
-enum MoonlightState: String {
-    /// Pairing with the host's Sunshine (LanKVM hands Sunshine the PIN Moonlight shows).
-    case pairing
-    case starting
-    /// Its window shows the stream.
-    case streaming
-    /// It quit or was closed; it can be opened again.
-    case ended
-    /// It couldn't start or pair; the message says why. It can be tried again.
-    case failed
-}
-
-/// The stream the host's Sunshine serves (`SunshineInfo` in crates/protocol).
-struct SunshineStream: Equatable {
-    var port: UInt16 = 0
-    /// Bumped each time Sunshine starts again (another display): Moonlight reconnects.
-    var generation: UInt32 = 0
-    var width: UInt32 = 0
-    var height: UInt32 = 0
-    var fps: UInt32 = 0
-}
-
-extension SunshineStream: Decodable {
-    private enum CodingKeys: String, CodingKey {
-        case port, generation, width, height, fps
-    }
-
-    /// Lenient: it only adds detail to an `engine` event, which must never be dropped for it.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        port = c.lenient(UInt16.self, .port) ?? 0
-        generation = c.lenient(UInt32.self, .generation) ?? 0
-        width = c.lenient(UInt32.self, .width) ?? 0
-        height = c.lenient(UInt32.self, .height) ?? 0
-        fps = c.lenient(UInt32.self, .fps) ?? 0
-    }
 }
 
 /// Why the host didn't grant control or took it back (`ControlReason` in crates/protocol).

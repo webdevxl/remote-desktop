@@ -1,5 +1,4 @@
 import AppKit
-import AVFoundation
 import CoreMedia
 import CoreVideo
 import Darwin
@@ -7,7 +6,7 @@ import ImageIO
 import QuartzCore
 import ScreenCaptureKit
 
-/// The screen scope of scripts/engine-bench.sh: with `LANKVM_SCOPE_LOG=<file>` set, this binary
+/// The screen scope of scripts/viewer-bench.sh: with `LANKVM_SCOPE_LOG=<file>` set, this binary
 /// films a viewer window's area of the screen instead of being LanKVM, reads Frame Source's frame
 /// number strip in every captured frame, and logs when each number reached the glass.
 ///
@@ -31,22 +30,13 @@ import ScreenCaptureKit
 /// Frame Source's `commit_us`, so on one Mac the two logs join by frame number with no sync.
 /// While the screen is locked the glass shows the lock screen, and the scope finds no strip.
 ///
-/// `LANKVM_SCOPE_AVCAPTURE=<display id>` instead films a whole display the way Sunshine does on
-/// macOS (AVCaptureScreenInput, BGRA at the display's pixel size, at most `LANKVM_SCOPE_FPS`), to
-/// tell how much of Sunshine's latency its capture alone costs; `display_us` is then the sample's
-/// presentation time (host clock).
-///
 /// The log (JSON lines): `start`, `window` (where it captures), `strip` (where it found the strip,
 /// capture pixels), a `frame` line per readable frame {n, display_us, arrival_us}, an `unreadable`
 /// line per frame it couldn't read once a strip was found, `error`, and `summary` last.
 enum BenchScope {
     /// Runs the scope and exits when `LANKVM_SCOPE_LOG` is set; returns at once otherwise.
     static func runIfRequested() {
-        let env = ProcessInfo.processInfo.environment
-        guard let path = env["LANKVM_SCOPE_LOG"], !path.isEmpty else { return }
-        if let id = env["LANKVM_SCOPE_AVCAPTURE"].flatMap({ CGDirectDisplayID($0) }) {
-            AVScope(logPath: path, displayID: id).run()
-        }
+        guard let path = ProcessInfo.processInfo.environment["LANKVM_SCOPE_LOG"], !path.isEmpty else { return }
         Scope(logPath: path).run()
     }
 }
@@ -567,108 +557,3 @@ private final class Scope: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     }
 }
 
-/// Sunshine's capture, for comparison (`LANKVM_SCOPE_AVCAPTURE`): AVCaptureScreenInput on a whole
-/// display, set up as Sunshine's src/platform/macos/av_video.m does (minimum frame duration 1/fps,
-/// BGRA at the display's pixel size, aspect-fit scaling, a serial queue at user-initiated QoS).
-private final class AVScope: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
-    let log: ScopeLog
-    let displayID: CGDirectDisplayID
-    let seconds: Double
-    let fps: Int
-    let queue = DispatchQueue(label: "dev.lankvm.scope.av", qos: .userInitiated)
-    let session = AVCaptureSession()
-    var signals: [DispatchSourceSignal] = []
-    var strip: Strip?
-    var started = 0.0
-    var finished = false
-    var frames = 0, readable = 0, unreadable = 0, undetected = 0, detections = 0
-    var seen = Set<Int>()
-
-    init(logPath: String, displayID: CGDirectDisplayID) {
-        let env = ProcessInfo.processInfo.environment
-        log = ScopeLog(path: logPath)
-        self.displayID = displayID
-        seconds = env["LANKVM_SCOPE_SECONDS"].flatMap { Double($0) } ?? 10
-        fps = max(1, env["LANKVM_SCOPE_FPS"].flatMap { Int($0) } ?? 120)
-    }
-
-    func run() -> Never {
-        NSApplication.shared.setActivationPolicy(.prohibited)
-        guard log.isOpen else { exit(2) }
-        for sig in [SIGTERM, SIGINT] {
-            signal(sig, SIG_IGN)
-            let source = DispatchSource.makeSignalSource(signal: sig, queue: queue)
-            source.setEventHandler { [self] in finish(0) }
-            source.resume()
-            signals.append(source)
-        }
-        log.write("start", ["pid": Int(getpid()), "backend": "avcapture", "display_id": Int(displayID), "seconds": seconds, "fps": fps,
-                            "time_us": nowUs(), "epoch": Date().timeIntervalSince1970, "locked": screenLocked()])
-        guard let mode = CGDisplayCopyDisplayMode(displayID), let input = AVCaptureScreenInput(displayID: displayID) else {
-            log.write("error", ["message": "no display \(displayID)"])
-            log.flush()
-            exit(1)
-        }
-        input.minFrameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-        let output = AVCaptureVideoDataOutput()
-        output.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: mode.pixelWidth,
-            kCVPixelBufferHeightKey as String: mode.pixelHeight,
-            AVVideoScalingModeKey: AVVideoScalingModeResizeAspect,
-        ]
-        output.setSampleBufferDelegate(self, queue: queue)
-        guard session.canAddInput(input), session.canAddOutput(output) else {
-            log.write("error", ["message": "can't set up AVCaptureSession for display \(displayID)"])
-            log.flush()
-            exit(1)
-        }
-        session.addInput(input)
-        session.addOutput(output)
-        log.write("window", ["display_id": Int(displayID), "capture": [mode.pixelWidth, mode.pixelHeight], "backend": "avcapture"])
-        session.startRunning()
-        queue.async { [self] in
-            started = CACurrentMediaTime()
-            queue.asyncAfter(deadline: .now() + seconds) { [self] in finish(0) }
-        }
-        while true { CFRunLoopRun() }
-    }
-
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        let arrival = nowUs()
-        guard !finished, let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        frames += 1
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let display = pts.isValid ? Int(CMTimeGetSeconds(pts) * 1_000_000) : 0
-        CVPixelBufferLockBaseAddress(image, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(image) else { return }
-        let px = Pixels(base: UnsafePointer(base.assumingMemoryBound(to: UInt8.self)), bytesPerRow: CVPixelBufferGetBytesPerRow(image),
-                        width: CVPixelBufferGetWidth(image), height: CVPixelBufferGetHeight(image))
-        if strip == nil, let s = detectStrip(px) {
-            strip = s
-            detections += 1
-            log.write("strip", ["x": s.x, "y": s.y, "s": s.s, "manual": false])
-        }
-        guard let current = strip else { undetected += 1; return }
-        guard let n = readStrip(px, current) else {
-            unreadable += 1
-            log.raw("{\"display_us\":\(display),\"type\":\"unreadable\"}")
-            return
-        }
-        readable += 1
-        seen.insert(n)
-        log.raw("{\"arrival_us\":\(arrival),\"display_us\":\(display),\"n\":\(n),\"type\":\"frame\"}")
-    }
-
-    func finish(_ code: Int32) {
-        guard !finished else { return }
-        finished = true
-        log.write("summary", ["frames": frames, "readable": readable, "unreadable": unreadable, "idle": 0, "blank": 0,
-                              "undetected": undetected, "detections": detections, "distinct": seen.count,
-                              "seconds": started > 0 ? CACurrentMediaTime() - started : 0])
-        log.flush()
-        session.stopRunning()
-        exit(code)
-    }
-}

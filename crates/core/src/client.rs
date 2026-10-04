@@ -11,8 +11,8 @@ use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 use platform_mac::decoder::{DecodedFrame, Decoder};
 use platform_mac::{CVPixelBuffer, clock, system};
 use protocol::{
-    Arrangement, ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, DisplayChoice, DisplayReason, DisplayState, Engine, EngineState,
-    FULL_FRAME_TILE, HostMsg, InputMsg, MAX_TILES, PROTOCOL_VERSION, SunshineInfo, TileRect, VideoFrame,
+    Arrangement, ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, DisplayChoice, DisplayReason, DisplayState, FULL_FRAME_TILE,
+    HostMsg, InputMsg, MAX_TILES, PROTOCOL_VERSION, TileRect, VideoFrame,
 };
 use quinn::{Connection, ConnectionError, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -25,7 +25,6 @@ use serde::Serialize;
 use transport::video::{Reassembler, tile_of};
 
 use crate::Trust;
-use crate::moonlight::{self, MoonlightOptions};
 use crate::stats::{FrameTiming, Stats, StatsView};
 use crate::view::{TileImage, ViewHandle, ViewSlot};
 
@@ -142,13 +141,6 @@ pub enum SessionEvent {
     StreamError { message: String, width: u32, height: u32 },
     /// What this Mac knows about a paired host changed (how to reach it over the internet).
     TrustChanged,
-    /// The engine streaming the picture now (answering `request`, or 0 when the host changed
-    /// it): LanKVM's, or the host's Sunshine (`sunshine` says where Moonlight connects).
-    /// `message` says why it isn't the one asked for, or what happened.
-    Engine { request: u32, engine: Engine, sunshine: Option<SunshineInfo>, message: String },
-    /// What Moonlight does for the Sunshine engine: "pairing", "starting", "streaming", "ended"
-    /// or "failed" (see `moonlight`), with its process and log file.
-    Moonlight { state: &'static str, message: String, pid: Option<u32>, log: Option<String> },
 }
 
 /// Input written per batch at most; anything more waits for the next write.
@@ -178,25 +170,6 @@ pub struct Shared {
     pending_display: Mutex<Option<PendingDisplay>>,
     /// The host's latest [`HostMsg::VideoIdle`], for the video task.
     video_idle: Mutex<Option<(u32, u64)>>,
-    /// Id of our latest engine request (they count apart from the others).
-    latest_engine_request: Mutex<u32>,
-    /// The host's Sunshine while it streams this session (the host's word); None: LanKVM's own
-    /// stream.
-    sunshine: Mutex<Option<SunshineInfo>>,
-    /// The same, for the video task: no LanKVM video comes meanwhile, and none is asked for.
-    sunshine_streams: AtomicBool,
-    /// Moonlight for the Sunshine engine.
-    moonlight: Mutex<MoonlightSlot>,
-}
-
-/// Moonlight for a session's Sunshine engine: how to run it, and its runner while it lives.
-#[derive(Default)]
-struct MoonlightSlot {
-    /// None: don't run Moonlight (the probe watching Sunshine start without it).
-    options: Option<MoonlightOptions>,
-    /// What the runner needs from the connection, once connected.
-    env: Option<moonlight::Env>,
-    runner: Option<moonlight::Runner>,
 }
 
 /// A `Display` event to send once a frame of `size` is decoded.
@@ -233,8 +206,6 @@ pub struct Session {
     input_tx: mpsc::UnboundedSender<(InputMsg, u64)>,
     task: tokio::task::JoinHandle<()>,
     view: Mutex<Option<ViewHandle>>,
-    events: SessionEvents,
-    rt: tokio::runtime::Handle,
 }
 
 impl Session {
@@ -253,13 +224,13 @@ impl Session {
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let task = rt.spawn({
-            let (shared, conn, ctl_tx, events) = (shared.clone(), conn.clone(), ctl_tx.clone(), events.clone());
+            let (shared, conn, ctl_tx) = (shared.clone(), conn.clone(), ctl_tx.clone());
             async move {
                 let ctx = RunCtx {
                     trust,
                     max_size,
                     max_fps,
-                    shared: shared.clone(),
+                    shared,
                     conn_slot: conn,
                     events: events.clone(),
                     pin_rx,
@@ -267,9 +238,6 @@ impl Session {
                     input_rx,
                 };
                 let result = run(network, &target, ctx).await;
-                // Moonlight goes with the session (dropping its runner stops it).
-                let runner = shared.moonlight.lock().unwrap().runner.take();
-                drop(runner);
                 let error = result.err().map(|e| format!("{e:#}"));
                 if let Some(e) = &error {
                     tracing::info!("session ended: {e}");
@@ -291,7 +259,7 @@ impl Session {
                 }
             });
         }
-        Self { shared, conn, pin_tx, ctl_tx, input_tx, task, view: Mutex::new(None), events, rt: rt.clone() }
+        Self { shared, conn, pin_tx, ctl_tx, input_tx, task, view: Mutex::new(None) }
     }
 
     /// Asks the host for control (true) or to only view it (false); `take_over` takes control
@@ -319,38 +287,6 @@ impl Session {
         *latest = request;
         let _ = self.ctl_tx.send(ClientMsg::SetDisplay { request, display });
         request
-    }
-
-    /// Asks the host to stream with `engine`. For the host's Sunshine, `moonlight` says how to
-    /// run Moonlight on it (None: not at all, only the engine). The answer arrives as a
-    /// [`SessionEvent::Engine`] for the returned request id.
-    pub fn set_engine(&self, engine: Engine, moonlight: Option<MoonlightOptions>) -> u32 {
-        let request = {
-            let mut latest = self.shared.latest_engine_request.lock().unwrap();
-            *latest = latest.wrapping_add(1).max(1);
-            *latest
-        };
-        if engine == Engine::Sunshine {
-            if moonlight.is_some() && moonlight::binary().is_none() {
-                // Nothing could show Sunshine's stream here: the host keeps streaming as it does.
-                let sunshine = self.shared.sunshine.lock().unwrap().clone();
-                let engine = if sunshine.is_some() { Engine::Sunshine } else { Engine::LanKvm };
-                let events = self.events.clone();
-                self.rt.spawn(async move { events(SessionEvent::Engine { request, engine, sunshine, message: moonlight::not_installed() }) });
-                return request;
-            }
-            self.shared.moonlight.lock().unwrap().options = moonlight;
-        }
-        let _ = self.ctl_tx.send(ClientMsg::SetEngine { request, engine });
-        request
-    }
-
-    /// Opens Moonlight again on the host's Sunshine, after it ended (the session still streams
-    /// with Sunshine).
-    pub fn open_moonlight(&self) {
-        if let Some(runner) = &self.shared.moonlight.lock().unwrap().runner {
-            runner.send(moonlight::Cmd::Open);
-        }
     }
 
     /// While controlling: whether this window has the focus and forwards input.
@@ -404,10 +340,6 @@ impl Session {
         if let Some(conn) = self.conn.lock().unwrap().as_ref() {
             conn.close(0u32.into(), b"viewer closed");
         }
-        // The host ends Sunshine's stream once the connection is gone, and Moonlight quits (or
-        // its runner kills it).
-        let runner = self.shared.moonlight.lock().unwrap().runner.take();
-        drop(runner);
         self.task.abort();
         self.detach_view();
     }
@@ -544,9 +476,6 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     };
     let RunCtx { trust, shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, .. } = ctx;
     tracing::info!(?info, "connected");
-    // Moonlight, should the session stream with the host's Sunshine, connects to the same address.
-    shared.moonlight.lock().unwrap().env =
-        Some(moonlight::Env { ip: addr.ip(), lan: !internet, host_name: info.host_name.clone(), ctl: ctl_tx.clone(), events: events.clone() });
     // Where it was reached, to try first next time (and show under Paired Devices).
     let remembered = internet && trust.internet_hosts.lock().unwrap().remember_used(&host_fp, target);
     *shared.info.lock().unwrap() = Some(info.clone());
@@ -715,13 +644,6 @@ fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents, host: 
         HostMsg::InputAck { seq, received_us, injected_us } => shared.stats.lock().unwrap().on_input_ack(seq, received_us, injected_us),
         HostMsg::Display(state) => on_display(state, shared, events),
         HostMsg::VideoIdle { update, mask } => *shared.video_idle.lock().unwrap() = Some((update, mask)),
-        HostMsg::Engine(state) => on_engine(state, shared, events),
-        HostMsg::SunshinePaired { ok, message } => {
-            tracing::info!(ok, message, "Sunshine pairing");
-            if let Some(runner) = &shared.moonlight.lock().unwrap().runner {
-                runner.send(moonlight::Cmd::Paired { ok, message });
-            }
-        }
         HostMsg::InternetAccess { key, addresses } => {
             let Ok(key) = AccessKey::try_from(key.as_slice()) else {
                 tracing::warn!(len = key.len(), "ignoring an internet access key of the wrong size");
@@ -767,31 +689,6 @@ fn on_display(state: DisplayState, shared: &Shared, events: &SessionEvents) {
         *pending = Some(PendingDisplay { event, size: (width, height), since: Instant::now() });
     } else {
         emit_display(event, events);
-    }
-}
-
-/// The host says which engine streams now. That is the truth however old the request it answers
-/// (like `Display`): Moonlight follows it (starts, starts again for a new generation, or stops).
-fn on_engine(state: EngineState, shared: &Shared, events: &SessionEvents) {
-    let EngineState { request, engine, sunshine, message } = state;
-    let sunshine = sunshine.filter(|_| engine == Engine::Sunshine);
-    let engine = if sunshine.is_some() { Engine::Sunshine } else { Engine::LanKvm };
-    tracing::info!(request, ?engine, ?sunshine, message, "engine");
-    shared.sunshine_streams.store(sunshine.is_some(), Ordering::Release);
-    *shared.sunshine.lock().unwrap() = sunshine.clone();
-    events(SessionEvent::Engine { request, engine, sunshine: sunshine.clone(), message });
-    let mut slot = shared.moonlight.lock().unwrap();
-    match sunshine {
-        Some(info) => match &slot.runner {
-            Some(runner) => runner.send(moonlight::Cmd::Info(info)),
-            None => {
-                if let (Some(options), Some(env)) = (slot.options.clone(), slot.env.clone()) {
-                    slot.runner = Some(moonlight::start(env, info, options));
-                }
-            }
-        },
-        // Dropping the runner stops it: Moonlight quits once the host ended the stream.
-        None => drop(slot.runner.take()),
     }
 }
 
@@ -1380,12 +1277,6 @@ fn request_keyframes(
 }
 
 fn send_keyframe_request(shared: &Shared, ctl: &mpsc::UnboundedSender<ClientMsg>, msg: ClientMsg) {
-    // While the host's Sunshine streams, LanKVM's video stops: nothing is missing, and the host
-    // has no stream to make keyframes with. (The first frames of LanKVM's stream when it comes
-    // back are keyframes anyway.)
-    if matches!(msg, ClientMsg::RequestKeyframe | ClientMsg::RequestKeyframes { .. }) && shared.sunshine_streams.load(Ordering::Acquire) {
-        return;
-    }
     shared.stats.lock().unwrap().keyframe_requests += 1;
     tracing::debug!(?msg, "keyframe request");
     let _ = ctl.send(msg);
