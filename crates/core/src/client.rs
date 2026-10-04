@@ -395,22 +395,32 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     let name = paired.and_then(|host| host_name(&ctx.trust, &host));
     let (conn, addr, internet, _relay) = match paired {
         Some(host) => {
-            let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host).await?;
+            let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, None).await?;
             let addr = conn.remote_address();
             (conn, addr, internet, relay)
         }
         None => {
             let addr = resolve(target).await?;
             let internet = network.gate.is_internet(addr);
-            let conn = if internet {
-                connect_over_internet(&network, target, addr, &ctx.trust).await?
+            // A paired host known to be at that address (its public IP, say) is reached as
+            // Paired Devices does: there, and through its LanKVM server, so its router needn't
+            // forward a port.
+            let known = internet.then(|| ctx.trust.internet_hosts.lock().unwrap().known_at(target, addr, &ctx.trust.hosts.lock().unwrap())).flatten();
+            if let Some(host) = known {
+                let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, Some(target)).await?;
+                let addr = conn.remote_address();
+                (conn, addr, internet, relay)
             } else {
-                tokio::time::timeout(CONNECT_TIMEOUT, network.endpoint.connect(addr, "lankvm")?)
-                    .await
-                    .map_err(|_| anyhow!("no answer from {addr} — is LanKVM running there?"))?
-                    .context("connect")?
-            };
-            (conn, addr, internet, None)
+                let conn = if internet {
+                    connect_over_internet(&network, target, addr, &ctx.trust).await?
+                } else {
+                    tokio::time::timeout(CONNECT_TIMEOUT, network.endpoint.connect(addr, "lankvm")?)
+                        .await
+                        .map_err(|_| anyhow!("no answer from {addr} — is LanKVM running there?"))?
+                        .context("connect")?
+                };
+                (conn, addr, internet, None)
+            }
         }
     };
     // At the start of a sentence, and within one.
@@ -649,7 +659,8 @@ struct Reached {
 /// Connects to paired host `host` over the internet, as Paired Devices does: at every address it
 /// announced or was reached at, and through its LanKVM server, all at once. The first to reach
 /// that host wins, and the others are given up (a relay session one of them started ends).
-async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trust: &Trust, host: Fingerprint) -> Result<Reached> {
+/// `typed`: an address the user typed for it, tried too.
+async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trust: &Trust, host: Fingerprint, typed: Option<&str>) -> Result<Reached> {
     if !trust.hosts.lock().unwrap().contains(&host) {
         bail!("This Mac isn't paired with that Mac any more. Connect to it on the same network and enter its code to pair again.");
     }
@@ -665,9 +676,15 @@ async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trus
         );
     };
     let key = way.key;
+    let mut addresses = way.addresses;
+    if let Some(typed) = typed
+        && !addresses.iter().any(|a| crate::internet::same_address(a, typed))
+    {
+        addresses.insert(0, typed.trim().to_string());
+    }
     let mut attempts = tokio::task::JoinSet::new();
     if !rendezvous.force_relay() {
-        for address in way.addresses {
+        for address in addresses {
             let (network, within) = (network.clone(), within.clone());
             attempts.spawn(async move { (false, connect_at(&network, &within, &address, key).await) });
         }

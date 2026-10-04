@@ -271,18 +271,27 @@ impl HostInternet {
     }
 
     /// Where paired Macs are told to reach this one over the internet; empty while internet
-    /// access is off.
+    /// access is off. Includes the address the LanKVM server sees: the router doesn't forward it
+    /// by itself, but a viewer that knows it takes the public IP typed for it as this Mac's and
+    /// connects through the server.
     pub(crate) fn announced_addresses(&self) -> Vec<String> {
         if !self.enabled() {
             return Vec::new();
         }
-        announced(&self.public_address.lock().unwrap(), self.map_state(), self.port)
+        let mut addresses = announced(&self.public_address.lock().unwrap(), self.map_state(), self.port);
+        if let Some(observed) = self.rendezvous.host_observed().map(|o| o.to_string())
+            && !addresses.iter().any(|a| same_address(a, &observed))
+        {
+            addresses.push(observed);
+        }
+        addresses
     }
 
     pub(crate) fn view(&self) -> InternetView {
         let public_address = self.public_address.lock().unwrap().clone();
         let mut view = build_view(self.enabled(), self.map_state(), self.port, public_address, lan_address(), self.gate.stats().ignored);
         view.server = self.rendezvous.host_view();
+        view.announced = self.announced_addresses();
         view
     }
 }
@@ -424,7 +433,7 @@ fn normalized(address: &str) -> String {
     with_port(address, DEFAULT_PORT).to_ascii_lowercase()
 }
 
-fn same_address(a: &str, b: &str) -> bool {
+pub(crate) fn same_address(a: &str, b: &str) -> bool {
     normalized(a) == normalized(b)
 }
 
@@ -635,6 +644,37 @@ impl InternetHosts {
             .collect();
         matches.sort_by_key(|(rank, ..)| *rank);
         matches.into_iter().map(|(_, fp, key)| (fp, key)).collect()
+    }
+
+    /// The paired host known to be at `target` (as typed, resolved to `resolved`): one this Mac
+    /// reached there, or that announced it, or with an address that resolves the same. A typed
+    /// IP without a port also matches a host at that IP on any port (its router may keep another
+    /// port open than the one typed). Such a host is reached as Paired Devices does, through its
+    /// LanKVM server as well, so its public IP works without the router forwarding a port.
+    pub(crate) fn known_at(&self, target: &str, resolved: SocketAddr, trusted: &TrustStore) -> Option<Fingerprint> {
+        let typed = normalized(target);
+        let ip_only = target.trim().parse::<IpAddr>().is_ok();
+        let resolves = |a: &String| with_port(a, DEFAULT_PORT).parse::<SocketAddr>().ok();
+        let rank = |host: &InternetHost| {
+            let mut known = host.used.iter().chain(&host.announced);
+            if host.used.iter().any(|a| normalized(a) == typed) {
+                Some(0)
+            } else if host.announced.iter().any(|a| normalized(a) == typed) {
+                Some(1)
+            } else if known.clone().any(|a| resolves(a) == Some(resolved)) {
+                Some(2)
+            } else if ip_only && known.any(|a| resolves(a).is_some_and(|addr| addr.ip() == resolved.ip())) {
+                Some(3)
+            } else {
+                None
+            }
+        };
+        self.hosts
+            .iter()
+            .filter(|(fp, _)| trusted.contains(fp))
+            .filter_map(|(fp, host)| Some((rank(host)?, *fp)))
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, fp)| fp)
     }
 
     /// Whether any paired host gave this Mac a key.
@@ -871,6 +911,28 @@ mod tests {
         let none = trusted(&TempDir::new("candidates-none").0, &[]);
         assert!(hosts.candidates("203.0.113.7", resolved, &none).is_empty());
         assert!(!hosts.any_key(&none));
+    }
+
+    #[test]
+    fn a_typed_public_ip_names_the_host_announced_there() {
+        let dir = TempDir::new("known-at");
+        let mut hosts = InternetHosts::load(&dir.0.join("internet-hosts.json"));
+        // Host 1's router keeps port 51000 open for it (as its LanKVM server saw); host 2 is
+        // elsewhere; host 3 never said where it is.
+        hosts.set_announced(fp(1), key(1), vec!["203.0.113.7:51000".into()], None);
+        hosts.set_announced(fp(2), key(2), vec!["198.51.100.1:47800".into()], None);
+        hosts.set_announced(fp(3), key(3), Vec::new(), None);
+        let all = trusted(&dir.0, &[1, 2, 3]);
+
+        assert_eq!(hosts.known_at("203.0.113.7:51000", addr("203.0.113.7:51000"), &all), Some(fp(1)));
+        // The bare IP gets the default port, which the router doesn't keep open: still host 1.
+        assert_eq!(hosts.known_at("203.0.113.7", addr("203.0.113.7:47800"), &all), Some(fp(1)));
+        // Another port typed explicitly is another place.
+        assert_eq!(hosts.known_at("203.0.113.7:6000", addr("203.0.113.7:6000"), &all), None);
+        assert_eq!(hosts.known_at("192.0.2.1", addr("192.0.2.1:47800"), &all), None, "nobody announced it");
+        assert_eq!(hosts.known_at("198.51.100.1", addr("198.51.100.1:47800"), &all), Some(fp(2)));
+        let not_two = trusted(&TempDir::new("known-at-some").0, &[1, 3]);
+        assert_eq!(hosts.known_at("198.51.100.1", addr("198.51.100.1:47800"), &not_two), None, "no longer paired");
     }
 
     #[test]

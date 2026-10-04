@@ -315,6 +315,13 @@ impl Rendezvous {
         }
     }
 
+    /// This Mac's address as its LanKVM server sees it (its router's public address and the port
+    /// the router keeps open for it), while registered.
+    pub(crate) fn host_observed(&self) -> Option<SocketAddr> {
+        let host = self.host.lock().unwrap();
+        host.observed.filter(|_| host.enabled && !host.server.is_empty() && host.state == State::Registered)
+    }
+
     /// The server viewers are told to ask for this host at, and the ID to ask for: empty while
     /// the host doesn't register (internet access or the server off).
     pub(crate) fn announced(&self) -> (String, Vec<u8>) {

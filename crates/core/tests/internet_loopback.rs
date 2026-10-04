@@ -274,7 +274,8 @@ fn forgetting_a_viewer_revokes_its_internet_access() {
     s.host.core.forget_device("viewer", &s.viewer_fp);
     s.viewer.ended(id);
     let error = s.viewer.connect(&target, NO_ANSWER_WAIT).expect_err("no answer once forgotten");
-    assert!(error.starts_with(&format!("No answer from {target}.")), "{error}");
+    // The address is the host's, known from before, so the message names it.
+    assert!(error.starts_with(&format!("No answer from host at {target}.")), "{error}");
 }
 
 #[test]
