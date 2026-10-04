@@ -535,6 +535,7 @@ struct SessionControl: View {
     @AppStorage(SessionControlModel.pinnedKey) private var pinned = false
     @AppStorage(SystemShortcuts.defaultsKey) private var sendSystemShortcuts = true
     @AppStorage(TrackpadGestures.defaultsKey) private var sendTrackpadGestures = true
+    @AppStorage(SharedClipboard.defaultsKey) private var shareClipboard = true
     @AppStorage("showStats") private var showStats = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -796,6 +797,7 @@ struct SessionControl: View {
         Divider()
         Toggle("Send System Shortcuts to Remote Mac", isOn: $sendSystemShortcuts)
         Toggle("Send Trackpad Gestures to Remote Mac", isOn: $sendTrackpadGestures)
+        Toggle("Share Clipboard", isOn: $shareClipboard)
         Divider()
         if session.mode == .control {
             Button("View Only", action: model.viewOnly)

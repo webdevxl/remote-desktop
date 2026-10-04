@@ -54,6 +54,7 @@ private struct ControlCommands: Commands {
     @FocusedObject private var controls: SessionControlModel?
     @AppStorage(SystemShortcuts.defaultsKey) private var sendSystemShortcuts = true
     @AppStorage(TrackpadGestures.defaultsKey) private var sendTrackpadGestures = true
+    @AppStorage(SharedClipboard.defaultsKey) private var shareClipboard = true
     @AppStorage(SessionControlModel.visibleKey) private var showSessionControl = true
 
     var body: some Commands {
@@ -89,6 +90,8 @@ private struct ControlCommands: Commands {
             Text("⌘Tab, ⌘Space, Mission Control and screenshot keys go to the Mac you control.")
             Toggle("Send Trackpad Gestures to Remote Mac", isOn: $sendTrackpadGestures)
             Text("Pinch, rotate and swipes go to the Mac you control. Mission Control and Spaces swipes need Accessibility for LanKVM here.")
+            Toggle("Share Clipboard", isOn: $shareClipboard)
+            Text("While you control a Mac, what you copy on either one can be pasted on the other.")
             Divider()
             Toggle("Show Session Control", isOn: $showSessionControl)
         }

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lankvm_core::control::Backend;
-use lankvm_core::{Core, CoreOptions, Event};
+use lankvm_core::{ClipboardBackend, Core, CoreOptions, Event};
 use platform_mac::inject::Bounds;
 use protocol::{
     Arrangement, DisplayChoice, DisplayReason, DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction,
@@ -44,6 +44,8 @@ impl Peer {
             // Never the real LanKVM server.
             rendezvous: Some(String::new()),
             force_relay: false,
+            // Never the user's clipboard.
+            clipboard: ClipboardBackend::Off,
         };
         let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
         Self { core, events, pending: RefCell::new(Vec::new()) }
@@ -478,6 +480,8 @@ fn same_mac_control_is_refused_without_the_override() {
         // Never the real LanKVM server.
         rendezvous: Some(String::new()),
         force_relay: false,
+        // Never the user's clipboard.
+        clipboard: ClipboardBackend::Off,
     };
     let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
     let host = Peer { core, events, pending: RefCell::new(Vec::new()) };
@@ -502,6 +506,8 @@ fn start_host(dir: &Path, backend: Backend, ttl: Option<Duration>) -> Peer {
         // Never the real LanKVM server.
         rendezvous: Some(String::new()),
         force_relay: false,
+        // Never the user's clipboard.
+        clipboard: ClipboardBackend::Off,
     };
     let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
     Peer { core, events, pending: RefCell::new(Vec::new()) }
@@ -631,6 +637,7 @@ fn raw_input(s: &Setup, input: Vec<u8>) -> (bool, protocol::ControlState) {
             }
         }
         let mut stream = conn.open_uni().await.unwrap();
+        stream.write_all(&[protocol::STREAM_INPUT]).await.unwrap();
         stream.write_all(&input).await.unwrap();
         let ended = loop {
             match transport::framing::read_msg::<protocol::HostMsg>(&mut recv).await.unwrap().unwrap() {

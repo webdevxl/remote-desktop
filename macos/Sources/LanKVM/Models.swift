@@ -457,6 +457,7 @@ struct SessionStats: Decodable, Equatable {
 struct CoreEvent: Decodable {
     enum Kind: String, Decodable {
         case hostChanged, trustChanged, pinNeeded, connected, ended, control, cursorShape, cursor, display, streamError
+        case clipboardTooLarge
     }
     var type: Kind
     var session: UInt64?
@@ -481,6 +482,9 @@ struct CoreEvent: Decodable {
     var hotX: Double?
     var hotY: Double?
     var state: String?
+    /// clipboardTooLarge: the clipboard's size, and whether it was this Mac's (else the host's).
+    var bytes: Int64?
+    var sent: Bool?
 }
 
 /// Why the host didn't grant control or took it back (`ControlReason` in crates/protocol).

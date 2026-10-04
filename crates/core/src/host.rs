@@ -17,7 +17,8 @@ use platform_mac::tiler::{TileCopy, Tiler, tiles_touched};
 use platform_mac::{CVPixelBuffer, clock, permissions, system, virtual_display};
 use protocol::{
     Arrangement, ClientMsg, Codec, ControlReason, ControlState, CursorState, DisplayChoice, DisplayReason, DisplayState, HostMsg,
-    FULL_FRAME_TILE, MAX_TILES, PROTOCOL_VERSION, TILE_MAX_WIDTH, TileRect, VideoFrame, VirtualDisplaySpec, tile_layout,
+    FULL_FRAME_TILE, MAX_TILES, PROTOCOL_VERSION, STREAM_CLIPBOARD, STREAM_INPUT, TILE_MAX_WIDTH, TileRect, VideoFrame,
+    VirtualDisplaySpec, tile_layout,
 };
 use quinn::{Connection, ConnectionError, Incoming, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -29,6 +30,7 @@ use transport::pairing::{generate_pin, host_respond};
 use serde::Serialize;
 use transport::video::Packetizer;
 
+use crate::clipboard::{Clipboard, Note, SessionClipboard, stream_kind};
 use crate::control::{Backend, HostSettings, InputCmdSender, InputConfig, InputFailure, InputShared, InputThread, RateLimit};
 use crate::displays::{Acquired, DisplayNotice, Displays, VirtualDisplayView};
 use crate::internet::{HostInternet, InternetView};
@@ -167,6 +169,8 @@ pub struct HostCtx {
     /// Handshakes in progress by whether they came from the internet, and address (see
     /// [`MAX_HANDSHAKES`]).
     pub(crate) handshakes: Mutex<HashMap<(bool, IpAddr), usize>>,
+    /// This Mac's clipboard, shared with the viewer controlling it if that viewer wants to.
+    pub(crate) clipboard: Option<Arc<Clipboard>>,
 }
 
 /// Host status as the UI sees it.
@@ -608,14 +612,25 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         }
     }));
     // The viewer opens its input stream with its first input, and a new one if the host gave up
-    // on the old one.
+    // on the old one, and a stream for each clipboard transfer. Each says what it is first: on a
+    // task of its own, so one that doesn't say holds up nothing.
     let _acceptor = AbortOnDrop(tokio::spawn({
         let (evt_tx, conn) = (evt_tx.clone(), conn.clone());
         async move {
-            while let Ok(recv) = conn.accept_uni().await {
-                if evt_tx.send(SessionEvt::InputStream(recv)).is_err() {
-                    break;
-                }
+            while let Ok(mut recv) = conn.accept_uni().await {
+                let evt_tx = evt_tx.clone();
+                tokio::spawn(async move {
+                    let evt = match stream_kind(&mut recv).await {
+                        Some(STREAM_INPUT) => SessionEvt::InputStream(recv),
+                        Some(STREAM_CLIPBOARD) => SessionEvt::ClipboardStream(recv),
+                        kind => {
+                            tracing::debug!(?kind, "ignored a stream from the viewer");
+                            let _ = recv.stop(0u32.into());
+                            return;
+                        }
+                    };
+                    let _ = evt_tx.send(evt);
+                });
             }
         }
     }));
@@ -666,6 +681,15 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         events: evt_tx,
         ttl: None,
     };
+    // The clipboard is shared while the viewer controls this Mac and wants to share it.
+    let mut clipboard = ctx.clipboard.as_ref().map(|hub| {
+        let viewer = control.viewer_name.clone();
+        SessionClipboard::new(hub, conn.clone(), internet, same_mac, move |note| match note {
+            Note::TooLargeToSend(bytes) => tracing::info!(%viewer, bytes, "this Mac's clipboard is too large to share with the viewer"),
+            Note::TooLargeToReceive(bytes) => tracing::info!(%viewer, bytes, "the viewer's clipboard is too large to share"),
+        })
+    });
+    let mut viewer_shares_clipboard = false;
     let mut screen = Screen::new(streamer, showing, out.clone(), client_fp, same_mac, watching);
     screen.seq_seen = adopted_seq;
     // What it shows, and whether it may ask for a virtual display.
@@ -693,6 +717,9 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
             evt = client_rx.recv() => evt,
             _ = permission_check.tick() => {
                 control.check_permission();
+                if let Some(clipboard) = &mut clipboard {
+                    clipboard.set(viewer_shares_clipboard && control.active());
+                }
                 // QUIC follows a viewer to a new network. A session from the local network
                 // doesn't follow it onto the internet: that takes a knock (and internet access
                 // on), and its settings are the local network's.
@@ -709,7 +736,9 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
             }
         };
         let Some(evt) = evt else { break };
-        if let SessionEvt::Client(ClientMsg::SetControl { .. } | ClientMsg::Focus { .. } | ClientMsg::SetDisplay { .. }) = evt
+        if let SessionEvt::Client(
+            ClientMsg::SetControl { .. } | ClientMsg::Focus { .. } | ClientMsg::SetDisplay { .. } | ClientMsg::ShareClipboard { .. },
+        ) = evt
             && !requests.allow(Instant::now(), MAX_CONTROL_REQUESTS_PER_SEC)
         {
             bail!("more than {MAX_CONTROL_REQUESTS_PER_SEC} control requests a second");
@@ -735,12 +764,26 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
                 let _ = out.try_send(HostMsg::Pong { client_time_us, host_time_us: now });
             }
             SessionEvt::Client(ClientMsg::SetControl { on, request, take_over }) => control.set(on, take_over, request),
-            SessionEvt::Client(ClientMsg::Focus { forwarding }) => control.focus(forwarding),
+            SessionEvt::Client(ClientMsg::Focus { forwarding }) => {
+                control.focus(forwarding);
+                // The viewer's user turned to their own Mac, maybe to paste what they just copied
+                // here: look now rather than at the next poll.
+                if !forwarding && let Some(clipboard) = &clipboard {
+                    clipboard.check();
+                }
+            }
+            SessionEvt::Client(ClientMsg::ShareClipboard { on }) => viewer_shares_clipboard = on,
             SessionEvt::Client(ClientMsg::SetDisplay { request, display }) => screen.request(request, display),
             SessionEvt::Client(other) => bail!("unexpected message {other:?}"),
             SessionEvt::Closed(None) => break,
             SessionEvt::Closed(Some(e)) => return Err(e),
             SessionEvt::InputStream(recv) => control.attach_input(recv),
+            // Dropped (refused) without a clipboard to share.
+            SessionEvt::ClipboardStream(recv) => {
+                if let Some(clipboard) = &clipboard {
+                    clipboard.incoming(recv);
+                }
+            }
             SessionEvt::Revoke(reason, message) => control.revoke(reason, message),
             SessionEvt::Cursor(update) => control.cursor(update),
             SessionEvt::Display(notice) => screen.notice(notice),
@@ -752,6 +795,10 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
             }
             SessionEvt::Availability => screen.availability_changed(),
             SessionEvt::CaptureStopped(generation) => screen.capture_stopped(generation),
+        }
+        // Control may have started or ended, or the viewer changed its mind.
+        if let Some(clipboard) = &mut clipboard {
+            clipboard.set(viewer_shares_clipboard && control.active());
         }
     }
     Ok(())
@@ -880,6 +927,8 @@ pub(crate) enum SessionEvt {
     /// The control stream ended, cleanly or not.
     Closed(Option<anyhow::Error>),
     InputStream(RecvStream),
+    /// A clipboard transfer from the viewer (see [`SessionClipboard`]).
+    ClipboardStream(RecvStream),
     /// Control ends on the host's side (its user, a policy change, bad input...), with the
     /// message to show on the viewer.
     Revoke(ControlReason, String),

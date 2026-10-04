@@ -253,6 +253,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A test tool leaves the clipboard of the Mac it runs on alone.
+    core.set_share_clipboard(false);
     let id = core.connect(&args.target, args.max, args.fps);
     let source = match &args.barcode {
         Some(Barcode::Log(path)) => Some(SourceLog::new(path)),

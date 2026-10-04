@@ -12,10 +12,10 @@ use platform_mac::decoder::{DecodedFrame, Decoder};
 use platform_mac::{CVPixelBuffer, clock, system};
 use protocol::{
     Arrangement, ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, DisplayChoice, DisplayReason, DisplayState, FULL_FRAME_TILE,
-    HostMsg, InputMsg, MAX_TILES, PROTOCOL_VERSION, TileRect, VideoFrame,
+    HostMsg, InputMsg, MAX_TILES, PROTOCOL_VERSION, STREAM_INPUT, TileRect, VideoFrame,
 };
 use quinn::{Connection, ConnectionError, RecvStream, SendStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use transport::endpoint::{Network, peer_fingerprint};
 use transport::framing::{read_msg, write_msg};
 use transport::gate::DirectPath;
@@ -27,6 +27,7 @@ use serde::Serialize;
 use transport::video::{Reassembler, tile_of};
 
 use crate::Trust;
+use crate::clipboard::{Clipboard, Note, SessionClipboard};
 use crate::rendezvous::{Elsewhere, RelaySession, Rendezvous};
 use crate::stats::{FrameTiming, Stats, StatsView};
 use crate::view::{TileImage, ViewHandle, ViewSlot};
@@ -154,6 +155,9 @@ pub enum SessionEvent {
     StreamError { message: String, width: u32, height: u32 },
     /// What this Mac knows about a paired host changed (how to reach it over the internet).
     TrustChanged,
+    /// A clipboard of `bytes` was too big to share, so the other Mac's was emptied: this Mac's
+    /// (`sent`), or the host's (this Mac's was emptied).
+    ClipboardTooLarge { bytes: u64, sent: bool },
 }
 
 /// Input written per batch at most; anything more waits for the next write.
@@ -169,6 +173,8 @@ pub struct Shared {
     pub stats: Mutex<Stats>,
     /// Whether the host lets us control it right now. Input is dropped otherwise.
     controlling: AtomicBool,
+    /// The same, for the clipboard (shared while controlling).
+    controlling_changed: watch::Sender<bool>,
     /// Id of our latest control request and whether it asked for control; answers to older
     /// ones are stale.
     latest_request: Mutex<(u32, bool)>,
@@ -219,6 +225,7 @@ pub struct Session {
     input_tx: mpsc::UnboundedSender<(InputMsg, u64)>,
     task: tokio::task::JoinHandle<()>,
     view: Mutex<Option<ViewHandle>>,
+    clipboard: Option<Arc<Clipboard>>,
 }
 
 impl Session {
@@ -230,6 +237,7 @@ impl Session {
         target: String,
         max_size: (u32, u32),
         max_fps: u32,
+        clipboard: Option<(Arc<Clipboard>, watch::Receiver<bool>)>,
         events: SessionEvents,
     ) -> Self {
         let shared = Arc::new(Shared::default());
@@ -237,6 +245,7 @@ impl Session {
         let (pin_tx, pin_rx) = mpsc::unbounded_channel();
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let hub = clipboard.as_ref().map(|(hub, _)| hub.clone());
         let task = rt.spawn({
             let (shared, conn, ctl_tx) = (shared.clone(), conn.clone(), ctl_tx.clone());
             async move {
@@ -251,6 +260,7 @@ impl Session {
                     pin_rx,
                     ctl: (ctl_tx, ctl_rx),
                     input_rx,
+                    clipboard,
                 };
                 let result = run(network, &target, ctx).await;
                 let error = result.err().map(|e| format!("{e:#}"));
@@ -274,7 +284,7 @@ impl Session {
                 }
             });
         }
-        Self { shared, conn, pin_tx, ctl_tx, input_tx, task, view: Mutex::new(None) }
+        Self { shared, conn, pin_tx, ctl_tx, input_tx, task, view: Mutex::new(None), clipboard: hub }
     }
 
     /// Asks the host for control (true) or to only view it (false); `take_over` takes control
@@ -288,7 +298,7 @@ impl Session {
             // Let go of everything first (the input stream is ordered before the request); the
             // host also releases on its side.
             self.send_input(InputMsg::ReleaseAll);
-            self.shared.controlling.store(false, Ordering::Release);
+            self.shared.set_controlling(false);
         }
         let _ = self.ctl_tx.send(ClientMsg::SetControl { on, request, take_over });
         request
@@ -307,6 +317,11 @@ impl Session {
     /// While controlling: whether this window has the focus and forwards input.
     pub fn set_focus(&self, forwarding: bool) {
         if self.shared.controlling.load(Ordering::Acquire) {
+            // The user may be about to paste on the host what they just copied here: it goes now
+            // rather than at the next poll.
+            if forwarding && let Some(clipboard) = &self.clipboard {
+                clipboard.check();
+            }
             let _ = self.ctl_tx.send(ClientMsg::Focus { forwarding });
         }
     }
@@ -391,6 +406,8 @@ struct RunCtx {
     pin_rx: mpsc::UnboundedReceiver<String>,
     ctl: (mpsc::UnboundedSender<ClientMsg>, mpsc::UnboundedReceiver<ClientMsg>),
     input_rx: mpsc::UnboundedReceiver<(InputMsg, u64)>,
+    /// This Mac's clipboard, and whether its user lets it be shared.
+    clipboard: Option<(Arc<Clipboard>, watch::Receiver<bool>)>,
 }
 
 async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
@@ -533,8 +550,9 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
         }
         other => Some(other),
     };
-    let RunCtx { trust, shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, .. } = ctx;
+    let RunCtx { trust, shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, clipboard, .. } = ctx;
     tracing::info!(?info, "connected");
+    let same_machine = info.same_machine;
     // Where it was reached, to try first next time (and show under Paired Devices). A paired
     // host connected to by name was reached at one of the addresses known already, or through
     // its server.
@@ -580,6 +598,11 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
             }
         }
     });
+    // The clipboard is shared while this Mac controls the host, if its user lets it.
+    let clipboard = clipboard.map(|(hub, share)| {
+        let controlling = shared.controlling_changed.subscribe();
+        tokio::spawn(share_clipboard(conn.clone(), hub, share, controlling, same_machine, internet, ctl_tx.clone(), events.clone()))
+    });
     let pinger = tokio::spawn({
         let ctl_tx = ctl_tx.clone();
         async move {
@@ -601,8 +624,54 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     reader.abort();
     writer.abort();
     input.abort();
-    shared.controlling.store(false, Ordering::Release);
+    if let Some(clipboard) = clipboard {
+        clipboard.abort();
+    }
+    shared.set_controlling(false);
     result
+}
+
+/// Shares the clipboard with the host while this Mac controls it and its user lets it (`share`),
+/// and takes the host's clipboard transfers.
+#[allow(clippy::too_many_arguments)]
+async fn share_clipboard(
+    conn: Connection,
+    hub: Arc<Clipboard>,
+    mut share: watch::Receiver<bool>,
+    mut controlling: watch::Receiver<bool>,
+    same_machine: bool,
+    internet: bool,
+    ctl: mpsc::UnboundedSender<ClientMsg>,
+    events: SessionEvents,
+) {
+    let mut clipboard = SessionClipboard::new(&hub, conn.clone(), internet, same_machine, move |note| {
+        let (bytes, sent) = match note {
+            Note::TooLargeToSend(bytes) => (bytes, true),
+            Note::TooLargeToReceive(bytes) => (bytes, false),
+        };
+        events(SessionEvent::ClipboardTooLarge { bytes, sent });
+    });
+    let mut told = None;
+    loop {
+        let wants = *share.borrow_and_update();
+        // The host shares its clipboard only once told.
+        if told != Some(wants) {
+            told = Some(wants);
+            if ctl.send(ClientMsg::ShareClipboard { on: wants }).is_err() {
+                return;
+            }
+        }
+        clipboard.set(wants && *controlling.borrow_and_update());
+        tokio::select! {
+            changed = share.changed() => if changed.is_err() { return },
+            changed = controlling.changed() => if changed.is_err() { return },
+            // Hosts open streams only for clipboard transfers.
+            stream = conn.accept_uni() => match stream {
+                Ok(recv) => clipboard.incoming_unread(recv),
+                Err(_) => return,
+            },
+        }
+    }
 }
 
 /// How often a session through a relay looks for a way straight to the host on this Mac's
@@ -1021,7 +1090,7 @@ fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents, host: 
                 tracing::warn!(?state, "ignoring control we didn't ask for");
                 return;
             }
-            shared.controlling.store(state.active, Ordering::Release);
+            shared.set_controlling(state.active);
             drop(latest);
             events(SessionEvent::Control(state));
         }
@@ -1096,6 +1165,11 @@ fn emit_display((request, info, reason, message): (u32, SessionInfo, u16, String
 }
 
 impl Shared {
+    fn set_controlling(&self, on: bool) {
+        self.controlling.store(on, Ordering::Release);
+        self.controlling_changed.send_replace(on);
+    }
+
     /// The session's connection now goes to the host `relayed` or not, at `address`: told to the
     /// app with the display change waiting for its first frame, if there is one (it carries the
     /// whole session info, which would undo it otherwise), or now.
@@ -1152,9 +1226,11 @@ async fn write_input(conn: &Connection, mut rx: mpsc::UnboundedReceiver<(InputMs
         // Once more on a new stream if the host stopped reading this one.
         for attempt in 0..2 {
             if send.is_none() {
-                let stream = conn.open_uni().await.context("open input stream")?;
-                // Ahead of any other stream we might add later (it doesn't outrank video datagrams).
+                let mut stream = conn.open_uni().await.context("open input stream")?;
+                // Ahead of the clipboard's streams (it doesn't outrank video datagrams).
                 let _ = stream.set_priority(100);
+                // Goes out with the first input written below.
+                stream.write_all(&[STREAM_INPUT]).await.context("write input")?;
                 send = Some(stream);
             }
             match send.as_mut().expect("opened above").write_all(&bytes).await {

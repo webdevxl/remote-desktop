@@ -122,6 +122,11 @@ final class CoreModel: ObservableObject {
             return
         }
         thisMac = decode(ThisMac.self, lk_this_mac())
+        // Share Clipboard (Control menu) applies to every session, and right away.
+        lk_set_share_clipboard(SharedClipboard.enabled)
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { _ in
+            lk_set_share_clipboard(SharedClipboard.enabled)
+        }
         refreshHost()
         refreshPaired()
         refreshRecents()
@@ -160,7 +165,7 @@ final class CoreModel: ObservableObject {
             }
         case .trustChanged:
             refreshPaired()
-        case .pinNeeded, .connected, .ended, .control, .cursorShape, .cursor, .display, .streamError:
+        case .pinNeeded, .connected, .ended, .control, .cursorShape, .cursor, .display, .streamError, .clipboardTooLarge:
             guard let id = event.session, let session = sessions[id] else { return }
             // Each kind of a session's event has its own case: a kind missing here must not end
             // the session.
@@ -228,6 +233,11 @@ final class CoreModel: ObservableObject {
                 guard case .connected = session.phase else { return }
                 session.streamError = event.message ?? "This Mac can't show the picture “\(session.hostName)” sends."
                 session.streamErrorSize = event.width.flatMap { w in event.height.map { (UInt32(w), UInt32($0)) } }
+            case .clipboardTooLarge:
+                let size = ByteCountFormatter.string(fromByteCount: event.bytes ?? 0, countStyle: .file)
+                session.showToast(event.sent == true
+                    ? "This Mac’s clipboard (\(size)) is too big to share with “\(session.hostName)”"
+                    : "The clipboard on “\(session.hostName)” (\(size)) is too big to share")
             case .hostChanged, .trustChanged:
                 break
             }
@@ -563,6 +573,16 @@ final class CoreModel: ObservableObject {
     private func decode<T: Decodable>(_ type: T.Type, _ ptr: UnsafeMutablePointer<CChar>?) -> T? {
         guard let text = takeString(ptr) else { return nil }
         return try? JSONDecoder().decode(type, from: Data(text.utf8))
+    }
+}
+
+/// User setting: whether this Mac shares its clipboard with the Macs it controls, so what is
+/// copied on either can be pasted on the other. The core applies it to every session.
+enum SharedClipboard {
+    static let defaultsKey = "shareClipboard"
+
+    static var enabled: Bool {
+        UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? true
     }
 }
 

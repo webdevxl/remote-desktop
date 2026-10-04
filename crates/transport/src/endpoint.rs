@@ -156,16 +156,16 @@ fn bind_socket(bind: SocketAddr) -> Result<std::net::UdpSocket> {
 }
 
 /// Hosts accept exactly one control stream and one input stream from each viewer (two input
-/// streams while a replaced one winds down) and never read datagrams. Tight limits keep a peer,
-/// paired or not, from making the host buffer data it never reads. Over the internet (`pace`) the
-/// video goes out at the pace the host sets.
+/// streams while a replaced one winds down), two clipboard transfers at a time, and never read
+/// datagrams. Tight limits keep a peer, paired or not, from making the host buffer data it never
+/// reads. Over the internet (`pace`) the video goes out at the pace the host sets.
 fn transport_config(pace: Option<&Pace>) -> Arc<TransportConfig> {
     let mut t = base_transport_config(pace.is_some());
     if let Some(pace) = pace {
         t.congestion_controller_factory(Arc::new(WanControllerFactory { pace: pace.clone() }));
     }
     t.max_concurrent_bidi_streams(1u32.into());
-    t.max_concurrent_uni_streams(2u32.into());
+    t.max_concurrent_uni_streams(4u32.into());
     t.receive_window((8u32 * 1024 * 1024).into());
     // Not None: quinn then refuses to send datagrams too, and video travels in them.
     t.datagram_receive_buffer_size(Some(64 * 1024));
@@ -182,9 +182,9 @@ fn client_transport_config(internet: bool) -> Arc<TransportConfig> {
         .max_ack_delay(Some(Duration::from_millis(1)))
         .reordering_threshold(1u32.into());
     t.ack_frequency_config(Some(ack));
-    // Hosts never open streams.
+    // Hosts open streams only for clipboard transfers, two at a time (one winding down).
     t.max_concurrent_bidi_streams(0u32.into());
-    t.max_concurrent_uni_streams(0u32.into());
+    t.max_concurrent_uni_streams(2u32.into());
     Arc::new(t)
 }
 

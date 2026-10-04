@@ -70,6 +70,9 @@ uint32_t lk_set_control(uint64_t session, bool on, bool take_over);
 // While controlling: whether the viewer window has the focus (the host shows its cursor in the
 // video while it doesn't).
 void lk_set_focus(uint64_t session, bool forwarding);
+// Whether this Mac shares its clipboard with the Macs it controls, for every session (on until
+// told otherwise). A `clipboardTooLarge` event says when one was too big to share.
+void lk_set_share_clipboard(bool on);
 void lk_input_mouse_move(uint64_t session, double x, double y);
 void lk_input_mouse_button(uint64_t session, uint8_t button, bool down, uint8_t clicks, double x, double y);
 

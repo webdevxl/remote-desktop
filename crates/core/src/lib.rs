@@ -3,6 +3,7 @@
 //! The SwiftUI app drives it through the C ABI in [`ffi`] and receives [`Event`]s as JSON.
 
 mod client;
+mod clipboard;
 pub mod control;
 mod displays;
 pub mod ffi;
@@ -33,8 +34,10 @@ use transport::pairing::TrustStore;
 use transport::rendezvous::{DEFAULT_SERVER, RendezvousIdentity};
 
 pub use crate::client::{FrameProbe, ProbeFrame};
+pub use crate::clipboard::ClipboardBackend;
 pub use crate::stats::FrameTiming;
 use crate::client::{Session, SessionEvent, SessionInfo};
+use crate::clipboard::Clipboard;
 use crate::internet::{HostInternet, InternetHosts};
 use crate::rendezvous::Rendezvous;
 
@@ -75,6 +78,9 @@ pub enum Event {
     /// The session's video of `width` × `height` pixels can't be shown (e.g. this Mac can't
     /// decode that size).
     StreamError { session: u64, message: String, width: u32, height: u32 },
+    /// A clipboard of `bytes` was too big to share with the session's host, so the other Mac's
+    /// clipboard was emptied: this Mac's (`sent`), or the host's (this Mac's was emptied).
+    ClipboardTooLarge { session: u64, bytes: u64, sent: bool },
 }
 
 /// Serializes bytes as standard base64 (what Swift's `JSONDecoder` expects for `Data`).
@@ -131,6 +137,11 @@ pub struct Core {
     recents: Mutex<Recents>,
     sessions: Mutex<HashMap<u64, Arc<Session>>>,
     next_session: AtomicU64,
+    /// This Mac's clipboard, shared with the Macs it controls and the one controlling it (None if
+    /// the core shares none).
+    clipboard: Option<Arc<Clipboard>>,
+    /// Whether this Mac shares its clipboard with the Macs it controls (the user's choice).
+    share_clipboard: tokio::sync::watch::Sender<bool>,
     _activity: Activity,
 }
 
@@ -171,6 +182,9 @@ pub struct CoreOptions {
     /// Tests: connecting to a paired Mac by fingerprint goes straight to its LanKVM server's
     /// relay, without trying its addresses or punching (`LANKVM_TEST_FORCE_RELAY=1`).
     pub force_relay: bool,
+    /// The clipboard shared with the Macs this one controls or is controlled by
+    /// (`LANKVM_CLIPBOARD`). Tests use pasteboards of their own, never the user's.
+    pub clipboard: ClipboardBackend,
 }
 
 impl CoreOptions {
@@ -193,6 +207,7 @@ impl CoreOptions {
             // LanKVM server unless told to.
             rendezvous: std::env::var("LANKVM_RENDEZVOUS").ok().or_else(|| testing_internet().then(String::new)),
             force_relay: std::env::var("LANKVM_TEST_FORCE_RELAY").is_ok_and(|v| v == "1"),
+            clipboard: ClipboardBackend::from_env(),
         }
     }
 }
@@ -216,6 +231,7 @@ impl Core {
             loopback_is_internet,
             rendezvous: rendezvous_override,
             force_relay,
+            clipboard,
         } = options;
         // Video decode runs synchronously on these (3-6 ms a frame); enough workers keep the
         // connection drivers and input writer from waiting behind it.
@@ -281,6 +297,10 @@ impl Core {
         if backend != control::Backend::Hid {
             tracing::warn!(?backend, "injected input is redirected (LANKVM_INJECT)");
         }
+        if clipboard != ClipboardBackend::System {
+            tracing::warn!(?clipboard, "the shared clipboard isn't this Mac's (LANKVM_CLIPBOARD)");
+        }
+        let clipboard = Clipboard::start(&clipboard);
         let host = Arc::new_cyclic(|weak| host::HostCtx {
             displays: displays::Displays::new(weak.clone(), identity.fingerprint, Box::new(displays::RealScreens::default())),
             console_active: std::sync::atomic::AtomicBool::new(true),
@@ -302,6 +322,7 @@ impl Core {
             pairing_throttle: Default::default(),
             pending: Default::default(),
             handshakes: Default::default(),
+            clipboard: clipboard.clone(),
         });
         if guard_pid.is_some() || control_ttl.is_some() {
             tracing::warn!(?guard_pid, ?control_ttl, "test limits on remote control");
@@ -335,6 +356,8 @@ impl Core {
             recents: Mutex::new(Recents::load(&dir.join("recent-hosts.txt"))),
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
+            clipboard,
+            share_clipboard: tokio::sync::watch::channel(true).0,
             _activity: activity,
         }))
     }
@@ -442,6 +465,7 @@ impl Core {
                 SessionEvent::Display { request, info, reason, message } => Event::Display { session: id, request, info, reason, message },
                 SessionEvent::StreamError { message, width, height } => Event::StreamError { session: id, message, width, height },
                 SessionEvent::TrustChanged => Event::TrustChanged,
+                SessionEvent::ClipboardTooLarge { bytes, sent } => Event::ClipboardTooLarge { session: id, bytes, sent },
             };
             (core.events)(event);
         });
@@ -453,6 +477,7 @@ impl Core {
             target,
             max_size,
             max_fps,
+            self.clipboard.clone().map(|clipboard| (clipboard, self.share_clipboard.subscribe())),
             on_event,
         );
         self.sessions.lock().unwrap().insert(id, Arc::new(session));
@@ -479,6 +504,14 @@ impl Core {
     /// [`Event::Display`] carries (0 if there's no such session).
     pub fn set_display(&self, id: u64, display: DisplayChoice) -> u32 {
         self.session(id).map_or(0, |s| s.set_display(display))
+    }
+
+    /// Whether this Mac shares its clipboard with the Macs it controls: what is copied on either
+    /// can be pasted on the other. Applies to every session at once (on by default).
+    pub fn set_share_clipboard(&self, on: bool) {
+        if self.share_clipboard.send_replace(on) != on {
+            tracing::info!(on, "share the clipboard with the Macs this one controls");
+        }
     }
 
     /// While controlling: whether the session's window has the focus.

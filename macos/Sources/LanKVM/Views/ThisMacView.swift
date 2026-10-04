@@ -294,7 +294,7 @@ private struct RemoteControlCard: View {
         if needsPermission {
             return "To use this Mac's mouse and keyboard from another Mac, macOS needs to allow LanKVM under Accessibility."
         }
-        return "Paired Macs can switch to Control and use this Mac's mouse and keyboard. To take it back at any time, press ⌃⌥⌘ and the period key here."
+        return "Paired Macs can switch to Control and use this Mac's mouse and keyboard, and its clipboard if they share theirs. To take it back at any time, press ⌃⌥⌘ and the period key here."
     }
 }
 

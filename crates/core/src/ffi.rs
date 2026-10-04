@@ -227,6 +227,15 @@ pub extern "C" fn lk_set_control(session: u64, on: bool, take_over: bool) -> u32
     core().map_or(0, |c| c.set_control(session, on, take_over))
 }
 
+/// Whether this Mac shares its clipboard with the Macs it controls (what is copied on either can
+/// be pasted on the other), for every session. On until told otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_set_share_clipboard(on: bool) {
+    if let Some(c) = core() {
+        c.set_share_clipboard(on);
+    }
+}
+
 /// While controlling: whether the viewer window has the focus and forwards input. The host puts
 /// its cursor back into the video while it doesn't.
 #[unsafe(no_mangle)]

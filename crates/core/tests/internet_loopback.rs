@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lankvm_core::control::Backend;
-use lankvm_core::{Core, CoreOptions, Event};
+use lankvm_core::{ClipboardBackend, Core, CoreOptions, Event};
 use protocol::InputMsg;
 use serde_json::{Value, json};
 use transport::identity::DeviceIdentity;
@@ -51,6 +51,8 @@ impl Peer {
             loopback_is_internet: false,
             rendezvous: Some(rendezvous.to_string()),
             force_relay,
+            // Never the user's clipboard.
+            clipboard: ClipboardBackend::Off,
         };
         let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
         Self { core, events, pending: RefCell::new(Vec::new()) }

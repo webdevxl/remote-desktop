@@ -7,7 +7,7 @@ no router setup: a small LanKVM server introduces them to each other.
 
 **Status:** prototype. You enter an IP, enter a PIN once, and see the other Mac's screen. Each
 viewer window has two modes: **View** only looks; **Control** uses the other Mac's keyboard and
-mouse as if they were plugged into it.
+mouse as if they were plugged into it, and shares the clipboard with it.
 
 ## How it stays fast
 
@@ -161,6 +161,30 @@ menu-bar icon lists them, with **Stop Control** and **Disconnect**; **⌃⌥⌘.
 control back. One Mac controls at a time: another device has to choose to take over. Two Macs
 can't control each other at once: when the Mac you're controlling takes control of yours, your
 window on it switches to View (otherwise every key would bounce between the two).
+
+### Copy and paste between the Macs
+
+While you control another Mac, the two share one clipboard: copy on either, paste on the other.
+Text, rich text, web content (HTML), links, images and PDFs go across. Files stay where they are:
+copying one empties the other Mac's clipboard, so it never pastes something older.
+
+- **Control → Share Clipboard** (also in the session control's **⋯** menu) turns it off or on for
+  every Mac this one controls. It's on by default. While it's off, or while you only view a Mac,
+  neither clipboard leaves its Mac.
+- The newest copy wins. When you start controlling a Mac, whichever clipboard was copied last, on
+  either Mac, goes to the other. After that each copy goes across within a quarter of a second,
+  and at once when you switch between the Macs (⌃⌥⌘, or clicking the remote screen or another
+  window), just before you paste.
+- A chain shares one clipboard: when your Mac controls one whose window controls a third, a copy
+  on any of them reaches the others.
+- Up to 64 MB over the local network, 8 MB over the internet. When a clipboard is bigger, the
+  viewer window says so and the other Mac's clipboard is emptied instead. An image copied as TIFF
+  goes as PNG, a fraction of the size.
+- A password copied from a password manager keeps its "concealed" mark (nspasteboard.org), so
+  clipboard history apps on the other Mac leave it out too.
+- LanKVM checks only whether the clipboard changed (a counter macOS keeps), a few times a second,
+  and reads it only while it shares it. If macOS asks whether LanKVM may paste from other apps,
+  allow it.
 
 ### Working on a big screen: virtual displays
 
@@ -326,6 +350,11 @@ its own host injects).
 `cargo test --workspace` covers the control path without any permission: two cores talk over
 real QUIC on loopback while the host records what it would inject (`crates/core/tests/control_loopback.rs`).
 
+**The shared clipboard on one Mac.** Two copies of LanKVM on the same Mac have the same
+clipboard, so they don't share it. `LANKVM_CLIPBOARD=<name>` gives an instance a pasteboard of its
+own instead (`off`: none), which it then shares; `crates/core/tests/clipboard_loopback.rs` runs two
+cores that way, never touching your clipboard.
+
 **Internet access on one Mac.** `LANKVM_TEST_LOOPBACK_IS_INTERNET=1` makes an instance treat
 loopback as the internet, so its connections over `127.0.0.1` go through the gate, the knock and
 the internet checks; the router is left alone, and so is the LanKVM server unless
@@ -402,6 +431,11 @@ and unlocked while it runs.
   the host. One device controls at a time. Input is ignored unless granted,
   checked and clamped (key codes, buttons, scroll values), and a flood of presses ends control.
   A viewer that floods control requests or stops reading what the host sends is disconnected.
+- **The clipboard** goes only between a Mac and the paired Mac controlling it, while that Mac's
+  user has **Share Clipboard** on, inside the session's encrypted connection. A Mac writes only
+  the shared types (text, rich text, HTML, links, PNG, PDF and the nspasteboard.org marks) that
+  come from the other: never files or app-private types. The host also accepts clipboard
+  transfers only from the viewer controlling it, and reads at most two at a time.
 - Every event a host injects carries a per-process tag, so a viewer on the same Mac drops it
   instead of sending it back, plus how many Macs it has been relayed through (A controls B,
   whose window controls C): hosts drop input that went around more than three, so Macs
@@ -459,8 +493,8 @@ and unlocked while it runs.
 |---|---|
 | `crates/protocol` | Wire messages, video packet header |
 | `crates/transport` | QUIC endpoint, LAN congestion control, identity, pairing, packetizer/reassembler, the gate that keeps the port silent to the internet (`gate.rs`, `knock.rs`, `cid.rs`), the LanKVM server's protocol and relay on the socket (`rendezvous.rs`, with an in-process server for tests in `test_server.rs`) |
-| `crates/platform-mac` | ScreenCaptureKit capture, finding the tiles that changed (`tiler.rs`), VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), virtual displays (`virtual_display.rs`), router port mapping (`portmap.rs`) |
-| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), virtual displays for viewers (`displays.rs`), internet access keys, addresses and port mapping (`internet.rs`), registration with and introductions through the LanKVM server (`rendezvous.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
+| `crates/platform-mac` | ScreenCaptureKit capture, finding the tiles that changed (`tiler.rs`), VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), the clipboard (`clipboard.rs`), virtual displays (`virtual_display.rs`), router port mapping (`portmap.rs`) |
+| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), the shared clipboard (`clipboard.rs`), virtual displays for viewers (`displays.rs`), internet access keys, addresses and port mapping (`internet.rs`), registration with and introductions through the LanKVM server (`rendezvous.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
 | `macos/` | SwiftUI app (SwiftPM). `Sources/CLanKVM/include/lankvm.h` is the C interface |
 | `scripts/bundle.sh` | Builds and signs `LanKVM.app` |
 | `scripts/make-icon.swift` | Regenerates `macos/Resources/AppIcon.icns` |
@@ -471,8 +505,8 @@ The remote screen never goes through SwiftUI. The viewer window hosts a `CAMetal
 Rust core renders each decoded frame into it from its own thread as soon as it arrives.
 
 Tests: `cargo test --workspace`. This includes a real hardware HEVC encode→decode round trip, a
-QUIC loopback session, remote control end to end over QUIC, and connecting over the (loopback)
-internet. To review the UI without granting any permissions, render every screen
+QUIC loopback session, remote control and the shared clipboard end to end over QUIC, and
+connecting over the (loopback) internet. To review the UI without granting any permissions, render every screen
 to PNG (light and dark):
 
 ```bash
