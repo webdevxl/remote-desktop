@@ -1,4 +1,5 @@
-//! Host role: accept viewers from the local network and stream this Mac's screen to them.
+//! Host role: accept viewers (from the local network, and from the internet when that is on)
+//! and stream this Mac's screen to them.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -18,18 +19,19 @@ use protocol::{
     Arrangement, ClientMsg, Codec, ControlReason, ControlState, CursorState, DisplayChoice, DisplayReason, DisplayState, HostMsg,
     FULL_FRAME_TILE, MAX_TILES, PROTOCOL_VERSION, TILE_MAX_WIDTH, TileRect, VideoFrame, VirtualDisplaySpec, tile_layout,
 };
-use quinn::{Connection, ConnectionError, Endpoint, Incoming, RecvStream, SendStream};
+use quinn::{Connection, ConnectionError, Incoming, RecvStream, SendStream};
 use tokio::sync::mpsc;
-use transport::endpoint::peer_fingerprint;
+use transport::endpoint::{Network, peer_fingerprint};
 use transport::framing::{read_msg, write_msg};
 use transport::identity::{Fingerprint, short_hex};
-use transport::net::is_local_network;
 use transport::pairing::{generate_pin, host_respond};
 use serde::Serialize;
 use transport::video::Packetizer;
 
 use crate::control::{Backend, HostSettings, InputCmdSender, InputConfig, InputFailure, InputShared, InputThread, RateLimit};
 use crate::displays::{Acquired, DisplayNotice, Displays, VirtualDisplayView};
+use crate::internet::{HostInternet, InternetView};
+use crate::rate::{self, RateControl, Sample};
 use crate::{Event, EventSink, Trust};
 
 /// Minimum spacing between keyframes (and re-sent tiles) produced on request or after a loss; a
@@ -62,7 +64,12 @@ const DIRTY_RECTS_DISTRUST: Duration = Duration::from_secs(10);
 /// trip on a LAN; a peer that starts handshakes and never finishes them can't pile them up.
 const MAX_HANDSHAKES: usize = 64;
 const MAX_HANDSHAKES_PER_ADDRESS: usize = 8;
+/// Handshakes from the internet count apart, and fewer may run: whoever has a knock (a paired
+/// viewer, or someone with its key) can't take the places viewers on the local network need.
+const MAX_HANDSHAKES_INTERNET: usize = 16;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// The same over the internet: a few round trips of a slow path, with a lost packet or two.
+const HANDSHAKE_TIMEOUT_INTERNET: Duration = Duration::from_secs(8);
 /// Connections from devices not (yet) trusted that are still saying Hello, pairing or starting
 /// their stream. More are turned away, so peers that never finish can't pile up. Trusted devices
 /// don't count and are never turned away.
@@ -95,6 +102,8 @@ pub struct Viewer {
     pub addr: SocketAddr,
     pub fingerprint: Fingerprint,
     pub conn: Connection,
+    /// It connected over the internet, not from the local network.
+    pub internet: bool,
     /// Whether this viewer controls the Mac right now (rather than only viewing it).
     pub controlling: Arc<AtomicBool>,
     /// The display it watches.
@@ -130,6 +139,8 @@ pub struct HostCtx {
     pub trust: Arc<Trust>,
     pub settings: Mutex<HostSettings>,
     pub settings_path: PathBuf,
+    /// Internet access: the gate's keys and the port mapping.
+    pub(crate) internet: Arc<HostInternet>,
     /// Where injected input goes (real events unless a test asks to record them).
     pub backend: Backend,
     /// Stamped on every injected event, with bits 24..31 holding the relay depth; viewers on
@@ -153,8 +164,9 @@ pub struct HostCtx {
     pub(crate) pairing_throttle: Mutex<PairingThrottle>,
     /// Connections being set up (see [`MAX_PENDING`]).
     pub(crate) pending: AtomicUsize,
-    /// Handshakes in progress by address (see [`MAX_HANDSHAKES`]).
-    pub(crate) handshakes: Mutex<HashMap<IpAddr, usize>>,
+    /// Handshakes in progress by whether they came from the internet, and address (see
+    /// [`MAX_HANDSHAKES`]).
+    pub(crate) handshakes: Mutex<HashMap<(bool, IpAddr), usize>>,
 }
 
 /// Host status as the UI sees it.
@@ -170,6 +182,8 @@ pub struct HostStatusView {
     pub control_permission: bool,
     /// Displays made for viewers, watched or waiting for their viewer to come back.
     pub virtual_displays: Vec<VirtualDisplayView>,
+    /// Whether paired Macs can reach this one over the internet.
+    pub internet: InternetView,
 }
 
 #[derive(Serialize)]
@@ -183,6 +197,8 @@ pub struct ViewerView {
     /// The display it watches, and whether that is one made for a viewer.
     pub display_id: u32,
     pub virtual_display: bool,
+    /// It connected over the internet.
+    pub internet: bool,
 }
 
 #[derive(Serialize)]
@@ -205,6 +221,7 @@ impl HostCtx {
         let control_permission = self.backend.permitted();
         let allow_control = self.settings.lock().unwrap().allow_control;
         let virtual_displays = self.displays.summary();
+        let internet = self.internet.view();
         let status = self.status.lock().unwrap();
         HostStatusView {
             viewers: status
@@ -220,6 +237,7 @@ impl HostCtx {
                         controlling: v.controlling.load(Ordering::Acquire),
                         display_id,
                         virtual_display: virtual_displays.iter().any(|d| d.display_id == display_id),
+                        internet: v.internet,
                     }
                 })
                 .collect(),
@@ -232,6 +250,7 @@ impl HostCtx {
             allow_control,
             control_permission,
             virtual_displays,
+            internet,
         }
     }
 
@@ -255,6 +274,42 @@ impl HostCtx {
         for v in self.status.lock().unwrap().viewers.iter() {
             let _ = v.session.send(SessionEvt::Availability);
         }
+        self.changed();
+    }
+
+    /// Lets paired Macs connect over the internet, or stops that. Turning it off ends the
+    /// sessions that came over the internet; turning it on asks the router to forward the port.
+    pub fn set_internet_access(&self, on: bool) {
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.internet_access = on;
+            if let Err(e) = settings.save(&self.settings_path) {
+                tracing::warn!("save host settings: {e:#}");
+            }
+        }
+        // First, so no new session gets in once the old ones are closed below.
+        self.internet.set_enabled(on);
+        tracing::info!(on, "internet access");
+        if !on {
+            for v in self.status.lock().unwrap().viewers.iter().filter(|v| v.internet) {
+                v.conn.close(8u32.into(), b"internet access turned off");
+            }
+        }
+        self.changed();
+    }
+
+    /// The address paired Macs are told to use over the internet, as the user typed it (a
+    /// dynamic DNS name or an IP, with or without a port), or "".
+    pub fn set_public_address(&self, address: &str) {
+        let address = address.trim().to_string();
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.public_address = address.clone();
+            if let Err(e) = settings.save(&self.settings_path) {
+                tracing::warn!("save host settings: {e:#}");
+            }
+        }
+        self.internet.set_public_address(address);
         self.changed();
     }
 
@@ -333,14 +388,22 @@ pub fn can_capture() -> bool {
     permissions::screen_capture_allowed() || main_display().is_ok()
 }
 
-pub async fn run(endpoint: Endpoint, ctx: Arc<HostCtx>) {
-    while let Some(incoming) = endpoint.accept().await {
+pub async fn run(network: Network, ctx: Arc<HostCtx>) {
+    while let Some(incoming) = network.endpoint.accept().await {
         let remote = incoming.remote_address();
-        if !is_local_network(remote.ip()) {
-            tracing::warn!(%remote, "refused connection from outside the local network");
-            incoming.refuse();
-            continue;
-        }
+        // From the internet, only a paired viewer that knocks gets any answer, and only while
+        // internet access is on. Everyone else is ignored, never refused: a refusal would show
+        // the port is open. (The gate in front of the socket already dropped most of them.)
+        let internet = if network.gate.is_internet(remote) {
+            let Some(viewer) = network.gate.admit(&incoming.orig_dst_cid(), remote) else {
+                tracing::debug!(%remote, "ignored a connection attempt from the internet");
+                incoming.ignore();
+                continue;
+            };
+            Some(Internet { viewer, config: network.internet_server_config() })
+        } else {
+            None
+        };
         // The peer proves it receives at its address (a stateless retry: one more round trip)
         // before the host keeps any state for it, so floods from made-up addresses cost nothing.
         if !incoming.remote_address_validated() {
@@ -349,14 +412,19 @@ pub async fn run(endpoint: Endpoint, ctx: Arc<HostCtx>) {
             }
             continue;
         }
-        let Some(handshake) = Handshake::enter(&ctx, remote.ip()) else {
-            tracing::warn!(%remote, "refused connection: too many handshakes in progress");
-            incoming.refuse();
+        let Some(handshake) = Handshake::enter(&ctx, remote.ip(), internet.is_some()) else {
+            if internet.is_some() {
+                tracing::debug!(%remote, "ignored a connection from the internet: too many handshakes in progress");
+                incoming.ignore();
+            } else {
+                tracing::warn!(%remote, "refused connection: too many handshakes in progress");
+                incoming.refuse();
+            }
             continue;
         };
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            match serve(incoming, ctx, handshake).await {
+            match serve(incoming, ctx, handshake, internet).await {
                 Ok(()) => tracing::info!(%remote, "viewer disconnected"),
                 Err(e) => tracing::info!(%remote, "viewer session ended: {e:#}"),
             }
@@ -364,10 +432,32 @@ pub async fn run(endpoint: Endpoint, ctx: Arc<HostCtx>) {
     }
 }
 
-async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> Result<()> {
-    let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await.context("handshake timed out")?.context("handshake")?;
+/// A connection attempt from the internet that carried a valid knock.
+struct Internet {
+    /// The viewer whose key made the knock.
+    viewer: Fingerprint,
+    config: Arc<quinn::ServerConfig>,
+}
+
+async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, internet: Option<Internet>) -> Result<()> {
+    let conn = match &internet {
+        None => tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await.context("handshake timed out")?.context("handshake")?,
+        Some(internet) => {
+            let connecting = incoming.accept_with(internet.config.clone()).context("handshake")?;
+            tokio::time::timeout(HANDSHAKE_TIMEOUT_INTERNET, connecting).await.context("handshake timed out")?.context("handshake")?
+        }
+    };
     drop(handshake);
     let client_fp = peer_fingerprint(&conn).context("viewer sent no certificate")?;
+    // Over the internet, the device must be the paired viewer whose key knocked. Anyone else is
+    // told nothing.
+    if let Some(internet) = &internet
+        && (client_fp != internet.viewer || !ctx.trust.viewers.lock().unwrap().contains(&client_fp))
+    {
+        conn.close(0u32.into(), b"");
+        bail!("turned away a device from the internet: not the paired viewer that knocked");
+    }
+    let internet = internet.is_some();
     // The handshake proved the device holds its key, so trust can't be faked here.
     let pending = if ctx.trust.viewers.lock().unwrap().contains(&client_fp) {
         None
@@ -395,6 +485,14 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
     }
     let known = ctx.trust.viewers.lock().unwrap().contains(&client_fp);
     if !known || !trusts_host {
+        // A PIN shown here could be guessed at from anywhere: pairing needs the local network.
+        if internet {
+            let host = system::device_name();
+            return reject(&conn, &mut send, &format!(
+                "{host} only pairs with Macs on its own network. Connect to it on the same network once (enter its code there), then connect over the internet."
+            ))
+            .await;
+        }
         let _slot = match PairingSlot::claim(&ctx) {
             Ok(slot) => slot,
             Err(why) => return reject(&conn, &mut send, &why).await,
@@ -420,8 +518,9 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
         viewer_max: (max_width, max_height),
         viewer_fps: fps,
         video: ctx.video,
+        internet,
         stream: Arc::default(),
-        video_out: Arc::new(VideoOut::new(conn.clone())),
+        video_out: Arc::new(VideoOut::new(conn.clone(), internet)),
         input: Arc::new(InputShared::default()),
         cursor: CursorWish::default(),
         generation: Arc::default(),
@@ -443,7 +542,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
 
     write_msg(&mut send, &HostMsg::Welcome { device_name: system::device_name(), width, height, fps, codec }).await?;
 
-    tracing::info!(viewer = %device_name, addr = %conn.remote_address(), fingerprint = %short_hex(&client_fp), width, height, fps, display = showing.display_id, video = ctx.video, "streaming");
+    tracing::info!(viewer = %device_name, addr = %conn.remote_address(), fingerprint = %short_hex(&client_fp), width, height, fps, display = showing.display_id, video = ctx.video, internet, "streaming");
 
     // From here on several parties talk to the viewer (pongs, control state, cursor shapes,
     // input acks), so one task owns the send side of the control stream.
@@ -456,6 +555,8 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
             }
         }
     }));
+    // Over the internet, the video follows what the connection carries.
+    let _rate = internet.then(|| AbortOnDrop(tokio::spawn(follow_the_connection(conn.clone(), streamer.video_out.clone()))));
     // What the viewer sends is read only as fast as the session handles it.
     let (client_tx, mut client_rx) = mpsc::channel::<SessionEvt>(CLIENT_QUEUE);
     let _reader = AbortOnDrop(tokio::spawn(async move {
@@ -493,6 +594,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
             addr: conn.remote_address(),
             fingerprint: client_fp,
             conn: conn.clone(),
+            internet,
             controlling: controlling.clone(),
             watching: watching.clone(),
             session: evt_tx.clone(),
@@ -503,6 +605,11 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
     // viewers listed, and this one is listed from here on.
     if !ctx.trust.viewers.lock().unwrap().contains(&client_fp) {
         bail!("device was forgotten while connecting");
+    }
+    // Likewise turning internet access off.
+    if internet && !ctx.internet.enabled() {
+        conn.close(8u32.into(), b"internet access turned off");
+        bail!("internet access was turned off while connecting");
     }
     drop(pending);
     let mut control = SessionControl {
@@ -529,6 +636,12 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
     screen.seq_seen = adopted_seq;
     // What it shows, and whether it may ask for a virtual display.
     screen.announce(0, DisplayReason::NONE, String::new());
+    // How to reach this Mac over the internet, now or once that is turned on (after Display:
+    // the viewer reads that first).
+    let _ = out.try_send(HostMsg::InternetAccess {
+        key: ctx.internet.access_key(&client_fp).to_vec(),
+        addresses: ctx.internet.announced_addresses(),
+    });
 
     // While controlled, notice within a second if the Accessibility permission is withdrawn.
     let mut permission_check = tokio::time::interval(PERMISSION_CHECK);
@@ -541,6 +654,13 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake) -> R
             evt = client_rx.recv() => evt,
             _ = permission_check.tick() => {
                 control.check_permission();
+                // QUIC follows a viewer to a new network. A session from the local network
+                // doesn't follow it onto the internet: that takes a knock (and internet access
+                // on), and its settings are the local network's.
+                if !internet && ctx.internet.is_internet(conn.remote_address()) {
+                    conn.close(9u32.into(), b"left the local network");
+                    bail!("the viewer left the local network (now at {})", conn.remote_address());
+                }
                 continue;
             }
         };
@@ -598,29 +718,32 @@ const PERMISSION_CHECK: Duration = Duration::from_secs(1);
 /// Holds a place among the handshakes in progress (see [`MAX_HANDSHAKES`]).
 struct Handshake {
     ctx: Arc<HostCtx>,
-    ip: IpAddr,
+    /// Whether it came from the internet, and from where.
+    key: (bool, IpAddr),
 }
 
 impl Handshake {
-    fn enter(ctx: &Arc<HostCtx>, ip: IpAddr) -> Option<Self> {
+    fn enter(ctx: &Arc<HostCtx>, ip: IpAddr, internet: bool) -> Option<Self> {
+        let max = if internet { MAX_HANDSHAKES_INTERNET } else { MAX_HANDSHAKES };
+        let key = (internet, ip);
         let mut handshakes = ctx.handshakes.lock().unwrap();
-        let total: usize = handshakes.values().sum();
-        let from_ip = handshakes.get(&ip).copied().unwrap_or(0);
-        if total >= MAX_HANDSHAKES || from_ip >= MAX_HANDSHAKES_PER_ADDRESS {
+        let total: usize = handshakes.iter().filter(|((from_internet, _), _)| *from_internet == internet).map(|(_, n)| n).sum();
+        let from_ip = handshakes.get(&key).copied().unwrap_or(0);
+        if total >= max || from_ip >= MAX_HANDSHAKES_PER_ADDRESS {
             return None;
         }
-        handshakes.insert(ip, from_ip + 1);
-        Some(Self { ctx: ctx.clone(), ip })
+        handshakes.insert(key, from_ip + 1);
+        Some(Self { ctx: ctx.clone(), key })
     }
 }
 
 impl Drop for Handshake {
     fn drop(&mut self) {
         let mut handshakes = self.ctx.handshakes.lock().unwrap();
-        if let Some(n) = handshakes.get_mut(&self.ip) {
+        if let Some(n) = handshakes.get_mut(&self.key) {
             *n -= 1;
             if *n == 0 {
-                handshakes.remove(&self.ip);
+                handshakes.remove(&self.key);
             }
         }
     }
@@ -1129,6 +1252,7 @@ async fn pair(
         _ => bail!("pairing failed (wrong code)"),
     }
     ctx.trust.viewers.lock().unwrap().add(client_fp, device_name)?;
+    ctx.internet.sync_keys();
     ctx.pairing_throttle.lock().unwrap().succeeded();
     tracing::info!(viewer = %device_name, "paired");
     (ctx.events)(Event::TrustChanged);
@@ -1169,6 +1293,16 @@ fn choose_fps(requested: u32) -> u32 {
     requested.clamp(15, 120)
 }
 
+/// Over the internet a display streams at most this often: frames past it would only split the
+/// same bitrate thinner.
+const INTERNET_MAX_FPS: u32 = 60;
+
+/// The frame rate to stream a display of `refresh_hz` at, over the `internet` or not.
+fn stream_fps(refresh_hz: u32, internet: bool) -> u32 {
+    let fps = choose_fps(refresh_hz);
+    if internet { fps.min(INTERNET_MAX_FPS) } else { fps }
+}
+
 /// Generous LAN bitrate: about 0.12 bits per pixel per frame, so text stays sharp.
 fn bitrate_for(width: u32, height: u32, fps: u32) -> u32 {
     let bps = width as f64 * height as f64 * fps as f64 * 0.12;
@@ -1202,12 +1336,25 @@ struct Motion {
     /// As the encoders have them.
     bitrates: Vec<u32>,
     next_check: Instant,
+    /// `stream_bps` changed: the next check tells every tile its share, however small the change.
+    budget_changed: bool,
 }
 
 impl Motion {
     fn new(stream_bps: u32, tiles: Vec<TileRect>, now: Instant) -> Self {
         let bitrates = tile_bitrates(stream_bps, &tiles, 0);
-        Self { stream_bps, changed_at: vec![None; tiles.len()], tiles, bitrates, next_check: now + RETARGET_INTERVAL }
+        Self { stream_bps, changed_at: vec![None; tiles.len()], tiles, bitrates, next_check: now + RETARGET_INTERVAL, budget_changed: false }
+    }
+
+    /// The stream's bitrate is now `stream_bps` (over the internet it follows the connection):
+    /// the tiles get their new shares at the next update, even a cut too small to be worth it
+    /// otherwise, since it is what the connection carries.
+    fn set_stream_bps(&mut self, stream_bps: u32, now: Instant) {
+        if stream_bps != self.stream_bps {
+            self.stream_bps = stream_bps;
+            self.budget_changed = true;
+            self.next_check = now;
+        }
     }
 
     fn changed(&mut self, tiles: u64, now: Instant) {
@@ -1234,11 +1381,14 @@ impl Motion {
         let mut changes = Vec::new();
         for (i, target) in tile_bitrates(self.stream_bps, &self.tiles, active).into_iter().enumerate() {
             let current = self.bitrates[i];
-            if (f64::from(target) - f64::from(current)).abs() > RETARGET_MIN_CHANGE * f64::from(current) {
+            if (f64::from(target) - f64::from(current)).abs() > RETARGET_MIN_CHANGE * f64::from(current)
+                || (self.budget_changed && target != current)
+            {
                 self.bitrates[i] = target;
                 changes.push((i, target));
             }
         }
+        self.budget_changed = false;
         changes
     }
 }
@@ -1304,11 +1454,40 @@ struct VideoOut {
     /// The viewer can't decode the full-frame stream ([`ClientMsg::NoFullFrame`]): every stream
     /// of this connection sends changes as tiles only.
     no_full_frame: AtomicBool,
+    /// Over the internet: what the connection carries (None on the local network).
+    wan: Option<WanLimits>,
+}
+
+/// The limits an internet connection's video keeps to, set by its rate controller every
+/// [`rate::TICK`] (see [`follow_the_connection`]) and read by the encode thread.
+struct WanLimits {
+    /// The stream's bitrate ceiling, and whether it changed since the encode thread last looked.
+    ceiling_bps: AtomicU32,
+    changed: AtomicBool,
+    /// The running stream's LAN bitrate: the ceiling never goes above it.
+    cap_bps: AtomicU32,
+    /// Datagram bytes that may wait in QUIC's buffer before the next update is held back.
+    backlog_limit: AtomicUsize,
+    /// Least time between keyframes served on request (µs): about a round trip.
+    keyframe_gap_us: AtomicU64,
+    /// Free space in the datagram send buffer while nothing waits there.
+    empty_space: usize,
 }
 
 impl VideoOut {
-    fn new(conn: Connection) -> Self {
+    /// Over the `internet`, streams send tiles only: a full frame is hundreds of packets, and on
+    /// a path that loses one now and then most would arrive incomplete.
+    fn new(conn: Connection, internet: bool) -> Self {
         let packetizers = (0..MAX_TILES).map(|i| Mutex::new(Packetizer::for_tile(i as u8))).collect();
+        let wan = internet.then(|| WanLimits {
+            ceiling_bps: AtomicU32::new(rate::START_BPS),
+            changed: AtomicBool::new(false),
+            cap_bps: AtomicU32::new(rate::START_BPS),
+            backlog_limit: AtomicUsize::new(rate::backlog_limit(rate::START_BPS)),
+            keyframe_gap_us: AtomicU64::new(rate::keyframe_gap(conn.rtt()).as_micros() as u64),
+            // Nothing was sent yet: the connection's video goes out through here only.
+            empty_space: conn.datagram_send_buffer_space(),
+        });
         Self {
             conn,
             packetizers,
@@ -1316,8 +1495,46 @@ impl VideoOut {
             next_tag: AtomicU64::new(0),
             slots: Mutex::new([UpdateSlot { tag: NOT_SENT, ..UpdateSlot::default() }; UPDATE_MASKS]),
             notices: Mutex::default(),
-            no_full_frame: AtomicBool::new(false),
+            no_full_frame: AtomicBool::new(internet),
+            wan,
         }
+    }
+
+    /// The bitrate a new stream of LAN bitrate `lan_bps` starts at: over the internet, no more
+    /// than the connection carries.
+    fn start_bitrate(&self, lan_bps: u32) -> u32 {
+        match &self.wan {
+            None => lan_bps,
+            Some(wan) => {
+                wan.cap_bps.store(lan_bps, Ordering::Release);
+                lan_bps.min(wan.ceiling_bps.load(Ordering::Acquire))
+            }
+        }
+    }
+
+    /// The stream's new bitrate, if the ceiling changed since the last call (never on the local
+    /// network).
+    fn take_ceiling(&self) -> Option<u32> {
+        let wan = self.wan.as_ref()?;
+        wan.changed
+            .swap(false, Ordering::AcqRel)
+            .then(|| wan.ceiling_bps.load(Ordering::Acquire).min(wan.cap_bps.load(Ordering::Acquire)))
+    }
+
+    /// Bytes of datagrams waiting in QUIC's send buffer (over the internet only).
+    fn backlog(&self) -> usize {
+        self.wan.as_ref().map_or(0, |wan| wan.empty_space.saturating_sub(self.conn.datagram_send_buffer_space()))
+    }
+
+    /// Over the internet: more video waits in QUIC's send buffer than should, so the next update
+    /// waits (always false on the local network).
+    fn backlogged(&self) -> bool {
+        self.wan.as_ref().is_some_and(|wan| self.backlog() > wan.backlog_limit.load(Ordering::Relaxed))
+    }
+
+    /// Over the internet, the least time between keyframes served on request.
+    fn keyframe_gap(&self) -> Option<Duration> {
+        self.wan.as_ref().map(|wan| Duration::from_micros(wan.keyframe_gap_us.load(Ordering::Relaxed)))
     }
 
     fn set_notices(&self, out: mpsc::Sender<HostMsg>) {
@@ -1398,6 +1615,42 @@ impl VideoOut {
                 tracing::warn!(tile = tile.index, "packetize: {e:#}");
                 false
             }
+        }
+    }
+}
+
+/// Over the internet: every [`rate::TICK`], samples what the connection did and sets `video`'s
+/// limits to what it carries (see [`crate::rate`]). Runs as long as the session.
+async fn follow_the_connection(conn: Connection, video: Arc<VideoOut>) {
+    let Some(wan) = video.wan.as_ref() else { return };
+    let mut control = RateControl::new(wan.cap_bps.load(Ordering::Acquire));
+    let publish = |ceiling: u32| {
+        wan.backlog_limit.store(rate::backlog_limit(ceiling), Ordering::Relaxed);
+        wan.ceiling_bps.store(ceiling, Ordering::Release);
+        wan.changed.store(true, Ordering::Release);
+    };
+    publish(control.ceiling());
+    let mut tick = tokio::time::interval(rate::TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    let (mut at, mut stats) = (Instant::now(), conn.stats());
+    loop {
+        tick.tick().await;
+        let (now, next) = (Instant::now(), conn.stats());
+        let sample = Sample::between(&stats, &next, now - at, video.backlog());
+        (at, stats) = (now, next);
+        wan.keyframe_gap_us.store(rate::keyframe_gap(sample.rtt).as_micros() as u64, Ordering::Relaxed);
+        let capped = control.set_cap(wan.cap_bps.load(Ordering::Acquire));
+        if let Some(ceiling) = control.on_sample(&sample).or(capped) {
+            tracing::debug!(
+                ceiling_mbps = f64::from(ceiling) / 1e6,
+                sent_mbps = control.send_rate() / 1e6,
+                rtt_ms = sample.rtt.as_secs_f64() * 1e3,
+                lost = sample.lost_packets,
+                backlog = sample.backlog,
+                "video bitrate follows the connection"
+            );
+            publish(ceiling);
         }
     }
 }
@@ -1639,8 +1892,9 @@ struct Work {
 }
 
 /// Keyframes and resends asked for, by the viewer or after a lost frame: they merge into masks
-/// (nothing is ever dropped), served together at most every [`KEYFRAME_MIN_INTERVAL`], so a viewer
-/// that keeps losing packets can't turn the stream into all-keyframes.
+/// (nothing is ever dropped), served together at most every [`KEYFRAME_MIN_INTERVAL`] (over the
+/// internet, about a round trip), so a viewer that keeps losing packets can't turn the stream into
+/// all-keyframes.
 #[derive(Default)]
 struct Requests {
     keyframes: u64,
@@ -1653,6 +1907,9 @@ struct Requests {
     served: Option<Instant>,
     /// Keyframes still waiting when the update in progress started.
     held: u64,
+    /// Over the internet, the spacing instead of [`KEYFRAME_MIN_INTERVAL`]: about a round trip
+    /// (see [`rate::keyframe_gap`]).
+    gap: Option<Duration>,
 }
 
 impl Requests {
@@ -1680,8 +1937,8 @@ impl Requests {
 
     /// How long until the pending tiles may be served; None if there are none.
     fn wait(&self, now: Instant) -> Option<Duration> {
-        (self.keyframes | self.resends != 0)
-            .then(|| self.served.map_or(Duration::ZERO, |t| (t + KEYFRAME_MIN_INTERVAL).saturating_duration_since(now)))
+        let gap = self.gap.unwrap_or(KEYFRAME_MIN_INTERVAL);
+        (self.keyframes | self.resends != 0).then(|| self.served.map_or(Duration::ZERO, |t| (t + gap).saturating_duration_since(now)))
     }
 
     /// The work for the update starting now: the tiles only when it's their turn.
@@ -1850,6 +2107,9 @@ const TILER_RETRY: Duration = Duration::from_millis(5);
 const MAX_TILER_RETRY: Duration = Duration::from_millis(500);
 /// A tiler that keeps failing says so at most this often.
 const TILER_WARN_INTERVAL: Duration = Duration::from_secs(5);
+/// While video waits in QUIC's send buffer beyond its limit (over the internet), the next update
+/// looks again this often whether it drained.
+const BACKLOG_RECHECK: Duration = Duration::from_millis(2);
 
 /// Paces the retries of frames the tiler failed on, and the warnings about it.
 #[derive(Default)]
@@ -1894,8 +2154,18 @@ fn encode_loop(shared: &Shared, mut pipeline: Pipeline, video: &VideoOut) {
                     return;
                 }
                 let now = Instant::now();
+                if let Some(gap) = video.keyframe_gap() {
+                    state.requests.gap = Some(gap);
+                }
                 let frame_wait = state.next.as_ref().map(|_| state.retry_at.map_or(Duration::ZERO, |t| t.saturating_duration_since(now)));
                 let work_wait = [frame_wait, state.requests.wait(now)].into_iter().flatten().min();
+                if work_wait == Some(Duration::ZERO) && video.backlogged() {
+                    // Over the internet, video still waiting in QUIC's send buffer is late already:
+                    // the next update waits for it to drain (a newer capture still replaces the
+                    // one waiting), so a path that carries less costs frame rate, not latency.
+                    state = shared.wake.wait_timeout(state, BACKLOG_RECHECK).unwrap().0;
+                    continue;
+                }
                 if work_wait == Some(Duration::ZERO) {
                     let frame = if state.retry_at.is_none_or(|t| t <= now) { state.next.take() } else { None };
                     let touched = if frame.is_some() { std::mem::take(&mut state.touched) } else { 0 };
@@ -2161,6 +2431,10 @@ impl Pipeline {
             return outcome;
         }
 
+        // Over the internet, the stream's bitrate follows the connection.
+        if let Some(bps) = video.take_ceiling() {
+            self.motion.set_stream_bps(bps, now);
+        }
         for (i, bitrate_bps) in self.motion.retarget(now) {
             if let Err(e) = self.encoders.encoders[i].set_bitrate(bitrate_bps) {
                 tracing::debug!(tile = i, bitrate_bps, "set bitrate: {e:#}");
@@ -2362,6 +2636,8 @@ struct Streamer {
     viewer_max: (u32, u32),
     viewer_fps: u32,
     video: bool,
+    /// The viewer connected over the internet.
+    internet: bool,
     stream: Arc<StreamSlot>,
     video_out: Arc<VideoOut>,
     input: Arc<InputShared>,
@@ -2383,7 +2659,7 @@ impl Streamer {
         })
         .await??;
         let (width, height) = fit_within(display.width, display.height, self.viewer_max.0, self.viewer_max.1);
-        let fps = choose_fps(self.viewer_fps);
+        let fps = stream_fps(self.viewer_fps, self.internet);
         self.swap(display.id, width, height, fps).await?;
         Ok(Showing { display: DisplayChoice::Main, display_id: display.id, width, height, fps })
     }
@@ -2397,7 +2673,7 @@ impl Streamer {
         if (width, height) != (spec.width, spec.height) {
             tracing::warn!(display = display_id, width, height, ?spec, "the virtual display isn't the size asked for");
         }
-        let fps = choose_fps(spec.refresh_hz);
+        let fps = stream_fps(spec.refresh_hz, self.internet);
         self.swap(display_id, width, height, fps).await?;
         Ok(Showing { display: DisplayChoice::Virtual(spec), display_id, width, height, fps })
     }
@@ -2418,8 +2694,10 @@ impl Streamer {
             let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
             let show_cursor = self.cursor.wanted.load(Ordering::Acquire);
             let capture = CaptureConfig { display_id, width, height, fps, show_cursor };
-            // The bit budget stays at 60 fps worth, so bandwidth doesn't double at 120.
-            let encoder = EncoderConfig { width, height, fps, bitrate_bps: bitrate_for(width, height, fps.min(60)), codec: Codec::Hevc };
+            // The bit budget stays at 60 fps worth, so bandwidth doesn't double at 120. Over the
+            // internet, it starts at what the connection carries.
+            let bitrate_bps = self.video_out.start_bitrate(bitrate_for(width, height, fps.min(60)));
+            let encoder = EncoderConfig { width, height, fps, bitrate_bps, codec: Codec::Hevc };
             let events = self.events.clone();
             let stream = StreamSession::start(self.video_out.clone(), &capture, &encoder, move |why| {
                 tracing::warn!(display = display_id, "capture stopped: {why}");
@@ -2961,6 +3239,9 @@ mod tests {
         assert_eq!(choose_fps(60), 60);
         assert_eq!(choose_fps(1000), 120);
         assert_eq!(choose_fps(0), 15);
+        // Over the internet, at most 60 (the main display and virtual ones alike).
+        assert_eq!((stream_fps(120, false), stream_fps(120, true)), (120, 60));
+        assert_eq!(stream_fps(30, true), 30);
     }
 
     #[test]
@@ -3033,6 +3314,40 @@ mod tests {
         assert!(motion.retarget(t1).is_empty(), "{before:?}");
     }
 
+    /// Over the internet the stream's bitrate follows the connection: a new one reaches every
+    /// tile at the next update, however small the change.
+    #[test]
+    fn a_new_stream_bitrate_reaches_every_tile_at_once() {
+        let (w, h) = (6144, 2560);
+        let total = bitrate_for(w, h, 60);
+        let tiles = tile_layout(w, h, None);
+        let t0 = Instant::now();
+        let mut motion = Motion::new(total, tiles.clone(), t0);
+        // 10% less, before the interval is up.
+        let cut = total / 10 * 9;
+        motion.set_stream_bps(cut, t0);
+        let expected: Vec<_> = tile_bitrates(cut, &tiles, 0).into_iter().enumerate().collect();
+        assert_eq!(motion.retarget(t0), expected);
+        // Then by the threshold again.
+        motion.set_stream_bps(cut, t0);
+        assert!(motion.retarget(t0 + RETARGET_INTERVAL).is_empty());
+        motion.set_stream_bps(cut / 10 * 9, t0 + RETARGET_INTERVAL);
+        assert_eq!(motion.retarget(t0 + RETARGET_INTERVAL).len(), tiles.len());
+    }
+
+    #[test]
+    fn over_the_internet_keyframes_are_a_round_trip_apart() {
+        let t0 = Instant::now();
+        let gap = Duration::from_millis(120);
+        let mut k = Requests { gap: Some(gap), ..Requests::default() };
+        k.ask(0b01, 0b11, false);
+        assert_eq!(k.take(t0).keyframes, 0b01);
+        k.ask(0b10, 0b11, false);
+        assert_eq!(k.wait(t0 + KEYFRAME_MIN_INTERVAL), Some(gap - KEYFRAME_MIN_INTERVAL));
+        assert_eq!(k.take(t0 + KEYFRAME_MIN_INTERVAL), Work::default());
+        assert_eq!(k.take(t0 + gap).keyframes, 0b10);
+    }
+
     #[test]
     fn tile_grid_from_the_environment() {
         assert_eq!(parse_grid("2x8"), Some((2, 8)));
@@ -3047,7 +3362,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn only_updates_that_send_something_are_numbered() {
         let (host_conn, _conn) = loopback("numbers").await;
-        let video = VideoOut::new(host_conn);
+        let video = VideoOut::new(host_conn, false);
         let first = video.start_update(0b11);
         assert_eq!(video.finish_update(first, 0), None, "nothing went out: no number");
         let second = video.start_update(0b110);
@@ -3190,7 +3505,7 @@ mod tests {
         let _encoders = encoders_turn();
         let (host_conn, conn) = loopback("tiles").await;
         let (w, h) = (1280u32, 720u32);
-        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        let video = Arc::new(VideoOut::new(host_conn.clone(), false));
         // No full frames here (see `big_changes_go_out_as_one_full_frame`).
         let mut pipeline = pipeline(&video, w, h, (2, 2), 2.0);
         assert_eq!((pipeline.encoders.tiles.len(), pipeline.encoders.mask()), (4, 0b1111));
@@ -3254,7 +3569,7 @@ mod tests {
         let _encoders = encoders_turn();
         let (host_conn, conn) = loopback("full").await;
         let (w, h) = (1280u32, 720u32);
-        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        let video = Arc::new(VideoOut::new(host_conn.clone(), false));
         let mut pipeline = pipeline(&video, w, h, (2, 2), 0.75);
         assert!(pipeline.encoders.full.is_some());
         let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
@@ -3333,7 +3648,7 @@ mod tests {
         let _encoders = encoders_turn();
         let (host_conn, conn) = loopback("one").await;
         let (w, h) = (640u32, 360u32);
-        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        let video = Arc::new(VideoOut::new(host_conn.clone(), false));
         let mut pipeline = pipeline(&video, w, h, (1, 1), 0.0);
         assert!(pipeline.encoders.full.is_none());
         let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
@@ -3346,6 +3661,39 @@ mod tests {
         assert_eq!(requests.wait(Instant::now()), None);
     }
 
+    /// Over the internet: tiles only, streams start within the ceiling, and a new ceiling reaches
+    /// the encoders with the next update. On the local network none of it applies.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn over_the_internet_tiles_follow_the_ceiling() {
+        let _encoders = encoders_turn();
+        let (host_conn, _conn) = loopback("wan").await;
+        let (w, h) = (640u32, 384u32);
+        let video = Arc::new(VideoOut::new(host_conn.clone(), true));
+        let mut pipeline = pipeline(&video, w, h, (2, 1), 0.0);
+        assert!(pipeline.encoders.full.is_none() && video.no_full_frame.load(Ordering::Relaxed));
+        let wan = video.wan.as_ref().unwrap();
+        assert_eq!(video.start_bitrate(50_000_000), rate::START_BPS);
+        assert_eq!(video.start_bitrate(9_000_000), 9_000_000);
+        assert_eq!(video.take_ceiling(), None, "nothing changed yet");
+        // The ceiling never goes above the running stream's LAN bitrate.
+        wan.ceiling_bps.store(10_000_000, Ordering::Release);
+        wan.changed.store(true, Ordering::Release);
+        assert_eq!(video.take_ceiling(), Some(9_000_000));
+        assert_eq!(video.take_ceiling(), None, "once");
+        wan.ceiling_bps.store(3_000_000, Ordering::Release);
+        wan.changed.store(true, Ordering::Release);
+        let out = tokio::task::block_in_place(|| pipeline.update(&video, Some(nv12(w as usize, h as usize, |_, x, y| (x ^ y) as u8)), u64::MAX, Work::default()));
+        assert_eq!(out.sent, 0b11);
+        assert_eq!(pipeline.motion.stream_bps, 3_000_000);
+        assert!(!video.backlogged(), "nothing waits");
+        assert_eq!(video.keyframe_gap(), Some(Duration::from_millis(50)), "a loopback round trip is far shorter");
+
+        let lan = VideoOut::new(host_conn, false);
+        assert!(!lan.no_full_frame.load(Ordering::Relaxed));
+        assert_eq!(lan.start_bitrate(50_000_000), 50_000_000);
+        assert_eq!((lan.take_ceiling(), lan.backlogged(), lan.keyframe_gap()), (None, false, None));
+    }
+
     /// The encode thread as a stream runs it: newest frame wins, a frame the tiler failed on is
     /// tried again (or a newer one instead), requests are served without a capture.
     #[tokio::test(flavor = "multi_thread")]
@@ -3353,7 +3701,7 @@ mod tests {
         let _encoders = encoders_turn();
         let (host_conn, conn) = loopback("loop").await;
         let (w, h) = (640u32, 384u32);
-        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        let video = Arc::new(VideoOut::new(host_conn.clone(), false));
         let pipeline = pipeline(&video, w, h, (2, 1), 2.0);
         let shared = Arc::new(Shared {
             state: Mutex::default(),
@@ -3464,7 +3812,7 @@ mod tests {
     async fn dropped_keyframes_are_still_owed() {
         let _encoders = encoders_turn();
         let (host_conn, _conn) = loopback("owed").await;
-        let video = Arc::new(VideoOut::new(host_conn));
+        let video = Arc::new(VideoOut::new(host_conn, false));
         let mut pipeline = pipeline(&video, 640, 384, (2, 1), 2.0);
         let mut out = Outcome::default();
         pipeline.record(Route::Tile(0), Fate::Lost, 0, true, &mut out);
@@ -3479,7 +3827,7 @@ mod tests {
         let _encoders = encoders_turn();
         let (host_conn, conn) = loopback("nofull").await;
         let (w, h) = (640u32, 384u32);
-        let video = Arc::new(VideoOut::new(host_conn));
+        let video = Arc::new(VideoOut::new(host_conn, false));
         let mut pipeline = pipeline(&video, w, h, (2, 1), 0.5);
         let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
         tokio::task::block_in_place(|| pipeline.update(&video, Some(nv12(w as usize, h as usize, |_, x, y| (x + y) as u8)), u64::MAX, Work::default()));
@@ -3501,7 +3849,7 @@ mod tests {
         let _encoders = encoders_turn();
         let (host_conn, conn) = loopback("dirty").await;
         let (w, h) = (640u32, 384u32);
-        let video = Arc::new(VideoOut::new(host_conn));
+        let video = Arc::new(VideoOut::new(host_conn, false));
         let mut pipeline = pipeline(&video, w, h, (2, 1), 2.0);
         let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
         let update = |pipeline: &mut Pipeline, frame: CapturedFrame, touched: u64| {
@@ -3529,7 +3877,7 @@ mod tests {
         let _encoders = encoders_turn();
         let (host_conn, conn) = loopback("settle").await;
         let (w, h) = (640u32, 384u32);
-        let video = Arc::new(VideoOut::new(host_conn));
+        let video = Arc::new(VideoOut::new(host_conn, false));
         let mut pipeline = pipeline(&video, w, h, (2, 1), 2.0);
         let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
         let picture = |s: u8| nv12(w as usize, h as usize, move |p, x, y| ((x + y + p) as u8).wrapping_add(s * u8::from(x < 300)));
@@ -3553,7 +3901,7 @@ mod tests {
         let _encoders = encoders_turn();
         let (host_conn, conn) = loopback("fullrest").await;
         let (w, h) = (1280u32, 384u32);
-        let video = Arc::new(VideoOut::new(host_conn));
+        let video = Arc::new(VideoOut::new(host_conn, false));
         let mut pipeline = pipeline(&video, w, h, (4, 1), 0.5);
         let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
         // Seed `s[i]` changes tile `i` (320 px wide each).
@@ -3574,7 +3922,7 @@ mod tests {
     async fn encoders_that_keep_failing_are_made_again() {
         let _encoders = encoders_turn();
         let (host_conn, _conn) = loopback("repair").await;
-        let video = Arc::new(VideoOut::new(host_conn));
+        let video = Arc::new(VideoOut::new(host_conn, false));
         let mut pipeline = pipeline(&video, 640, 384, (2, 1), 0.5);
         pipeline.failures[1] = MAX_ENCODE_FAILURES;
         pipeline.failures[2] = MAX_ENCODE_FAILURES;
@@ -3592,7 +3940,7 @@ mod tests {
         let _encoders = encoders_turn();
         let (host_conn, conn) = loopback("quiet").await;
         let (w, h) = (640u32, 384u32);
-        let video = Arc::new(VideoOut::new(host_conn.clone()));
+        let video = Arc::new(VideoOut::new(host_conn.clone(), false));
         let pipeline = pipeline(&video, w, h, (2, 1), 2.0);
         let shared = Arc::new(Shared {
             state: Mutex::default(),

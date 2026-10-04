@@ -3,7 +3,7 @@
 # (scripts/e2e-control.sh host, record mode, launched hidden) streams a virtual display that no
 # screen here shows, LanKVM Frame Source animates that display full screen, and the headless probe
 # reads each frame's number off the decoded video. Nothing appears on this Mac's own screens but
-# the virtual display itself (next to them) and the test copies' Dock icons.
+# the virtual display itself (next to them), and the host copy's Dock icon and menu bar item.
 #
 #   scripts/latency-bench.sh [MODE [LABEL]]
 #   python3 scripts/latency-report.py target/e2e/bench/LABEL...     # compare runs side by side
@@ -16,7 +16,8 @@
 #
 # Env:
 #   APP=target/release/LanKVM.app    the build the host (and viewer) copies run, e.g. target/baseline/LanKVM.app
-#   PROBE=target/release/examples/probe   the probe build, e.g. target/baseline/probe
+#   PROBE=target/release/examples/probe   the probe build; it needs --barcode-log and --trace
+#                                    (target/baseline/probe predates them)
 #   DURATION=10                      seconds measured
 #   SIZE=2560x1600@2x REFRESH=120    the virtual display (pixels; @2x: Retina); HZ=120: Frame Source's rate
 #   VIEWER=1                         the GUI viewer copy ("LanKVM 2") instead of the probe: it shows the
@@ -157,6 +158,7 @@ for _ in {1..400}; do
     if [[ -n "$probe_pid" ]] && ! kill -0 "$probe_pid" 2>/dev/null; then
         echo "error: the probe stopped before the virtual display showed:" >&2
         cat "$OUT/probe.txt" >&2
+        tail -3 "$OUT/probe.err" >&2
         exit 1
     fi
     sleep 0.1

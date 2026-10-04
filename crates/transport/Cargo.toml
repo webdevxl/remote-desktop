@@ -10,6 +10,8 @@ tracing.workspace = true
 bytes.workspace = true
 tokio.workspace = true
 quinn.workspace = true
+# For `InvalidCid`, which quinn doesn't re-export. The same crate quinn already pulls in.
+quinn-proto = { version = "0.11", default-features = false }
 rustls.workspace = true
 rcgen.workspace = true
 serde.workspace = true

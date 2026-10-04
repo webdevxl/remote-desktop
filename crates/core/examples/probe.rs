@@ -61,12 +61,14 @@
 //!
 //! reads the number off every update decoded here, and reports per second and at the end how many
 //! source frames arrived (and how many never did), capture → decoded per update, and, joined with
-//! the source's log, source presented → decoded per frame. `--barcode-log` takes the strip's place
-//! from the source's log (its last "window" line, waited for); `--barcode` gives it in the captured
-//! display's points, converted with `--display WxH` or the display's pixels over `--barcode-scale`
-//! (default: 2 for a Retina virtual display, 1 for another, this Mac's main display's own scale).
-//! `--trace` writes a JSON line per finished update: {update, n, capture_local_us, decoded_us,
-//! tiles, bytes, new, full, motion} (n null where unreadable; new: the first update showing n).
+//! the source's log, source presented → decoded per frame (committed → decoded on a screen that
+//! reports no presentation times, as a virtual display doesn't). `--barcode-log` takes the strip's
+//! place from the source's log (its last "window" line, waited for); `--barcode` gives it in the
+//! captured display's points, converted with `--display WxH` or the display's pixels over
+//! `--barcode-scale` (default: 2 for a Retina virtual display, 1 for another, this Mac's main
+//! display's own scale). `--trace` writes a JSON line per finished update: {update, n,
+//! capture_local_us, decoded_us, tiles, bytes, new, full, motion} (n null where unreadable; new:
+//! the first update showing n; bytes null until the frame probe sees encoded sizes).
 
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Seek, Write};
@@ -631,16 +633,42 @@ struct SourceLog {
     /// The strip's place from the latest "window" line: rectangle and screen size in points,
     /// and its squares.
     strip: Option<((f64, f64, f64, f64), (f64, f64), usize)>,
-    /// Frame → when it was presented (µs, the mach clock this probe's times are on too), for the
-    /// frames that reached the screen.
-    presented: HashMap<u64, u64>,
-    /// Frames drawn.
-    frames: u64,
+    /// Frame → when it was presented (0: it never reached the screen) and committed, in µs of
+    /// the mach clock this probe's times are on too.
+    frames: HashMap<u64, (u64, u64)>,
+    /// Whether the screen reports presentation times at all: a virtual display doesn't.
+    presents: bool,
 }
 
 impl SourceLog {
     fn new(path: &str) -> Self {
-        Self { path: path.to_string(), read: 0, strip: None, presented: HashMap::new(), frames: 0 }
+        Self { path: path.to_string(), read: 0, strip: None, frames: HashMap::new(), presents: false }
+    }
+
+    /// When frame `n` reached the screen: its presentation, or on a screen that doesn't report
+    /// those, its commit (the source finished it; it shows from the next refresh or so on).
+    fn on_screen(&self, n: u64) -> Option<u64> {
+        let &(presented, committed) = self.frames.get(&n)?;
+        if self.presents { (presented > 0).then_some(presented) } else { Some(committed) }
+    }
+
+    /// What [`SourceLog::on_screen`] goes by.
+    fn basis(&self) -> &'static str {
+        if self.presents { "presented" } else { "committed" }
+    }
+
+    /// On screen → decoded, and → captured, in ms, for the frames in `shown` (as in
+    /// [`SourceFrames::shown`]) this log has by now.
+    fn delays(&self, shown: &[(u64, Option<u64>, u64)]) -> (Vec<f64>, Vec<f64>) {
+        let since = |at: u64, t: u64| (t as i64 - at as i64) as f64 / 1000.0;
+        let mut decoded = Vec::new();
+        let mut captured = Vec::new();
+        for &(n, capture, decode) in shown {
+            let Some(at) = self.on_screen(n) else { continue };
+            decoded.push(since(at, decode));
+            captured.extend(capture.map(|c| since(at, c)));
+        }
+        (decoded, captured)
     }
 
     /// Reads the lines written since the last time.
@@ -659,9 +687,10 @@ impl SourceLog {
             let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
             match v["type"].as_str() {
                 Some("frame") => {
-                    self.frames += 1;
-                    if let (Some(n), Some(at)) = (v["n"].as_u64(), v["presented_us"].as_u64().filter(|&t| t > 0)) {
-                        self.presented.insert(n, at);
+                    if let Some(n) = v["n"].as_u64() {
+                        let (presented, committed) = (v["presented_us"].as_u64().unwrap_or(0), v["commit_us"].as_u64().unwrap_or(0));
+                        self.presents |= presented > 0;
+                        self.frames.insert(n, (presented, committed));
                     }
                 }
                 Some("window") => {
@@ -1337,9 +1366,9 @@ impl Probe {
         }
     }
 
-    /// The source frames of the last second: how many showed, were skipped or late, and source
-    /// presented → decoded for those whose presentation is in the source's log by now. `before`:
-    /// the counts at the last report (frames shown, skipped, late, unread).
+    /// The source frames of the last second: how many showed, were skipped or late, and source on
+    /// screen → decoded for those in the source's log by now. `before`: the counts at the last
+    /// report (frames shown, skipped, late, unread).
     fn report_second(&mut self, before: &mut (usize, u64, u64, u64)) {
         if let Some(source) = &mut self.source {
             source.poll();
@@ -1350,14 +1379,15 @@ impl Probe {
         }
         let f = &watch.frames;
         let new = &f.shown[before.0.min(f.shown.len())..];
-        let delays = self.presented_to_decoded(new).0;
+        let delays = self.source.as_ref().map(|s| s.delays(new).0).unwrap_or_default();
         let delays = if delays.is_empty() {
             "-".to_string()
         } else {
             format!("{:.1}/{:.1}/{:.1}", percentile(&delays, 0.5), percentile(&delays, 0.95), percentile(&delays, 0.99))
         };
+        let basis = self.source.as_ref().map_or("presented", SourceLog::basis);
         println!(
-            "      source frames {:>3} new (n {}), {} skipped, {} late, {} unread  presented→decoded p50/p95/p99 {delays} ms",
+            "      source frames {:>3} new (n {}), {} skipped, {} late, {} unread  {basis}→decoded p50/p95/p99 {delays} ms",
             new.len(),
             f.newest.map_or("-".into(), |n| n.to_string()),
             f.skipped - before.1,
@@ -1365,21 +1395,6 @@ impl Probe {
             f.unread - before.3,
         );
         *before = (f.shown.len(), f.skipped, f.late, f.unread);
-    }
-
-    /// Source presented → decoded, and → captured, in ms, for the frames in `shown` whose
-    /// presentation is in the source's log.
-    fn presented_to_decoded(&self, shown: &[(u64, Option<u64>, u64)]) -> (Vec<f64>, Vec<f64>) {
-        let Some(source) = &self.source else { return Default::default() };
-        let since = |at: u64, t: u64| (t as i64 - at as i64) as f64 / 1000.0;
-        let mut decoded = Vec::new();
-        let mut captured = Vec::new();
-        for &(n, capture, decode) in shown {
-            let Some(&at) = source.presented.get(&n) else { continue };
-            decoded.push(since(at, decode));
-            captured.extend(capture.map(|c| since(at, c)));
-        }
-        (decoded, captured)
     }
 
     /// The whole watch: updates' latency, and with the strip, the source frames that showed.
@@ -1420,25 +1435,27 @@ impl Probe {
             if f.restarts > 0 { format!(", counting restarted {} times", f.restarts) } else { String::new() },
         );
         let Some(source) = &self.source else { return };
-        let (decoded, captured) = self.presented_to_decoded(&f.shown);
+        let (decoded, captured) = source.delays(&f.shown);
         if !decoded.is_empty() {
             println!(
-                "  source presented → decoded p50 {:.1} ms, p95 {:.1} ms, p99 {:.1} ms over {} frames; presented → captured p50 {:.1} ms",
+                "  source {} → decoded p50 {:.1} ms, p95 {:.1} ms, p99 {:.1} ms over {} frames; → captured p50 {:.1} ms{}",
+                source.basis(),
                 percentile(&decoded, 0.5),
                 percentile(&decoded, 0.95),
                 percentile(&decoded, 0.99),
                 decoded.len(),
-                percentile(&captured, 0.5)
+                percentile(&captured, 0.5),
+                if source.presents { "" } else { " (its screen reports no presentation times)" }
             );
         }
-        // What the source presented in that range and never showed here: skipped, or lost.
+        // What the source put on screen in that range and never showed here: skipped, or lost.
         let seen: std::collections::HashSet<u64> = f.shown.iter().map(|s| s.0).collect();
-        let presented: Vec<u64> = source.presented.keys().copied().filter(|n| (first..=newest).contains(n)).collect();
+        let on_screen: Vec<u64> = (first..=newest).filter(|&n| source.on_screen(n).is_some()).collect();
         println!(
-            "  the source presented {} frames in that range ({} drawn in all), {} of them never showed here",
-            presented.len(),
-            source.frames,
-            presented.iter().filter(|n| !seen.contains(n)).count()
+            "  the source put {} frames on screen in that range ({} drawn in all), {} of them never showed here",
+            on_screen.len(),
+            source.frames.len(),
+            on_screen.iter().filter(|n| !seen.contains(n)).count()
         );
     }
 }
@@ -2033,20 +2050,24 @@ mod tests {
     fn source_log_is_read_as_it_grows() {
         let path = std::env::temp_dir().join(format!("lankvm-probe-test-{}.jsonl", std::process::id()));
         let window = r#"{"type":"window","display_id":3,"scale":2,"screen_points":[1280,800],"strip_points":[16,16,512,32],"squares":16}"#;
-        std::fs::write(&path, format!("{window}\n{{\"type\":\"frame\",\"n\":0,\"presented_us\":1000}}\n{{\"type\":\"frame\",\"n\":1,\"pres")).unwrap();
+        let frame = |n: u64, presented: u64| format!(r#"{{"type":"frame","n":{n},"commit_us":{},"presented_us":{presented}}}"#, 100 * n);
+        std::fs::write(&path, format!("{window}\n{}\n{}", frame(0, 1000), &frame(1, 0)[..20])).unwrap();
         let mut log = SourceLog::new(path.to_str().unwrap());
         log.poll();
         assert_eq!(log.strip, Some(((16.0, 16.0, 512.0, 32.0), (1280.0, 800.0), 16)));
-        assert_eq!((log.frames, log.presented.get(&0)), (1, Some(&1000)), "the half-written line waits");
+        assert_eq!((log.frames.len(), log.on_screen(0)), (1, Some(1000)), "the half-written line waits");
         let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(file, "ented_us\":0}}\n{{\"type\":\"frame\",\"n\":2,\"presented_us\":9000}}").unwrap();
+        writeln!(file, "{}\n{}", &frame(1, 0)[20..], frame(2, 9000)).unwrap();
         log.poll();
-        assert_eq!(log.frames, 3);
-        assert_eq!((log.presented.get(&1), log.presented.get(&2)), (None, Some(&9000)), "frame 1 never reached the screen");
-        // A new run of the source starts the log over.
-        std::fs::write(&path, "{\"type\":\"frame\",\"n\":0,\"presented_us\":5}\n").unwrap();
+        assert_eq!(log.frames.len(), 3);
+        assert_eq!((log.on_screen(1), log.on_screen(2)), (None, Some(9000)), "frame 1 never reached the screen");
+        let shown = [(0, Some(1500), 4000), (1, Some(2000), 5000), (2, None, 12_500)];
+        assert_eq!(log.delays(&shown), (vec![3.0, 3.5], vec![0.5]));
+        // A new run of the source starts the log over; on a screen without presentation times
+        // (a virtual display), frames count from their commit.
+        std::fs::write(&path, format!("{}\n{}\n", frame(0, 0), frame(1, 0))).unwrap();
         log.poll();
-        assert_eq!((log.strip, log.frames, log.presented.get(&0)), (None, 1, Some(&5)));
+        assert_eq!((log.strip, log.frames.len(), log.on_screen(1), log.presents), (None, 2, Some(100), false));
         let _ = std::fs::remove_file(&path);
     }
 

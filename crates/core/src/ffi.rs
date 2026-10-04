@@ -426,6 +426,28 @@ pub extern "C" fn lk_set_allow_control(allow: bool) {
     }
 }
 
+/// Whether paired Macs may connect over the internet (saved). On asks the router to forward the
+/// port; off ends the sessions that came over the internet. Returns at once.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_set_internet_access(on: bool) {
+    if let Some(c) = core() {
+        c.set_internet_access(on);
+    }
+}
+
+/// The address paired Macs use over the internet (a dynamic DNS name or an IP, with or without
+/// a port; saved). "" (or null) clears it.
+///
+/// # Safety
+/// `address` must be null or a valid NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lk_set_public_address(address: *const c_char) {
+    let address = unsafe { arg(address) };
+    if let Some(c) = core() {
+        c.set_public_address(&address);
+    }
+}
+
 /// Whether macOS lets LanKVM post input (Privacy & Security → Accessibility).
 #[unsafe(no_mangle)]
 pub extern "C" fn lk_control_permission() -> bool {

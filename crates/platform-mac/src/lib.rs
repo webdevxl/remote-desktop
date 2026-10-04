@@ -12,6 +12,7 @@ pub mod gpu;
 pub mod inject;
 pub mod keys;
 mod nal;
+pub mod portmap;
 pub mod scaler;
 pub mod system;
 pub mod tiler;

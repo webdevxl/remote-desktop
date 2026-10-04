@@ -14,11 +14,12 @@ use protocol::{
     Arrangement, ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, DisplayChoice, DisplayReason, DisplayState, FULL_FRAME_TILE,
     HostMsg, InputMsg, MAX_TILES, PROTOCOL_VERSION, TileRect, VideoFrame,
 };
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use quinn::{Connection, ConnectionError, RecvStream, SendStream};
 use tokio::sync::mpsc;
-use transport::endpoint::peer_fingerprint;
+use transport::endpoint::{Network, peer_fingerprint};
 use transport::framing::{read_msg, write_msg};
 use transport::identity::Fingerprint;
+use transport::knock::AccessKey;
 use transport::pairing::client_start;
 use serde::Serialize;
 use transport::video::{Reassembler, tile_of};
@@ -28,6 +29,8 @@ use crate::stats::{FrameTiming, Stats, StatsView};
 use crate::view::{TileImage, ViewHandle, ViewSlot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The same over the internet, where a host that doesn't take this Mac's knock never answers.
+const CONNECT_TIMEOUT_INTERNET: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_millis(500);
 /// A tile frame missing packets for this long is considered lost even if no newer one arrives.
 const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_millis(60);
@@ -42,6 +45,13 @@ const UPDATE_TIMEOUT: Duration = Duration::from_millis(150);
 /// encoder dropped that frame (the decoder is fine) and sent this one instead.
 const SUSPECT_TIMEOUT: Duration = Duration::from_millis(150);
 const KEYFRAME_RETRY: Duration = Duration::from_millis(200);
+/// Over the internet, a frame still coming in also gets the time its size takes at what this Mac
+/// received over the last second, taken as at least this (bit/s): a still screen receives next to
+/// nothing, which says nothing about the path.
+const MIN_RECEIVE_BPS: f64 = crate::rate::FLOOR_BPS as f64;
+/// Over the internet, missing video is waited on at most this long, however slow the path or long
+/// the queue ahead of it.
+const MAX_INTERNET_WAIT: Duration = Duration::from_secs(3);
 /// While frames can't be decoded (a size this Mac's decoder doesn't take), ask for a keyframe only
 /// this often rather than flooding the host with requests that can't help.
 const UNDECODABLE_RETRY: Duration = Duration::from_secs(2);
@@ -69,6 +79,8 @@ pub struct SessionInfo {
     /// not in words.
     pub display_available: u16,
     pub display_unavailable: String,
+    /// Connected over the internet, not on the local network.
+    pub internet: bool,
 }
 
 /// The host display a session shows, as the UI sees it.
@@ -127,6 +139,8 @@ pub enum SessionEvent {
     Display { request: u32, info: SessionInfo, reason: u16, message: String },
     /// The video of this size can't be shown (e.g. this Mac can't decode it).
     StreamError { message: String, width: u32, height: u32 },
+    /// What this Mac knows about a paired host changed (how to reach it over the internet).
+    TrustChanged,
 }
 
 /// Input written per batch at most; anything more waits for the next write.
@@ -197,7 +211,7 @@ pub struct Session {
 impl Session {
     pub fn start(
         rt: &tokio::runtime::Handle,
-        endpoint: Endpoint,
+        network: Network,
         trust: Arc<Trust>,
         target: String,
         max_size: (u32, u32),
@@ -223,7 +237,7 @@ impl Session {
                     ctl: (ctl_tx, ctl_rx),
                     input_rx,
                 };
-                let result = run(endpoint, &target, ctx).await;
+                let result = run(network, &target, ctx).await;
                 let error = result.err().map(|e| format!("{e:#}"));
                 if let Some(e) = &error {
                     tracing::info!("session ended: {e}");
@@ -363,17 +377,30 @@ struct RunCtx {
     input_rx: mpsc::UnboundedReceiver<(InputMsg, u64)>,
 }
 
-async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
+async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     let addr = resolve(target).await?;
-    let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(addr, "lankvm")?)
-        .await
-        .map_err(|_| anyhow!("no answer from {addr} — is LanKVM running there?"))?
-        .context("connect")?;
+    let internet = network.gate.is_internet(addr);
+    let conn = if internet {
+        connect_over_internet(&network, target, addr, &ctx.trust).await?
+    } else {
+        tokio::time::timeout(CONNECT_TIMEOUT, network.endpoint.connect(addr, "lankvm")?)
+            .await
+            .map_err(|_| anyhow!("no answer from {addr} — is LanKVM running there?"))?
+            .context("connect")?
+    };
     *ctx.conn_slot.lock().unwrap() = Some(conn.clone());
     let host_fp = peer_fingerprint(&conn).context("host sent no certificate")?;
     let trusts_host = ctx.trust.hosts.lock().unwrap().contains(&host_fp);
+    // Forgotten while connecting.
+    if internet && !trusts_host {
+        conn.close(0u32.into(), b"");
+        bail!("The Mac at {target} isn't the one this Mac paired with.");
+    }
 
-    let (mut send, mut recv) = conn.open_bi().await?;
+    // From here until the host says what it shows, a close without a word means it turned this
+    // Mac away.
+    let away = |e| turned_away(e, &conn, internet, target);
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| away(e.into()))?;
     let hello = ClientMsg::Hello {
         version: PROTOCOL_VERSION,
         device_name: system::device_name(),
@@ -382,9 +409,9 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
         fps: ctx.max_fps,
         trusts_host,
     };
-    write_msg(&mut send, &hello).await?;
+    write_msg(&mut send, &hello).await.map_err(away)?;
     let info = loop {
-        match read_msg::<HostMsg>(&mut recv).await?.context("host closed the connection")? {
+        match read_msg::<HostMsg>(&mut recv).await.map_err(away)?.context("host closed the connection")? {
             HostMsg::Welcome { device_name, width, height, fps, codec } => {
                 if !trusts_host {
                     ctx.trust.hosts.lock().unwrap().add(host_fp, &device_name)?;
@@ -402,7 +429,15 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
                     display: DisplayView::new(&DisplayChoice::Main, (width, height), fps),
                     display_available: DisplayReason::NONE.0,
                     display_unavailable: String::new(),
+                    internet,
                 };
+            }
+            // Never over the internet: a host there only asks if something is off (it forgot
+            // this Mac), and a code typed here would be guessable from anywhere.
+            HostMsg::PairingRequired if internet => {
+                conn.close(0u32.into(), b"pairing needs the local network");
+                let host = host_name(&ctx.trust, &host_fp).unwrap_or_else(|| target.to_string());
+                bail!("{host} asked for a pairing code. Pairing only works on the same network: connect to it there first.");
             }
             HostMsg::PairingRequired => {
                 (ctx.events)(SessionEvent::PinNeeded);
@@ -429,7 +464,8 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
     let mut info = info;
     let first = tokio::time::timeout(FIRST_DISPLAY_TIMEOUT, read_msg::<HostMsg>(&mut recv))
         .await
-        .map_err(|_| anyhow!("{} didn't say what it shows", info.host_name))??
+        .map_err(|_| anyhow!("{} didn't say what it shows", info.host_name))?
+        .map_err(away)?
         .context("host closed the connection")?;
     let early = match first {
         HostMsg::Display(state) => {
@@ -438,12 +474,18 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
         }
         other => Some(other),
     };
-    let RunCtx { shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, .. } = ctx;
+    let RunCtx { trust, shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, .. } = ctx;
     tracing::info!(?info, "connected");
+    // Where it was reached, to try first next time (and show under Paired Devices).
+    let remembered = internet && trust.internet_hosts.lock().unwrap().remember_used(&host_fp, target);
     *shared.info.lock().unwrap() = Some(info.clone());
     events(SessionEvent::Connected(info));
+    if remembered {
+        events(SessionEvent::TrustChanged);
+    }
+    let host = PairedHost { trust, fingerprint: host_fp };
     if let Some(msg) = early {
-        handle_host_msg(msg, &shared, &events);
+        handle_host_msg(msg, &shared, &events, &host);
     }
 
     // Control stream: one writer task fed by a channel (pings, keyframe requests and the app's
@@ -459,7 +501,7 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
         let (shared, events) = (shared.clone(), events.clone());
         async move {
             while let Ok(Some(msg)) = read_msg::<HostMsg>(&mut recv).await {
-                handle_host_msg(msg, &shared, &events);
+                handle_host_msg(msg, &shared, &events, &host);
             }
         }
     });
@@ -484,7 +526,7 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
         }
     });
 
-    let result = receive_video(&conn, &shared, &ctl_tx, &events).await;
+    let result = receive_video(&conn, internet, &shared, &ctl_tx, &events).await;
     pinger.abort();
     reader.abort();
     writer.abort();
@@ -493,7 +535,88 @@ async fn run(endpoint: Endpoint, target: &str, mut ctx: RunCtx) -> Result<()> {
     result
 }
 
-fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents) {
+/// Connects to a host outside the local network. It answers only a knock made with the key it
+/// gave this Mac, so each paired host `target` may be gets a try with its key, all at once; the
+/// first to answer, and to be that host, wins.
+async fn connect_over_internet(network: &Network, target: &str, addr: SocketAddr, trust: &Trust) -> Result<Connection> {
+    let (candidates, any_key) = {
+        let internet = trust.internet_hosts.lock().unwrap();
+        let hosts = trust.hosts.lock().unwrap();
+        (internet.candidates(target, addr, &hosts), internet.any_key(&hosts))
+    };
+    if candidates.is_empty() && any_key {
+        // Every paired host said it is somewhere else.
+        bail!(
+            "This Mac doesn't know {target} as the address of a Mac it paired with. Connect to that Mac on the same network once, \
+             so it can tell this Mac where to reach it, then connect over the internet."
+        );
+    }
+    if candidates.is_empty() {
+        bail!(
+            "This Mac hasn't paired with a Mac at {target} yet. Pair on the same network first: connect to it there and enter its code. \
+             After that, you can connect over the internet."
+        );
+    }
+    let mut attempts = tokio::task::JoinSet::new();
+    for (host_fp, key) in candidates {
+        let connecting = network.endpoint.connect_with(network.internet_client_config(key), addr, "lankvm").context("connect")?;
+        attempts.spawn(async move { (host_fp, connecting.await) });
+    }
+    // Dropping the set (an answer, or the timeout) gives up on the other attempts.
+    let race = async move {
+        let (mut impostor, mut refused) = (false, None);
+        while let Some(attempt) = attempts.join_next().await {
+            let Ok((host_fp, result)) = attempt else { continue };
+            match result {
+                Ok(conn) if peer_fingerprint(&conn) == Some(host_fp) => return Ok(conn),
+                Ok(conn) => {
+                    conn.close(0u32.into(), b"");
+                    impostor = true;
+                }
+                Err(e) => refused = Some(e),
+            }
+        }
+        Err((impostor, refused))
+    };
+    match tokio::time::timeout(CONNECT_TIMEOUT_INTERNET, race).await {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err((true, _))) => bail!("The Mac at {target} isn't the one this Mac paired with."),
+        // A host that takes the knock but not this Mac's certificate closes once the handshake
+        // is over, which is after it is over here: see `turned_away`.
+        Ok(Err((false, Some(e)))) => Err(e).context("connect"),
+        Ok(Err((false, None))) | Err(_) => bail!(
+            "No answer from {target}. On that Mac, check that internet access is on (This Mac in LanKVM) and that its router \
+             forwards UDP port {} to it. Its public address may also have changed.",
+            addr.port()
+        ),
+    }
+}
+
+/// `e`, unless the host closed the connection without a word over the internet: it took this
+/// Mac's knock but not its certificate (it forgot this Mac while it connected, or this Mac's
+/// identity is new), and says nothing more to a device it doesn't know.
+fn turned_away(e: anyhow::Error, conn: &Connection, internet: bool, target: &str) -> anyhow::Error {
+    match conn.close_reason() {
+        Some(ConnectionError::ApplicationClosed(close)) if internet && close.error_code.into_inner() == 0 && close.reason.is_empty() => anyhow!(
+            "The Mac at {target} turned this Mac away. Connect to it on the same network once more, then try again over the internet."
+        ),
+        _ => e,
+    }
+}
+
+/// The name this Mac paired with `host` under.
+fn host_name(trust: &Trust, host: &Fingerprint) -> Option<String> {
+    let hosts = trust.hosts.lock().unwrap();
+    hosts.entries().iter().find(|(fp, _)| fp == host).map(|(_, name)| name.clone()).filter(|name| !name.is_empty())
+}
+
+/// The host a session talks to, for what it tells this Mac to remember about it.
+struct PairedHost {
+    trust: Arc<Trust>,
+    fingerprint: Fingerprint,
+}
+
+fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents, host: &PairedHost) {
     match msg {
         HostMsg::Pong { client_time_us, host_time_us } => {
             shared.stats.lock().unwrap().clock.add(client_time_us, clock::now_us(), host_time_us);
@@ -521,6 +644,18 @@ fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents) {
         HostMsg::InputAck { seq, received_us, injected_us } => shared.stats.lock().unwrap().on_input_ack(seq, received_us, injected_us),
         HostMsg::Display(state) => on_display(state, shared, events),
         HostMsg::VideoIdle { update, mask } => *shared.video_idle.lock().unwrap() = Some((update, mask)),
+        HostMsg::InternetAccess { key, addresses } => {
+            let Ok(key) = AccessKey::try_from(key.as_slice()) else {
+                tracing::warn!(len = key.len(), "ignoring an internet access key of the wrong size");
+                return;
+            };
+            // Before the lock: a host sending a great many costs next to nothing.
+            let addresses = crate::internet::clean_announced(addresses);
+            tracing::info!(?addresses, "host's internet addresses");
+            if host.trust.internet_hosts.lock().unwrap().set_announced(host.fingerprint, key, addresses) {
+                events(SessionEvent::TrustChanged);
+            }
+        }
         other => tracing::debug!("ignoring {other:?}"),
     }
 }
@@ -681,8 +816,10 @@ struct TileState {
 ///
 /// Each tile is reassembled and decoded on its own. Decoding is asynchronous, so this task only
 /// queues frames and never waits for the hardware; the decoder callbacks hand tiles to the view.
+/// Over the `internet`, it waits on missing video in step with the round trip (see [`Timeouts`]).
 async fn receive_video(
     conn: &Connection,
+    internet: bool,
     shared: &Arc<Shared>,
     ctl: &mpsc::UnboundedSender<ClientMsg>,
     events: &SessionEvents,
@@ -705,6 +842,9 @@ async fn receive_video(
     // What the view was last told about tiles waiting for a keyframe.
     let mut waiting = 0u64;
     let mut canvas = CanvasRepair::default();
+    let mut timeouts = Timeouts::LAN;
+    // Over the internet, when the last video came (see [`Timeouts::internet`]).
+    let mut last_video = Instant::now();
 
     loop {
         tokio::select! {
@@ -715,6 +855,9 @@ async fn receive_video(
                     Err(e) => return Err(e).context("connection lost"),
                 };
                 let Some(t) = tile_of(&datagram) else { continue };
+                if internet {
+                    last_video = Instant::now();
+                }
                 let Some(frame) = tiles[usize::from(t)].reassembler.push(&datagram) else { continue };
                 let received_us = clock::now_us();
                 let now = Instant::now();
@@ -742,6 +885,7 @@ async fn receive_video(
                     stream = Some(size);
                     reported_undecodable = None;
                     needs = KeyframeNeeds::new(now, Some(size));
+                    needs.pace(&timeouts);
                     other_size = OtherSize::default();
                     suspects = [None; MAX_TILES];
                     rects = [None; MAX_TILES];
@@ -753,7 +897,7 @@ async fn receive_video(
                 } else if stream != Some(size) {
                     // A straggler from the picture before, or the next picture whose keyframes
                     // were lost: nothing to decode it with either way.
-                    if other_size.frame(size, frame.skipped > 0, now) {
+                    if other_size.frame(size, frame.skipped > 0, now, timeouts.keyframe_retry) {
                         tracing::debug!(?size, ?stream, "frames of another size keep coming");
                         send_keyframe_request(shared, ctl, ClientMsg::RequestKeyframe);
                     }
@@ -786,7 +930,7 @@ async fn receive_video(
                 // may be a resend of it.
                 let cutoff = frame.first_seen.checked_sub(Duration::from_micros(500));
                 suspect(missing.tiles & !video.tile.bit(), &mut suspects, &mut needs, &tiles, cutoff, now);
-                request_keyframes(&mut needs, &mut tiles, shared, ctl);
+                request_keyframes(&mut needs, &mut tiles, &timeouts, shared, ctl);
 
                 if video.keyframe {
                     let tile = &mut tiles[usize::from(t)];
@@ -833,7 +977,7 @@ async fn receive_video(
                 }
                 if needs.needs(t) {
                     needs.frame_while_needed(t, now);
-                    request_keyframes(&mut needs, &mut tiles, shared, ctl);
+                    request_keyframes(&mut needs, &mut tiles, &timeouts, shared, ctl);
                     continue;
                 }
                 let tile = &mut tiles[usize::from(t)];
@@ -864,7 +1008,7 @@ async fn receive_video(
                     shared.slot.tile_failed(t, video.update);
                     tile.decoder = None;
                     needs.lost(t);
-                    request_keyframes(&mut needs, &mut tiles, shared, ctl);
+                    request_keyframes(&mut needs, &mut tiles, &timeouts, shared, ctl);
                 }
             }
             Some(failed) = failed_rx.recv() => {
@@ -888,14 +1032,19 @@ async fn receive_video(
                     }
                 }
                 needs.lost(failed.tile);
-                request_keyframes(&mut needs, &mut tiles, shared, ctl);
+                request_keyframes(&mut needs, &mut tiles, &timeouts, shared, ctl);
             }
             _ = check.tick() => {
                 let now = Instant::now();
+                if internet {
+                    let receiving = shared.stats.lock().unwrap().mbps() * 1e6;
+                    timeouts = Timeouts::internet(conn.rtt(), receiving, now.saturating_duration_since(last_video));
+                    needs.pace(&timeouts);
+                }
                 flush_display(shared, events, None);
                 // Updates nothing newer followed: the screen went still, so what they still miss
                 // isn't coming.
-                for t in tiles_in(meter.flush_stale(now, |bytes| shared.stats.lock().unwrap().on_frame_received(bytes))) {
+                for t in tiles_in(meter.flush_stale(now, timeouts.update, |bytes| shared.stats.lock().unwrap().on_frame_received(bytes))) {
                     needs.seen(t);
                     // One still coming in is left to its own (size-aware) timeout below.
                     if tiles[usize::from(t)].reassembler.oldest_partial().is_none() {
@@ -914,7 +1063,7 @@ async fn receive_video(
                     suspect(missing.tiles, &mut suspects, &mut needs, &tiles, None, now);
                 }
                 for (t, since) in suspects.iter_mut().enumerate() {
-                    if since.is_some_and(|at| now.duration_since(at) >= SUSPECT_TIMEOUT) {
+                    if since.is_some_and(|at| now.duration_since(at) >= timeouts.suspect) {
                         *since = None;
                         // One still coming in is left to its own (size-aware) timeout below.
                         if tiles[t].reassembler.oldest_partial().is_none() {
@@ -924,8 +1073,7 @@ async fn receive_video(
                 }
                 let mut unknown = 0u64;
                 for (t, tile) in tiles.iter_mut().enumerate() {
-                    let timeout = if t == usize::from(FULL_FRAME_TILE) { FULL_PARTIAL_FRAME_TIMEOUT } else { PARTIAL_FRAME_TIMEOUT };
-                    if !tile.reassembler.has_stale_partial(timeout) {
+                    if !timeouts.stale(&tile.reassembler, t == usize::from(FULL_FRAME_TILE), now) {
                         continue;
                     }
                     if needs.is_seen(t as u8) {
@@ -941,12 +1089,12 @@ async fn receive_video(
                 if unknown != 0 {
                     send_keyframe_request(shared, ctl, ClientMsg::RequestKeyframes { tiles: unknown });
                 }
-                if canvas.due(shared.slot.take_canvas_lost(), now) {
+                if canvas.due(shared.slot.take_canvas_lost(), now, timeouts.keyframe_retry) {
                     // The decoders are fine, only the picture they drew is gone: every tile again.
                     tracing::info!("view lost its picture: asking for every tile");
                     send_keyframe_request(shared, ctl, ClientMsg::RequestKeyframe);
                 }
-                request_keyframes(&mut needs, &mut tiles, shared, ctl);
+                request_keyframes(&mut needs, &mut tiles, &timeouts, shared, ctl);
             }
         }
         // Updates needn't wait for tiles whose frames are dropped until their keyframe comes.
@@ -957,8 +1105,89 @@ async fn receive_video(
     }
 }
 
+/// How long missing video may take before it counts as lost, and how often a keyframe is asked
+/// for again. On the local network, the constants above. Over the internet they grow with the
+/// round trip, with the size of a frame still coming in, and while video keeps coming in: a frame
+/// still on its way there isn't lost, and asking for it again would cost a keyframe, bigger
+/// still, that takes longer yet to come (and so on: a keyframe storm).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Timeouts {
+    /// A tile frame missing packets (the full frame's apart).
+    partial: Duration,
+    full_partial: Duration,
+    /// Over the internet, frames also get the time their size takes at this rate (bit/s).
+    receive_bps: Option<f64>,
+    /// An update missing tiles (see [`UpdateMeter`]), and a tile an update said it sent.
+    update: Duration,
+    suspect: Duration,
+    keyframe_retry: Duration,
+    /// Before every tile of a new stream is asked for again (see [`KeyframeNeeds`]).
+    all_retry: Duration,
+}
+
+impl Timeouts {
+    const LAN: Self = Self {
+        partial: PARTIAL_FRAME_TIMEOUT,
+        full_partial: FULL_PARTIAL_FRAME_TIMEOUT,
+        receive_bps: None,
+        update: UPDATE_TIMEOUT,
+        suspect: SUSPECT_TIMEOUT,
+        keyframe_retry: KEYFRAME_RETRY,
+        all_retry: KEYFRAME_RETRY,
+    };
+
+    /// Over the internet, with a round trip of `rtt`, `receive_bps` received over the last second,
+    /// and the last video `quiet` ago. Tiles of an update may wait in the host's send buffer behind
+    /// the others for long after a round trip (a stream's first keyframes take seconds at a few
+    /// Mbit/s): while video keeps coming in, none of them is missing yet, and the first keyframes
+    /// of a stream may be among it (up to [`MAX_INTERNET_WAIT`]). (A tile an update said it sent
+    /// is suspected only once something sent after it arrived: the host's buffer sends in order.)
+    fn internet(rtt: Duration, receive_bps: f64, quiet: Duration) -> Self {
+        let update = UPDATE_TIMEOUT + rtt * 2;
+        let arriving = quiet < update;
+        let keyframe_retry = KEYFRAME_RETRY.max(rtt * 3);
+        Self {
+            partial: PARTIAL_FRAME_TIMEOUT + rtt * 2,
+            full_partial: FULL_PARTIAL_FRAME_TIMEOUT + rtt * 2,
+            receive_bps: Some(receive_bps.max(MIN_RECEIVE_BPS)),
+            update: if arriving { update.max(MAX_INTERNET_WAIT) } else { update },
+            suspect: SUSPECT_TIMEOUT + rtt * 2,
+            keyframe_retry,
+            all_retry: if arriving { keyframe_retry.max(MAX_INTERNET_WAIT) } else { keyframe_retry },
+        }
+    }
+
+    /// How long a frame of `len` bytes (of the full-frame stream if `full`) may take to come in
+    /// whole, from its first packet.
+    fn partial_for(&self, full: bool, len: u32) -> Duration {
+        let base = if full { self.full_partial } else { self.partial };
+        match self.receive_bps {
+            None => base,
+            Some(bps) => (base + Duration::from_secs_f64(f64::from(len) * 8.0 / bps)).min(MAX_INTERNET_WAIT),
+        }
+    }
+
+    /// Whether a frame of `reassembler`'s (a tile's, or the full frame's if `full`) has been
+    /// missing packets for too long. Over the internet, only once none is still coming in: the
+    /// newest may be the keyframe that repairs the tile, and once it completes (or is given up on
+    /// too) frames skipped before it show anyway.
+    fn stale(&self, reassembler: &Reassembler, full: bool, now: Instant) -> bool {
+        match self.receive_bps {
+            None => reassembler.has_stale_partial(if full { self.full_partial } else { self.partial }),
+            Some(_) => reassembler.partials().next().is_some() && !self.coming_in(reassembler, full, now),
+        }
+    }
+
+    /// Over the internet, whether a frame of `reassembler`'s is still coming in, within its time
+    /// (never on the local network).
+    fn coming_in(&self, reassembler: &Reassembler, full: bool, now: Instant) -> bool {
+        self.receive_bps.is_some() && reassembler.partials().any(|(since, len)| now.duration_since(since) <= self.partial_for(full, len))
+    }
+}
+
 /// Asks the host for every tile again when the view lost its picture: at most every
-/// [`KEYFRAME_RETRY`], so a view that keeps failing doesn't turn the stream into keyframes.
+/// [`KEYFRAME_RETRY`] (see [`Timeouts`]), so a view that keeps failing doesn't turn the stream
+/// into keyframes.
 #[derive(Default)]
 struct CanvasRepair {
     pending: bool,
@@ -967,10 +1196,10 @@ struct CanvasRepair {
 
 impl CanvasRepair {
     /// `lost`: the view lost (part of) its picture since the last call. Returns whether to ask
-    /// for every tile now.
-    fn due(&mut self, lost: bool, now: Instant) -> bool {
+    /// for every tile now, at most every `retry`.
+    fn due(&mut self, lost: bool, now: Instant, retry: Duration) -> bool {
         self.pending |= lost;
-        if !self.pending || self.asked.is_some_and(|at| now.duration_since(at) < KEYFRAME_RETRY) {
+        if !self.pending || self.asked.is_some_and(|at| now.duration_since(at) < retry) {
             return false;
         }
         self.pending = false;
@@ -1026,11 +1255,23 @@ fn suspect(
 }
 
 /// Sends a keyframe request for the tiles that need one now, if any, and forgets their partial
-/// frames (the keyframe replaces them).
-fn request_keyframes(needs: &mut KeyframeNeeds, tiles: &mut [TileState], shared: &Shared, ctl: &mpsc::UnboundedSender<ClientMsg>) {
-    let Some((msg, asked)) = needs.due(Instant::now()) else { return };
+/// frames (the keyframe replaces them). Over the internet, not while one is still coming in (see
+/// [`Timeouts::coming_in`]): it may be the keyframe asked for last time, which is taking longer to
+/// come than asking again does; forgetting it would only have the host send it again, and again.
+fn request_keyframes(
+    needs: &mut KeyframeNeeds,
+    tiles: &mut [TileState],
+    timeouts: &Timeouts,
+    shared: &Shared,
+    ctl: &mpsc::UnboundedSender<ClientMsg>,
+) {
+    let now = Instant::now();
+    let Some((msg, asked)) = needs.due(now) else { return };
     for t in tiles_in(asked) {
-        tiles[usize::from(t)].reassembler.clear_partial();
+        let reassembler = &mut tiles[usize::from(t)].reassembler;
+        if !timeouts.coming_in(reassembler, t == FULL_FRAME_TILE, now) {
+            reassembler.clear_partial();
+        }
     }
     send_keyframe_request(shared, ctl, msg);
 }
@@ -1064,6 +1305,11 @@ struct KeyframeNeeds {
     asked: [Option<Instant>; MAX_TILES],
     /// The full-frame stream doesn't decode here, and the host was told to stop using it.
     full_off: bool,
+    /// How often to ask again: [`KEYFRAME_RETRY`], longer over the internet (see [`Timeouts`]).
+    retry: Duration,
+    /// The same for every tile while `all`: over the internet, longer still while video keeps
+    /// coming in.
+    retry_all: Duration,
 }
 
 impl KeyframeNeeds {
@@ -1081,7 +1327,15 @@ impl KeyframeNeeds {
             undecodable: 0,
             asked: [None; MAX_TILES],
             full_off: false,
+            retry: KEYFRAME_RETRY,
+            retry_all: KEYFRAME_RETRY,
         }
+    }
+
+    /// Asks (again) at the pace of `timeouts`.
+    fn pace(&mut self, timeouts: &Timeouts) {
+        self.retry = timeouts.keyframe_retry;
+        self.retry_all = timeouts.all_retry;
     }
 
     /// The tiles that had a frame of this stream (see `seen`).
@@ -1135,7 +1389,7 @@ impl KeyframeNeeds {
     /// A frame of tile `t` came while it waits for a keyframe. Full frames keep coming without
     /// one long after it was asked for: the host didn't get the request, so ask again.
     fn frame_while_needed(&mut self, t: u8, now: Instant) {
-        let retry = if self.undecodable & (1u64 << t) != 0 { UNDECODABLE_RETRY } else { KEYFRAME_RETRY };
+        let retry = if self.undecodable & (1u64 << t) != 0 { UNDECODABLE_RETRY } else { self.retry };
         if t == FULL_FRAME_TILE && self.asked[usize::from(t)].is_some_and(|at| now.duration_since(at) >= retry) {
             self.asked[usize::from(t)] = None;
         }
@@ -1175,7 +1429,7 @@ impl KeyframeNeeds {
     /// Mac can't decode. (The full frame doesn't count: tiles may decode where it doesn't.)
     fn all_retry(&self) -> Duration {
         let waiting = self.seen & !self.started & !(1u64 << FULL_FRAME_TILE);
-        if waiting != 0 && waiting & !self.undecodable == 0 { UNDECODABLE_RETRY } else { KEYFRAME_RETRY }
+        if waiting != 0 && waiting & !self.undecodable == 0 { UNDECODABLE_RETRY } else { self.retry_all }
     }
 
     /// The request to send now, if any, with the tiles it asks for: each tile at most every
@@ -1192,7 +1446,7 @@ impl KeyframeNeeds {
             if self.need & self.seen & bit == 0 || (t == usize::from(FULL_FRAME_TILE) && self.asked[t].is_some()) {
                 continue;
             }
-            let retry = if self.undecodable & bit != 0 { UNDECODABLE_RETRY } else { KEYFRAME_RETRY };
+            let retry = if self.undecodable & bit != 0 { UNDECODABLE_RETRY } else { self.retry };
             if self.asked[t].is_none_or(|at| now.duration_since(at) >= retry) {
                 tiles |= bit;
             }
@@ -1227,14 +1481,14 @@ struct OtherSize {
 
 impl OtherSize {
     /// A frame of `size` came (after `lost_before`: its tile lost frames before it, maybe its
-    /// keyframe). Returns whether to ask for keyframes of every tile now.
-    fn frame(&mut self, size: (u32, u32), lost_before: bool, now: Instant) -> bool {
+    /// keyframe). Returns whether to ask for keyframes of every tile now (at most every `retry`).
+    fn frame(&mut self, size: (u32, u32), lost_before: bool, now: Instant, retry: Duration) -> bool {
         let since = match self.since {
             Some((s, at)) if s == size => at,
             _ => self.since.insert((size, now)).1,
         };
-        let lasting = lost_before || now.duration_since(since) >= KEYFRAME_RETRY;
-        let due = lasting && self.asked.is_none_or(|at| now.duration_since(at) >= KEYFRAME_RETRY);
+        let lasting = lost_before || now.duration_since(since) >= retry;
+        let due = lasting && self.asked.is_none_or(|at| now.duration_since(at) >= retry);
         if due {
             self.asked = Some(now);
         }
@@ -1375,9 +1629,10 @@ impl UpdateMeter {
         missing
     }
 
-    /// Reports an update whose missing tiles are too late to wait for; returns them.
-    fn flush_stale(&mut self, now: Instant, mut report: impl FnMut(usize)) -> u64 {
-        match self.pending.take_if(|p| now.duration_since(p.since) >= UPDATE_TIMEOUT) {
+    /// Reports an update whose missing tiles are too late to wait for (after `timeout`, see
+    /// [`UPDATE_TIMEOUT`]); returns them.
+    fn flush_stale(&mut self, now: Instant, timeout: Duration, mut report: impl FnMut(usize)) -> u64 {
+        match self.pending.take_if(|p| now.duration_since(p.since) >= timeout) {
             Some(p) => {
                 report(p.bytes);
                 p.mask & !p.got
@@ -1656,19 +1911,19 @@ mod tests {
         let ms = |ms| t0 + Duration::from_millis(ms);
         let mut other = OtherSize::default();
         // Stragglers of the picture before: a few, for a moment.
-        assert!(!other.frame((640, 480), false, ms(0)));
-        assert!(!other.frame((640, 480), false, ms(30)));
+        assert!(!other.frame((640, 480), false, ms(0), KEYFRAME_RETRY));
+        assert!(!other.frame((640, 480), false, ms(30), KEYFRAME_RETRY));
         // The next picture's P-frames keep coming: its keyframes were lost.
-        assert!(!other.frame((800, 600), false, ms(100)));
-        assert!(!other.frame((800, 600), false, ms(250)));
-        assert!(other.frame((800, 600), false, ms(300)));
-        assert!(!other.frame((800, 600), false, ms(400)), "paced");
-        assert!(other.frame((800, 600), false, ms(500)));
+        assert!(!other.frame((800, 600), false, ms(100), KEYFRAME_RETRY));
+        assert!(!other.frame((800, 600), false, ms(250), KEYFRAME_RETRY));
+        assert!(other.frame((800, 600), false, ms(300), KEYFRAME_RETRY));
+        assert!(!other.frame((800, 600), false, ms(400), KEYFRAME_RETRY), "paced");
+        assert!(other.frame((800, 600), false, ms(500), KEYFRAME_RETRY));
         // A frame whose tile lost frames before it asks at once (paced all the same).
         let mut other = OtherSize::default();
-        assert!(other.frame((800, 600), true, ms(0)));
-        assert!(!other.frame((800, 600), true, ms(100)));
-        assert!(other.frame((800, 600), true, ms(200)));
+        assert!(other.frame((800, 600), true, ms(0), KEYFRAME_RETRY));
+        assert!(!other.frame((800, 600), true, ms(100), KEYFRAME_RETRY));
+        assert!(other.frame((800, 600), true, ms(200), KEYFRAME_RETRY));
     }
 
     /// Runs `steps` of (update, mask, tile, bytes) through a meter: the bytes reported, and the
@@ -1720,11 +1975,11 @@ mod tests {
         let none = Missing::default();
         assert_eq!(meter.add(1, 0b1111, 0, 1 << 0, 100, t0, |b| out.push(b)), none);
         assert_eq!(meter.add(1, 0b1111, 0, 1 << 3, 100, t0, |b| out.push(b)), none);
-        assert_eq!(meter.flush_stale(t0 + UPDATE_TIMEOUT / 2, |b| out.push(b)), 0);
+        assert_eq!(meter.flush_stale(t0 + UPDATE_TIMEOUT / 2, UPDATE_TIMEOUT, |b| out.push(b)), 0);
         assert!(out.is_empty());
-        assert_eq!(meter.flush_stale(t0 + UPDATE_TIMEOUT, |b| out.push(b)), 0b0110, "tiles 1 and 2 never came");
+        assert_eq!(meter.flush_stale(t0 + UPDATE_TIMEOUT, UPDATE_TIMEOUT, |b| out.push(b)), 0b0110, "tiles 1 and 2 never came");
         assert_eq!(out, vec![200]);
-        assert_eq!(meter.flush_stale(t0 + UPDATE_TIMEOUT * 2, |b| out.push(b)), 0, "found once");
+        assert_eq!(meter.flush_stale(t0 + UPDATE_TIMEOUT * 2, UPDATE_TIMEOUT, |b| out.push(b)), 0, "found once");
         // Its tile shows up after all: bytes go with the next update, not as a frame.
         assert_eq!(meter.add(1, 0b1111, 0, 1 << 1, 7, t0, |b| out.push(b)), none);
         assert_eq!(meter.add(2, 0b1, 0b1111, 1 << 0, 1, t0, |b| out.push(b)), none, "update 1 was already reported");
@@ -1816,7 +2071,7 @@ mod tests {
         // The last update before the screen went still is 3: tile 1 isn't coming.
         assert_eq!(meter.idle(3, 0b111, |b| out.push(b)), Missing { tiles: 0b010, unknown: false });
         assert_eq!(out, vec![20]);
-        assert_eq!(meter.flush_stale(now + UPDATE_TIMEOUT, |b| out.push(b)), 0, "not twice");
+        assert_eq!(meter.flush_stale(now + UPDATE_TIMEOUT, UPDATE_TIMEOUT, |b| out.push(b)), 0, "not twice");
         // Update 4 (tiles 5 and 6) never came at all.
         assert_eq!(meter.idle(4, 0b110_0000, |_| {}), Missing { tiles: 0b110_0000, unknown: false });
         assert_eq!(meter.idle(4, 0b110_0000, |_| {}), Missing::default(), "said once");
@@ -1827,15 +2082,109 @@ mod tests {
     }
 
     #[test]
+    fn over_the_internet_timeouts_grow_with_the_round_trip() {
+        let ms = Duration::from_millis;
+        let quiet = Duration::from_secs(1);
+        // A short round trip: a little more patience than on the local network.
+        let near = Timeouts::internet(ms(10), 0.0, quiet);
+        let expected = Timeouts {
+            partial: ms(80),
+            full_partial: ms(270),
+            receive_bps: Some(MIN_RECEIVE_BPS),
+            update: ms(170),
+            suspect: ms(170),
+            keyframe_retry: ms(200),
+            all_retry: ms(200),
+        };
+        assert_eq!(near, expected);
+        let far = Timeouts::internet(ms(150), 4e6, quiet);
+        let expected = Timeouts {
+            partial: ms(360),
+            full_partial: ms(550),
+            receive_bps: Some(4e6),
+            update: ms(450),
+            suspect: ms(450),
+            keyframe_retry: ms(450),
+            all_retry: ms(450),
+        };
+        assert_eq!(far, expected);
+        // Keyframes are asked for again at that pace.
+        let t0 = Instant::now();
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.pace(&far);
+        assert_eq!(requested(needs.due(t0 + KEYFRAME_RETRY)), None);
+        assert_eq!(requested(needs.due(t0 + far.keyframe_retry)), Some(u64::MAX));
+        let mut canvas = CanvasRepair::default();
+        assert!(canvas.due(true, t0, far.keyframe_retry));
+        assert!(!canvas.due(true, t0 + KEYFRAME_RETRY, far.keyframe_retry));
+        // The local network keeps its constants.
+        assert_eq!(Timeouts::LAN.partial, PARTIAL_FRAME_TIMEOUT);
+        assert_eq!(Timeouts::LAN.keyframe_retry, KEYFRAME_RETRY);
+        assert_eq!(Timeouts::LAN.partial_for(false, 1 << 20), PARTIAL_FRAME_TIMEOUT);
+    }
+
+    #[test]
+    fn over_the_internet_a_frame_gets_the_time_its_size_takes() {
+        let ms = Duration::from_millis;
+        let close = |a: Duration, b: Duration| a.abs_diff(b) < Duration::from_micros(1);
+        // 25 KB at 2 Mbit/s: 100 ms on top of the round trip's allowance.
+        let timeouts = Timeouts::internet(ms(10), 2e6, Duration::from_secs(1));
+        assert!(close(timeouts.partial_for(false, 25_000), ms(180)));
+        assert!(close(timeouts.partial_for(true, 25_000), ms(370)));
+        // A still screen received next to nothing: taken as the floor's rate.
+        let still = Timeouts::internet(ms(10), 1e3, Duration::from_secs(1));
+        assert!(close(still.partial_for(false, 75_000), ms(480)));
+        // However slow, given up on within a few seconds.
+        assert_eq!(still.partial_for(false, 10_000_000), MAX_INTERNET_WAIT);
+
+        // A keyframe of 100 packets, its first one in.
+        let packets = transport::video::Packetizer::for_tile(3).packetize(&vec![7u8; 100 * 1_100], 1_200).unwrap();
+        let mut reassembler = Reassembler::new();
+        assert!(reassembler.push(&packets[0]).is_none());
+        let now = Instant::now();
+        assert!(timeouts.coming_in(&reassembler, false, now) && !timeouts.stale(&reassembler, false, now));
+        let later = now + timeouts.partial_for(false, 100 * 1_100) + ms(1);
+        assert!(!timeouts.coming_in(&reassembler, false, later) && timeouts.stale(&reassembler, false, later));
+        // On the local network, a frame is never kept for still coming in.
+        assert!(!Timeouts::LAN.coming_in(&reassembler, false, now));
+    }
+
+    #[test]
+    fn over_the_internet_tiles_still_coming_in_arent_missing() {
+        let ms = Duration::from_millis;
+        // Video came 50 ms ago: tiles of an update may still be waiting behind it, and the first
+        // keyframes of a stream may be among it.
+        let arriving = Timeouts::internet(ms(10), 4e6, ms(50));
+        assert_eq!((arriving.update, arriving.all_retry), (MAX_INTERNET_WAIT, MAX_INTERNET_WAIT));
+        assert_eq!((arriving.suspect, arriving.keyframe_retry), (ms(170), ms(200)), "these wait for nothing queued");
+        let t0 = Instant::now();
+        let mut meter = UpdateMeter::default();
+        meter.add(1, 0b1111, 0, 0b1, 100, t0, |_| {});
+        assert_eq!(meter.flush_stale(t0 + ms(500), arriving.update, |_| {}), 0);
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.pace(&arriving);
+        assert_eq!(requested(needs.due(t0 + ms(500))), None);
+        // Nothing for 170 ms: what still misses isn't coming.
+        let quiet = Timeouts::internet(ms(10), 4e6, ms(170));
+        assert_eq!(meter.flush_stale(t0 + ms(500), quiet.update, |_| {}), 0b1110);
+        needs.pace(&quiet);
+        assert_eq!(requested(needs.due(t0 + ms(500))), Some(u64::MAX));
+        // Video that keeps coming is waited on for a few seconds at most.
+        let mut needs = KeyframeNeeds::new(t0, Some(STREAM));
+        needs.pace(&arriving);
+        assert_eq!(requested(needs.due(t0 + MAX_INTERNET_WAIT)), Some(u64::MAX));
+    }
+
+    #[test]
     fn a_view_that_keeps_losing_its_picture_is_repaired_at_a_pace() {
         let t0 = Instant::now();
         let mut canvas = CanvasRepair::default();
-        assert!(!canvas.due(false, t0));
-        assert!(canvas.due(true, t0));
-        assert!(!canvas.due(true, t0 + KEYFRAME_RETRY / 2), "asked just now");
+        assert!(!canvas.due(false, t0, KEYFRAME_RETRY));
+        assert!(canvas.due(true, t0, KEYFRAME_RETRY));
+        assert!(!canvas.due(true, t0 + KEYFRAME_RETRY / 2, KEYFRAME_RETRY), "asked just now");
         // Still lost: asked again once it's time, even if not lost again since.
-        assert!(canvas.due(false, t0 + KEYFRAME_RETRY));
-        assert!(!canvas.due(false, t0 + KEYFRAME_RETRY * 3), "repaired");
+        assert!(canvas.due(false, t0 + KEYFRAME_RETRY, KEYFRAME_RETRY));
+        assert!(!canvas.due(false, t0 + KEYFRAME_RETRY * 3, KEYFRAME_RETRY), "repaired");
     }
 
     #[test]

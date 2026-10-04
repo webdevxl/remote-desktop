@@ -172,6 +172,12 @@ impl Reassembler {
         self.partial.values().map(|p| p.first_seen).min()
     }
 
+    /// The frames still incomplete: when each one's first packet arrived, and its size (bytes).
+    /// On a slow path a frame takes time to come in, the more the bigger it is.
+    pub fn partials(&self) -> impl Iterator<Item = (Instant, u32)> + '_ {
+        self.partial.values().map(|p| (p.first_seen, p.total_len))
+    }
+
     /// Whether a frame has been delivered: later frames say how many were skipped since.
     pub fn has_delivered(&self) -> bool {
         self.last_delivered.is_some()
@@ -268,7 +274,10 @@ mod tests {
         r.push(&f[0]);
         assert!(!r.has_stale_partial(Duration::from_secs(60)));
         assert!(r.has_stale_partial(Duration::ZERO));
+        let partials: Vec<_> = r.partials().collect();
+        assert_eq!((partials.len(), partials[0].1), (1, 5_000));
         r.clear_partial();
+        assert_eq!(r.partials().count(), 0);
         assert!(!r.has_stale_partial(Duration::ZERO));
     }
 

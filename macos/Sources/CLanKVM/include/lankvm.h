@@ -137,6 +137,10 @@ void lk_forget_device(const char *kind, const char *fingerprint);
 void lk_stop_control(uint64_t viewer);
 void lk_stop_all_control(void);
 void lk_set_allow_control(bool allow);
+// Opt-in: lets paired Macs connect over the internet, and asks the router to forward the port.
+void lk_set_internet_access(bool on);
+// The address other Macs use over the internet (dynamic DNS name or IP, optional :port); "" clears.
+void lk_set_public_address(const char *address);
 // Whether macOS lets LanKVM post input (Privacy & Security → Accessibility).
 bool lk_control_permission(void);
 // Removes a virtual display made for a viewer (0: all of them); its viewers go back to this Mac's

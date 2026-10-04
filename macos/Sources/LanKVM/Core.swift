@@ -23,13 +23,33 @@ final class CoreModel: ObservableObject {
 
     private init() {}
 
+    /// Internet access in the snapshots.
+    enum SampleInternet {
+        case off
+        /// The router forwards the port: reachable at 203.0.113.7:47800, with a Mac connected over
+        /// the internet.
+        case open
+        /// The router didn't answer: the port needs forwarding by hand.
+        case setup
+        /// The router is behind another router: the port needs forwarding on both.
+        case doubleNat
+        /// The router didn't answer, and the user forwarded the port and entered the public address.
+        case manual
+    }
+
     /// Sample state for UI snapshots (`--snapshot`), without starting the network core.
     /// `displays`: two Macs added displays here, one of them still connected.
-    func loadSampleState(screenAllowed: Bool, displays: Bool = false) {
+    func loadSampleState(screenAllowed: Bool, displays: Bool = false, internet: SampleInternet = .off) {
         thisMac = ThisMac(name: "Alex's MacBook Pro", addresses: ["192.168.1.23", "10.0.0.7"], port: 47800, deviceId: "724e:b7c8:8a63:ada8")
+        var viewers = [Viewer(id: 1, name: "Studio", address: "192.168.1.31", deviceId: "9f12:0ab3:77c1:e402", controlling: screenAllowed,
+                              displayId: displays ? 5 : 1, virtualDisplay: displays)]
+        var pairedViewers = [PairedDevice(fingerprint: "aa", deviceId: "9f12:0ab3:77c1:e402", name: "Studio")]
+        if internet == .open {
+            viewers.append(Viewer(id: 2, name: "MacBook Air", address: "198.51.100.24", deviceId: "c3a9:51e0:0d7b:9e26", internet: true))
+            pairedViewers.append(PairedDevice(fingerprint: "dd", deviceId: "c3a9:51e0:0d7b:9e26", name: "MacBook Air"))
+        }
         host = HostStatus(
-            viewers: [Viewer(id: 1, name: "Studio", address: "192.168.1.31", deviceId: "9f12:0ab3:77c1:e402", controlling: screenAllowed,
-                             displayId: displays ? 5 : 1, virtualDisplay: displays)],
+            viewers: viewers,
             pairing: [],
             screenCaptureAllowed: screenAllowed,
             allowControl: true,
@@ -37,12 +57,14 @@ final class CoreModel: ObservableObject {
             virtualDisplays: displays ? [
                 VirtualDisplay(displayId: 5, owner: "Studio", width: 6144, height: 2560, hidpi: true, arrangement: .only, inUse: true),
                 VirtualDisplay(displayId: 6, owner: "Mac mini", width: 3840, height: 2160, hidpi: true, arrangement: .extend, inUse: false),
-            ] : []
+            ] : [],
+            internet: Self.sampleInternet(internet)
         )
         paired = PairedDevices(
-            viewers: [PairedDevice(fingerprint: "aa", deviceId: "9f12:0ab3:77c1:e402", name: "Studio")],
+            viewers: pairedViewers,
             hosts: [
-                PairedDevice(fingerprint: "bb", deviceId: "41de:93a0:c2f7:118b", name: "Mac mini"),
+                PairedDevice(fingerprint: "bb", deviceId: "41de:93a0:c2f7:118b", name: "Mac mini",
+                             internetAddress: internet == .off ? nil : "198.51.100.17:47800"),
                 PairedDevice(fingerprint: "cc", deviceId: "07b9:5c2e:a1d4:6f30", name: "Studio"),
             ]
         )
@@ -51,6 +73,25 @@ final class CoreModel: ObservableObject {
             RecentHost(address: "192.168.1.31", name: "Studio"),
         ]
         canShareScreen = screenAllowed
+    }
+
+    /// Public addresses come from the documentation ranges (RFC 5737), which never reach a real Mac.
+    private static func sampleInternet(_ sample: SampleInternet) -> InternetStatus {
+        switch sample {
+        case .off:
+            InternetStatus()
+        case .open:
+            InternetStatus(enabled: true, state: .mapped, externalAddress: "203.0.113.7:47800", localAddress: "192.168.1.23",
+                           publicAddress: "home.example.com", announced: ["home.example.com:47800", "203.0.113.7:47800"],
+                           ignored: 37)
+        case .setup:
+            InternetStatus(enabled: true, state: .problem, problem: .noResponse, localAddress: "192.168.1.23")
+        case .doubleNat:
+            InternetStatus(enabled: true, state: .problem, problem: .doubleNat, routerAddress: "192.168.0.12", localAddress: "192.168.1.23")
+        case .manual:
+            InternetStatus(enabled: true, state: .problem, problem: .noResponse, localAddress: "192.168.1.23",
+                           publicAddress: "home.example.com", announced: ["home.example.com:47800"], ignored: 4)
+        }
     }
 
     func start() {
@@ -416,6 +457,20 @@ final class CoreModel: ObservableObject {
 
     func setAllowControl(_ allow: Bool) {
         lk_set_allow_control(allow)
+        refreshHost()
+    }
+
+    /// Lets paired Macs connect over the internet: the core asks the router to forward LanKVM's
+    /// port. Off stops that and closes the sessions that came over the internet.
+    func setInternetAccess(_ on: Bool) {
+        lk_set_internet_access(on)
+        refreshHost()
+    }
+
+    /// The address paired Macs use to reach this one over the internet: a dynamic DNS name or an
+    /// IP, optionally with a port. "" clears it.
+    func setPublicAddress(_ address: String) {
+        lk_set_public_address(address)
         refreshHost()
     }
 

@@ -4,14 +4,17 @@
     python3 scripts/latency-report.py target/e2e/bench/RUN... [--json]
 
 From a run's trace.jsonl (the probe's line per finished update) joined by frame number with
-frame-source.jsonl (when each source frame reached the virtual display):
+frame-source.jsonl (when each source frame reached the screen: presented, or where the screen
+reports no presentation times, as a virtual display doesn't, committed):
   updates           finished updates; capture -> decoded p50/p95/p99 (the host's capture to the
-                    update's last tile decoded here)
+                    update's last tile decoded here), from the first source frame shown to the
+                    last (or all of them, without frame numbers)
   source frames     frames shown (the first update showing each), their rate, frames skipped (the
-                    number jumped over them), frames the source presented that never showed here,
-                    updates that finished late (an older frame than one shown) or couldn't be read
-  presented ->      source presented -> decoded p50/p95/p99 per frame shown, -> captured p50
-  source            frames drawn and presented on the virtual display, and their rate
+                    number jumped over them), frames the source put on screen that never showed
+                    here, updates that finished late (an older frame than one shown) or couldn't
+                    be read
+  source ->         source on screen -> decoded p50/p95/p99 per frame shown, -> captured p50
+  source            frames drawn and on screen, and their rate
 From viewer-stats.log (VIEWER=1 runs): the median of the viewer's per-second stats while frames
 flowed (shownFps, totalP50Ms, displayP50Ms, ...) and how much its counters grew. From
 host-stats.log: the median of every number on the host's per-second lines.
@@ -73,23 +76,33 @@ def probe_numbers(run):
     trace = read_jsonl(run / "trace.jsonl")
     source = read_jsonl(run / "frame-source.jsonl")
     out = {}
-    drawn = [f for f in source if f.get("type") == "frame"]
-    presented = {f["n"]: f["presented_us"] for f in drawn if f.get("presented_us", 0) > 0}
+    drawn = {f["n"]: f for f in source if f.get("type") == "frame" and "n" in f}
+    # When each frame reached the screen (as the probe has it).
+    if any(f.get("presented_us", 0) > 0 for f in drawn.values()):
+        out["source_basis"] = "presented"
+        on_screen = {n: f["presented_us"] for n, f in drawn.items() if f.get("presented_us", 0) > 0}
+    else:
+        out["source_basis"] = "committed"
+        on_screen = {n: f["commit_us"] for n, f in drawn.items() if f.get("commit_us")}
     if drawn:
         out["source_drawn"] = len(drawn)
-        out["source_presented"] = len(presented)
-        times = sorted(presented.values())
+        out["source_on_screen"] = len(on_screen)
+        times = sorted(on_screen.values())
         if len(times) > 1:
             out["source_fps"] = (len(times) - 1) / ((times[-1] - times[0]) / 1e6)
     if not trace:
         return out
 
-    latency = [(t["decoded_us"] - t["capture_local_us"]) / 1000 for t in trace if t.get("capture_local_us") is not None]
-    out["updates"] = len(trace)
+    # While the source ran: connecting and switching displays aren't what's measured.
+    first = next((i for i, t in enumerate(trace) if t.get("new")), 0)
+    last = max((i for i, t in enumerate(trace) if t.get("new")), default=len(trace) - 1)
+    measured = trace[first : last + 1]
+    latency = [(t["decoded_us"] - t["capture_local_us"]) / 1000 for t in measured if t.get("capture_local_us") is not None]
+    out["updates"] = len(measured)
     out["update_ms"] = [quantile(latency, q) for q in (0.5, 0.95, 0.99)]
-    out["motion_updates"] = sum(1 for t in trace if t.get("motion"))
-    out["full_updates"] = sum(1 for t in trace if t.get("full"))
-    sizes = [t["bytes"] for t in trace if t.get("bytes") is not None]
+    out["motion_updates"] = sum(1 for t in measured if t.get("motion"))
+    out["full_updates"] = sum(1 for t in measured if t.get("full"))
+    sizes = [t["bytes"] for t in measured if t.get("bytes") is not None]
     if sizes:
         out["update_bytes_p50"] = quantile(sizes, 0.5)
 
@@ -114,17 +127,17 @@ def probe_numbers(run):
     out["frames_skipped"] = sum(b - a - 1 for a, b in zip(numbers, numbers[1:]) if 0 < b - a <= MAX_FRAME_JUMP)
     out["frames_late"] = late
     out["updates_unread"] = unread
-    if presented:
+    if on_screen:
         first, last, seen = numbers[0], max(numbers), set(numbers)
-        out["frames_never_shown"] = sum(1 for n in presented if first <= n <= last and n not in seen)
-        to_decoded = [(t["decoded_us"] - presented[t["n"]]) / 1000 for t in shown if t["n"] in presented]
+        out["frames_never_shown"] = sum(1 for n in on_screen if first <= n <= last and n not in seen)
+        to_decoded = [(t["decoded_us"] - on_screen[t["n"]]) / 1000 for t in shown if t["n"] in on_screen]
         to_captured = [
-            (t["capture_local_us"] - presented[t["n"]]) / 1000
+            (t["capture_local_us"] - on_screen[t["n"]]) / 1000
             for t in shown
-            if t["n"] in presented and t.get("capture_local_us") is not None
+            if t["n"] in on_screen and t.get("capture_local_us") is not None
         ]
-        out["presented_decoded_ms"] = [quantile(to_decoded, q) for q in (0.5, 0.95, 0.99)]
-        out["presented_captured_ms"] = quantile(to_captured, 0.5)
+        out["source_decoded_ms"] = [quantile(to_decoded, q) for q in (0.5, 0.95, 0.99)]
+        out["source_captured_ms"] = quantile(to_captured, 0.5)
         out["frames_joined"] = len(to_decoded)
     return out
 
@@ -215,7 +228,7 @@ def rows(runs):
     def source(r):
         if "source_drawn" not in r:
             return None
-        return f"{r['source_drawn']} / {r['source_presented']} ({fmt(r.get('source_fps'))} fps)"
+        return f"{r['source_drawn']} / {r['source_on_screen']} ({fmt(r.get('source_fps'))} fps)"
 
     out = [
         row("mode", lambda r: r.get("meta_mode")),
@@ -230,11 +243,12 @@ def rows(runs):
         row("source frames shown", lambda r: fmt(r.get("frames_shown"))),
         row("  rate (fps)", lambda r: fmt(r.get("frames_fps"))),
         row("  skipped", skipped),
-        row("  presented, never shown", lambda r: fmt(r.get("frames_never_shown"))),
+        row("  on screen, never shown", lambda r: fmt(r.get("frames_never_shown"))),
         row("  late / unread updates", lambda r: f"{r['frames_late']} / {r['updates_unread']}" if "frames_late" in r else None),
-        row("presented→decoded p50/95/99 ms", lambda r: fmt(r.get("presented_decoded_ms"))),
-        row("presented→captured p50 ms", lambda r: fmt(r.get("presented_captured_ms"))),
-        row("source drawn / presented", source),
+        row("source on screen means", lambda r: r.get("source_basis")),
+        row("source→decoded p50/95/99 ms", lambda r: fmt(r.get("source_decoded_ms"))),
+        row("source→captured p50 ms", lambda r: fmt(r.get("source_captured_ms"))),
+        row("source drawn / on screen", source),
         row("viewer seconds", lambda r: fmt(r.get("viewer_seconds"))),
     ]
     out += [row(f"viewer {key} (p50)", lambda r, k=key: fmt(r.get(f"viewer_{k}"))) for key in VIEWER_MEDIANS]

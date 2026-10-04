@@ -548,7 +548,7 @@ struct StatsHUD: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text(verbatim: "\(String(info.width))×\(String(info.height)) · \(info.codec.uppercased())")
+                Text(verbatim: "\(String(info.width))×\(String(info.height)) · \(info.codec.uppercased())\(info.internet ? " · Internet" : "")")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
             }

@@ -2,6 +2,7 @@
 
 Low-latency remote desktop for Macs on the same local network, built as a software network KVM.
 Every Mac runs the same app. Others on the LAN can view it, and it can connect to them by IP.
+Paired Macs can also connect over the internet, if the Mac they connect to turns that on.
 
 **Status:** prototype. You enter an IP, enter a PIN once, and see the other Mac's screen. Each
 viewer window has two modes: **View** only looks; **Control** uses the other Mac's keyboard and
@@ -22,11 +23,11 @@ mouse as if they were plugged into it.
   rate, never latency.
 - **UDP, never TCP, for video.** One QUIC connection (quinn) carries TLS 1.3, a reliable control
   stream, and unreliable datagrams for video. A fixed-window congestion controller is used
-  because the LAN doesn't need Cubic's backoff. Lost frames are dropped, never retransmitted:
-  the viewer asks for a keyframe of just the tile that lost one (1/16 of a whole keyframe), and
-  knows from every frame which tiles its update had, so even a tile lost whole on a still screen
-  is asked for again. Each side sends a tiny packet every 20 ms when idle, so a Wi-Fi radio never
-  dozes off between clicks.
+  because the LAN doesn't need Cubic's backoff (connections over the internet use Cubic). Lost
+  frames are dropped, never retransmitted: the viewer asks for a keyframe of just the tile that
+  lost one (1/16 of a whole keyframe), and knows from every frame which tiles its update had, so
+  even a tile lost whole on a still screen is asked for again. Each side sends a tiny packet
+  every 20 ms when idle, so a Wi-Fi radio never dozes off between clicks.
 - **Decode → display with zero copies.** Each tile has its own hardware decoder, decoding as soon
   as the tile arrives, in parallel with the others. The render thread copies decoded tiles into a
   picture on the GPU with Metal and draws it as soon as every tile of a frame is in, so a frame
@@ -200,6 +201,39 @@ forces the tile grid (`1x1` encodes the whole picture as one stream, as older ve
 `LANKVM_FULL_FRAME_AT` (default 0.6) is the share of the picture that has to change for it to go
 as one full frame (above 1: never).
 
+### Connecting over the internet
+
+Off by default, and only for Macs that have paired.
+
+1. **Pair on the same network first.** Connect once from the other Mac on your network and enter
+   the code. Pairing never happens over the internet. On every connection the host also hands
+   the viewer its key for knocking from the internet (see Security model).
+2. On the Mac to reach, open **This Mac** and turn on **Let paired Macs connect over the
+   internet**. LanKVM asks the router to forward its UDP port (macOS speaks UPnP, NAT-PMP and
+   PCP for it). When the router does, the card shows the address to use, e.g.
+   `203.0.113.7:47800`. When it doesn't, the card says why and what to forward by hand: UDP port
+   47800 to this Mac's address on the network, e.g. `192.168.1.20`. Reserve that address for
+   the Mac in the router's settings (a DHCP reservation), so the forward keeps pointing at it.
+3. Most home connections get a new public address now and then. If you have a dynamic DNS name,
+   or forwarded the port by hand, enter it under **Public address**, e.g. `home.example.com`
+   (the port is added if you leave it out). The host tells its paired Macs where to reach it
+   each time they connect. Once they know it at an address, they don't knock anywhere else (see
+   Security model): if the address changed and has no name, connect once on the local network
+   so the host can tell them the new one.
+4. On the other Mac, type that address in **Connect**, or click **Connect** next to the Mac in
+   **Paired Devices**, which shows the address it last reached it at or was told.
+
+Two Macs behind one router can both be reachable: the router gives the second one another
+outside port, and its card shows the address with that port, e.g. `203.0.113.7:47801`. (Or
+start it with its own `LANKVM_PORT`.) Turning the setting off removes the forward and ends the
+sessions that came over the internet; sessions on the local network carry on.
+
+Over the internet the picture follows the connection: changes go out as tiles only, at up to
+60 fps, and the bitrate starts at 12 Mbit/s and rises as far as the connection allows, backing off
+when packets get lost or start to queue. On a slow connection the frame rate drops rather than the
+picture falling behind. What limits it is usually the upload of the Mac you're looking at: for the
+best picture, give that Mac a fast upload.
+
 ## Testing a connection on one Mac
 
 Connecting LanKVM to itself isn't a real test: one process plays both roles with one identity.
@@ -262,10 +296,40 @@ its own host injects).
 `cargo test --workspace` covers the control path without any permission: two cores talk over
 real QUIC on loopback while the host records what it would inject (`crates/core/tests/control_loopback.rs`).
 
+**Internet access on one Mac.** `LANKVM_TEST_LOOPBACK_IS_INTERNET=1` makes an instance treat
+loopback as the internet, so its connections over `127.0.0.1` go through the gate, the knock and
+the internet checks; the router is left alone. Pair the two instances without it first (pairing
+never runs over the internet), then restart both with it. `crates/core/tests/internet_loopback.rs`
+does the same in `cargo test`.
+
 ## Security model
 
-- The app listens on UDP 47800 but only accepts addresses from the local network: RFC 1918,
-  link-local, unique-local and loopback.
+- The app listens on UDP 47800. It answers devices on the local network (RFC 1918, link-local,
+  unique-local and loopback), and nobody else unless internet access is on. A session from the
+  local network ends if the viewer takes it onto the internet (QUIC would follow it there).
+- **Over the internet only paired devices get an answer**, and only while the host has internet
+  access on. A gate in front of the QUIC socket looks at every packet from outside the local
+  network. A paired viewer's first packet carries a knock in its connection ID: a random nonce
+  and a tag over it made with that viewer's access key and the current 10-minute period of the
+  clock. Packets without a valid, fresh knock are dropped before QUIC sees them, so a stranger
+  gets no reply at all (no version negotiation, retry, close or reset): the port looks closed.
+  A knock copied off the wire is ignored from any other address, and how many knocks are
+  checked per second is limited. A viewer knocks at an address only with the keys of hosts it
+  reached or was told about there (or that haven't said where they are yet), so a wrong address
+  doesn't get knocks it could pass on to the viewer's other hosts.
+- Each viewer's access key is derived from a secret only the host has (`internet-secret.key`,
+  readable only by its user) and the viewer's certificate fingerprint, and is handed over on the
+  local network. The viewer keeps it in `internet-hosts.json` (likewise private). After the
+  knock, TLS still has to prove the device holds the certificate the key was made for, and the
+  device has to be paired.
+- **Forget** revokes a viewer's key at once and ends its sessions. Turning internet access off
+  stops all knocks and ends every session that came over the internet.
+- Pairing only happens on the local network: a host never shows a code for a connection from
+  the internet.
+- What a stranger scanning the port sees: nothing. One answer can still get out: QUIC's
+  stateless reset for a packet addressed to a connection ID the host issued earlier. Only
+  someone who watched an earlier session's packets has one, and all it tells them is that
+  LanKVM still runs there.
 - Each install has its own certificate (`~/Library/Application Support/lankvm/`). The connection
   is encrypted with TLS 1.3.
 - First contact requires the PIN shown on the host. Pairing uses SPAKE2 bound to both
@@ -302,6 +366,20 @@ real QUIC on loopback while the host records what it would inject (`crates/core/
   Accessibility on the Mac you control *from* too (Privacy & Security → Accessibility). Pinch,
   rotate and page swipes work without it.
 - **Reset a permission:** `tccutil reset ScreenCapture dev.lankvm.LanKVM` (or `Accessibility`)
+- **"No answer from …" over the internet:** on the Mac you connect to, look at This Mac →
+  Internet access. *The router didn't answer* or *can't open ports automatically*: turn on UPnP
+  or NAT-PMP in the router's settings, or forward UDP port 47800 to the address shown yourself.
+  *Behind another router* (double NAT, e.g. a provider's modem-router in front of your own):
+  forward the port on the outer router too, or put one of them in bridge mode. *Shares one public
+  address* (carrier-grade NAT): the internet can't reach the Mac at all; ask the provider for a
+  public IPv4 address, or use a VPN.
+- **Test from outside your network.** Many routers don't send a connection to their own public
+  address back inside (no hairpin NAT), so connecting to the public address from the same network
+  can fail while it works from anywhere else. Try from a phone's hotspot, and use the local
+  address at home.
+- **Internet connections fail while local ones work, and the router is fine:** knocks are tied to
+  the clock, so the two Macs' clocks must agree within about 10 minutes. Turn on *Set time and
+  date automatically* on both.
 - **Wi-Fi** adds jitter. For the lowest latency, put the viewed Macs on Ethernet, or connect the two
   Macs with a Thunderbolt cable (Thunderbolt Bridge). On Wi-Fi, a Mac whose radio regularly leaves
   the channel for AirDrop, Universal Control or Sidecar (AWDL) stalls every packet for tens of
@@ -319,9 +397,9 @@ real QUIC on loopback while the host records what it would inject (`crates/core/
 | Path | What |
 |---|---|
 | `crates/protocol` | Wire messages, video packet header |
-| `crates/transport` | QUIC endpoint, LAN congestion control, identity, pairing, packetizer/reassembler |
-| `crates/platform-mac` | ScreenCaptureKit capture, finding the tiles that changed (`tiler.rs`), VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), virtual displays (`virtual_display.rs`) |
-| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), virtual displays for viewers (`displays.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
+| `crates/transport` | QUIC endpoint, LAN congestion control, identity, pairing, packetizer/reassembler, the gate that keeps the port silent to the internet (`gate.rs`, `knock.rs`, `cid.rs`) |
+| `crates/platform-mac` | ScreenCaptureKit capture, finding the tiles that changed (`tiler.rs`), VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), virtual displays (`virtual_display.rs`), router port mapping (`portmap.rs`) |
+| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), virtual displays for viewers (`displays.rs`), internet access keys, addresses and port mapping (`internet.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
 | `macos/` | SwiftUI app (SwiftPM). `Sources/CLanKVM/include/lankvm.h` is the C interface |
 | `scripts/bundle.sh` | Builds and signs `LanKVM.app` |
 | `scripts/make-icon.swift` | Regenerates `macos/Resources/AppIcon.icns` |
@@ -331,7 +409,8 @@ The remote screen never goes through SwiftUI. The viewer window hosts a `CAMetal
 Rust core renders each decoded frame into it from its own thread as soon as it arrives.
 
 Tests: `cargo test --workspace`. This includes a real hardware HEVC encode→decode round trip, a
-QUIC loopback session, and remote control end to end over QUIC. To review the UI without granting any permissions, render every screen
+QUIC loopback session, remote control end to end over QUIC, and connecting over the (loopback)
+internet. To review the UI without granting any permissions, render every screen
 to PNG (light and dark):
 
 ```bash

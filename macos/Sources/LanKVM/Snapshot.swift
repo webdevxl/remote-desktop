@@ -58,8 +58,41 @@ enum Snapshot {
             renderSessionControls(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
             renderGestureHint(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
             renderDisplays(stats: sample, appearance: appearance, suffix: suffix, into: dir)
+            renderInternet(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
         }
         NSApp.terminate(nil)
+    }
+
+    /// Internet access: This Mac when the router opened the port, when it needs setting up by hand
+    /// (behind one router or two) and once it was set up by hand, the Macs this one controls with
+    /// their internet address, and the statistics of a session over the internet.
+    private static func renderInternet(info: SessionInfo, stats: SessionStats, appearance: NSAppearance.Name, suffix: String,
+                                       into dir: URL) {
+        let core = CoreModel.shared
+        for (name, internet) in [("open", CoreModel.SampleInternet.open), ("setup", .setup), ("doublenat", .doubleNat), ("manual", .manual)] {
+            core.loadSampleState(screenAllowed: true, internet: internet)
+            render(ContentView(selection: .thisMac).environmentObject(core), size: CGSize(width: 900, height: 1100),
+                   appearance: appearance, to: dir.appendingPathComponent("thisMac-internet-\(name)-\(suffix).png"))
+        }
+        core.loadSampleState(screenAllowed: true, internet: .open)
+        render(ContentView(selection: .paired).environmentObject(core), size: CGSize(width: 900, height: 620),
+               appearance: appearance, to: dir.appendingPathComponent("paired-internet-\(suffix).png"))
+
+        var remote = info
+        remote.address = "198.51.100.17:47800"
+        remote.internet = true
+        var slower = stats
+        slower.mbps = 11.2
+        slower.networkMs = 19.4
+        slower.totalMs = 36.3
+        slower.rttMs = 38.2
+        render(
+            ZStack(alignment: .topLeading) {
+                LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                StatsHUD(sessionId: 0, info: remote, sample: slower).padding(12)
+            }.environmentObject(core),
+            size: CGSize(width: 520, height: 320), appearance: appearance,
+            to: dir.appendingPathComponent("hud-internet-\(suffix).png"))
     }
 
     /// Virtual displays: the banners while switching and when it went wrong, the dimmed screen
@@ -129,7 +162,7 @@ enum Snapshot {
             to: dir.appendingPathComponent("hud-display-\(suffix).png"))
 
         core.loadSampleState(screenAllowed: true, displays: true)
-        render(ContentView(selection: .thisMac).environmentObject(core), size: CGSize(width: 900, height: 940),
+        render(ContentView(selection: .thisMac).environmentObject(core), size: CGSize(width: 900, height: 1100),
                appearance: appearance, to: dir.appendingPathComponent("thisMac-displays-\(suffix).png"))
     }
 

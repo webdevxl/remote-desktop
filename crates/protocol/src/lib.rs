@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const DEFAULT_PORT: u16 = 47800;
 pub const ALPN: &[u8] = b"lankvm/1";
 /// Upper bound for a single control message; protects against garbage length prefixes.
@@ -101,6 +101,11 @@ pub enum HostMsg {
     /// until it changes. Sent on the reliable control stream, so a client that lost that update
     /// entirely (no newer one comes to reveal it) still learns which tiles to ask for again.
     VideoIdle { update: u32, mask: u64 },
+    /// How this client can reach the host over the internet: its access key for knocking on the
+    /// host (32 bytes, the same on every connection) and the addresses the host announces for it
+    /// ("203.0.113.7:47800", "home.example.com:47800"), empty while internet access is off. Sent
+    /// after the first [`HostMsg::Display`].
+    InternetAccess { key: Vec<u8>, addresses: Vec<String> },
 }
 
 /// Which of the host's displays a client watches.
@@ -945,6 +950,7 @@ mod tests {
         assert_eq!(encode(&ClientMsg::RequestKeyframes { tiles: 5 }).unwrap(), [8, 5]);
         assert_eq!(encode(&ClientMsg::NoFullFrame).unwrap(), [9]);
         assert_eq!(encode(&HostMsg::VideoIdle { update: 1, mask: 2 }).unwrap(), [10, 1, 2]);
+        assert_eq!(encode(&HostMsg::InternetAccess { key: vec![7], addresses: vec!["a".into()] }).unwrap(), [11, 1, 7, 1, 1, 97]);
         let state = DisplayState {
             request: 0,
             display: DisplayChoice::Main,
@@ -1120,6 +1126,16 @@ mod tests {
         }
         // Input is small: a move is a few bytes.
         assert!(encode(&InputMsg::MouseMove { x: 40000, y: 30000 }).unwrap().len() <= 7);
+    }
+
+    #[test]
+    fn internet_access_round_trips() {
+        for m in [
+            HostMsg::InternetAccess { key: (0..32).collect(), addresses: vec!["203.0.113.7:47800".into(), "home.example.com:47801".into()] },
+            HostMsg::InternetAccess { key: vec![0xff; 32], addresses: Vec::new() },
+        ] {
+            assert_eq!(decode::<HostMsg>(&encode(&m).unwrap()).unwrap(), m);
+        }
     }
 
     #[test]

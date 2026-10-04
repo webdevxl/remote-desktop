@@ -19,6 +19,8 @@ struct HostStatus: Decodable, Equatable {
     var controlPermission: Bool = false
     /// Displays this Mac made for viewers, in use or kept a while for their viewer to come back.
     var virtualDisplays: [VirtualDisplay] = []
+    /// Whether paired Macs can reach this one over the internet.
+    var internet = InternetStatus()
 
     /// Who controls this Mac right now, if anyone.
     var controller: Viewer? { viewers.first(where: \.controlling) }
@@ -26,7 +28,7 @@ struct HostStatus: Decodable, Equatable {
 
 extension HostStatus {
     private enum CodingKeys: String, CodingKey {
-        case viewers, pairing, screenCaptureAllowed, allowControl, controlPermission, virtualDisplays
+        case viewers, pairing, screenCaptureAllowed, allowControl, controlPermission, virtualDisplays, internet
     }
 
     /// Newer fields are optional: a status without them (or with one this app can't read) still
@@ -39,6 +41,110 @@ extension HostStatus {
         allowControl = try c.decode(Bool.self, forKey: .allowControl)
         controlPermission = try c.decode(Bool.self, forKey: .controlPermission)
         virtualDisplays = c.lenient([VirtualDisplay].self, .virtualDisplays) ?? []
+        internet = c.lenient(InternetStatus.self, .internet) ?? InternetStatus()
+    }
+}
+
+/// Internet access to this Mac (`InternetView` in crates/core): the setting, and how far asking
+/// the router to forward LanKVM's port got.
+struct InternetStatus: Equatable {
+    enum State: String {
+        case off
+        /// Asking the router to forward the port.
+        case requesting
+        /// The router forwards it.
+        case mapped
+        /// This Mac's own address is public: nothing to forward.
+        case `public`
+        /// See `problem`. The core keeps asking in the background.
+        case problem
+    }
+
+    enum Problem: String {
+        /// The router didn't answer (no UPnP, NAT-PMP or PCP).
+        case noResponse
+        /// The router can't forward ports automatically.
+        case unsupported
+        /// Automatic port forwarding is turned off on the router.
+        case disabled
+        /// The router is behind another router.
+        case doubleNat
+        /// The internet provider shares one public address among many customers.
+        case cgnat
+        /// Not connected to a network with a router.
+        case noRouter
+        /// macOS's service that talks to the router isn't responding.
+        case serviceDown
+        /// The macOS Firewall blocks LanKVM.
+        case firewall
+        case other
+    }
+
+    /// The setting: paired Macs may connect over the internet.
+    var enabled = false
+    var state = State.off
+    var problem: Problem?
+    /// Where the internet reaches this Mac ("203.0.113.7:47800"), once the router forwards the
+    /// port or when this Mac's address is public.
+    var externalAddress: String?
+    /// The router's own outside address, when that isn't public (doubleNat, cgnat).
+    var routerAddress: String?
+    /// This Mac's address on the local network, to forward the port to by hand.
+    var localAddress: String?
+    /// The UDP port LanKVM uses on this Mac.
+    var port: UInt16 = 47800
+    /// The address the user gave for other Macs to use (a dynamic DNS name or an IP), or "".
+    var publicAddress = ""
+    /// The addresses paired Macs are told to use over the internet.
+    var announced: [String] = []
+    /// Packets from the internet that didn't come from a paired Mac, dropped since LanKVM started
+    /// (scanners, their retries, and Macs that were forgotten). Not a count of devices.
+    var ignored: UInt64 = 0
+
+    /// Paired Macs can reach this one: the router forwards the port, or nothing needs forwarding.
+    var isOpen: Bool { enabled && (state == .mapped || state == .public) }
+
+    /// Nothing on this Mac or its router can fix it: the network itself keeps the internet out.
+    var isUnreachable: Bool {
+        guard enabled, state == .problem else { return false }
+        return problem == .cgnat || problem == .noRouter
+    }
+
+    /// LanKVM can't get the port opened, but forwarding it in the router's settings works (in
+    /// both routers' for doubleNat).
+    var canForwardByHand: Bool {
+        switch problem ?? .other {
+        case .noResponse, .unsupported, .disabled, .doubleNat, .other: true
+        case .cgnat, .noRouter, .serviceDown, .firewall: false
+        }
+    }
+
+    /// The router didn't open the port, but the user gave the address to use: they forwarded it
+    /// themselves. The core can't tell whether that forward works.
+    var isManual: Bool { enabled && state == .problem && canForwardByHand && !publicAddress.isEmpty }
+}
+
+extension InternetStatus: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case enabled, state, problem, externalAddress, routerAddress, localAddress, port, publicAddress, announced, ignored
+    }
+
+    /// Every field is optional. A state this app doesn't know is shown as a problem it can't name
+    /// (forwarding the port by hand still helps), a problem it doesn't know likewise.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = c.lenient(Bool.self, .enabled) ?? false
+        let stateName = c.lenient(String.self, .state)
+        state = stateName.flatMap(State.init) ?? (enabled && stateName != nil ? .problem : .off)
+        let problemName = c.lenient(String.self, .problem)
+        problem = problemName.map { Problem(rawValue: $0) ?? .other } ?? (state == .problem ? .other : nil)
+        externalAddress = c.lenient(String.self, .externalAddress).flatMap { $0.isEmpty ? nil : $0 }
+        routerAddress = c.lenient(String.self, .routerAddress).flatMap { $0.isEmpty ? nil : $0 }
+        localAddress = c.lenient(String.self, .localAddress).flatMap { $0.isEmpty ? nil : $0 }
+        port = c.lenient(UInt16.self, .port) ?? 47800
+        publicAddress = c.lenient(String.self, .publicAddress) ?? ""
+        announced = c.lenient([String].self, .announced) ?? []
+        ignored = c.lenient(UInt64.self, .ignored) ?? 0
     }
 }
 
@@ -52,11 +158,13 @@ struct Viewer: Decodable, Identifiable, Equatable {
     var displayId: UInt32 = 0
     /// It watches a display this Mac made for it, not this Mac's own screen.
     var virtualDisplay: Bool = false
+    /// It connected over the internet, not from the local network.
+    var internet: Bool = false
 }
 
 extension Viewer {
     private enum CodingKeys: String, CodingKey {
-        case id, name, address, deviceId, controlling, displayId, virtualDisplay
+        case id, name, address, deviceId, controlling, displayId, virtualDisplay, internet
     }
 
     init(from decoder: Decoder) throws {
@@ -68,6 +176,7 @@ extension Viewer {
         controlling = c.lenient(Bool.self, .controlling) ?? false
         displayId = c.lenient(UInt32.self, .displayId) ?? 0
         virtualDisplay = c.lenient(Bool.self, .virtualDisplay) ?? false
+        internet = c.lenient(Bool.self, .internet) ?? false
     }
 }
 
@@ -121,7 +230,24 @@ struct PairedDevice: Decodable, Identifiable, Equatable {
     var fingerprint: String
     var deviceId: String
     var name: String
+    /// A Mac this one controls: where it was last reached, or told this Mac to reach it, over the
+    /// internet ("203.0.113.7:47800"). Nil when unknown.
+    var internetAddress: String?
     var id: String { fingerprint }
+}
+
+extension PairedDevice {
+    private enum CodingKeys: String, CodingKey {
+        case fingerprint, deviceId, name, internetAddress
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        fingerprint = try c.decode(String.self, forKey: .fingerprint)
+        deviceId = try c.decode(String.self, forKey: .deviceId)
+        name = try c.decode(String.self, forKey: .name)
+        internetAddress = c.lenient(String.self, .internetAddress).flatMap { $0.isEmpty ? nil : $0 }
+    }
 }
 
 struct PairedDevices: Decodable, Equatable {
@@ -153,11 +279,14 @@ struct SessionInfo: Decodable, Equatable {
     /// `displayUnavailable`, naming the host; "" while it may).
     var displayAvailable = DisplayReason.none
     var displayUnavailable = ""
+    /// Connected over the internet, not on the local network.
+    var internet = false
 }
 
 extension SessionInfo {
     private enum CodingKeys: String, CodingKey {
-        case hostName, hostId, sameMachine, address, width, height, fps, codec, display, displayAvailable, displayUnavailable
+        case hostName, hostId, sameMachine, address, width, height, fps, codec, display, displayAvailable, displayUnavailable,
+             internet
     }
 
     /// Lenient about everything but the stream itself: one field this app can't read would drop
@@ -176,6 +305,7 @@ extension SessionInfo {
             ?? RemoteDisplay(kind: .main, width: width, height: height, refreshHz: fps)
         displayAvailable = c.lenient(Int.self, .displayAvailable) ?? DisplayReason.none
         displayUnavailable = c.lenient(String.self, .displayUnavailable) ?? ""
+        internet = c.lenient(Bool.self, .internet) ?? false
     }
 }
 

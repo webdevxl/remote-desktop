@@ -1661,6 +1661,7 @@ dependencies = [
  "bytes",
  "protocol",
  "quinn",
+ "quinn-proto",
  "quinn-udp",
  "rcgen",
  "ring",

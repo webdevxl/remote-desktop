@@ -44,11 +44,16 @@ const MAX_SYSTEM_ACTIONS_PER_SEC: u32 = 4;
 pub struct HostSettings {
     /// Whether paired Macs may control this one, or only view it.
     pub allow_control: bool,
+    /// Whether paired Macs may connect over the internet (opt-in).
+    pub internet_access: bool,
+    /// The address paired Macs are told to use over the internet, as the user typed it (a
+    /// dynamic DNS name or an IP, with or without a port), or "".
+    pub public_address: String,
 }
 
 impl Default for HostSettings {
     fn default() -> Self {
-        Self { allow_control: true }
+        Self { allow_control: true, internet_access: false, public_address: String::new() }
     }
 }
 
@@ -784,8 +789,13 @@ mod tests {
         let path = std::env::temp_dir().join(format!("lankvm-settings-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         assert!(HostSettings::load(&path).allow_control);
-        HostSettings { allow_control: false }.save(&path).unwrap();
-        assert!(!HostSettings::load(&path).allow_control);
+        assert!(!HostSettings::load(&path).internet_access, "internet access is opt-in");
+        let saved = HostSettings { allow_control: false, internet_access: true, public_address: "home.example.com".into() };
+        saved.save(&path).unwrap();
+        assert_eq!(HostSettings::load(&path), saved);
+        // Files from before internet access load with its defaults.
+        std::fs::write(&path, br#"{ "allowControl": false }"#).unwrap();
+        assert_eq!(HostSettings::load(&path), HostSettings { allow_control: false, ..HostSettings::default() });
         std::fs::write(&path, b"{ not json").unwrap();
         assert_eq!(HostSettings::load(&path), HostSettings::default());
         let _ = std::fs::remove_file(&path);

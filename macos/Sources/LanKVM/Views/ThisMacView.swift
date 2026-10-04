@@ -16,6 +16,8 @@ struct ThisMacView: View {
 
             RemoteControlCard()
 
+            InternetAccessCard()
+
             if let mac = core.thisMac {
                 VStack(alignment: .leading, spacing: 8) {
                     SectionLabel(title: "Address")
@@ -44,7 +46,8 @@ struct ThisMacView: View {
                     ForEach(Array(core.host.viewers.enumerated()), id: \.element.id) { index, viewer in
                         if index > 0 { CardDivider() }
                         CardRow(icon: viewer.controlling ? "cursorarrow.rays" : "eye", tint: .lkAccent, title: viewer.name,
-                                detail: "\(viewer.controlling ? "Controlling" : "Viewing") · \(viewer.address)", monospacedDetail: true) {
+                                detail: "\(viewer.controlling ? "Controlling" : "Viewing") · \(viewer.address)\(viewer.internet ? " · over the internet" : "")",
+                                monospacedDetail: true) {
                             HStack(spacing: 8) {
                                 if viewer.controlling {
                                     Button("Stop Control") { core.stopControl(viewer) }
@@ -285,6 +288,270 @@ private struct RemoteControlCard: View {
             return "To use this Mac's mouse and keyboard from another Mac, macOS needs to allow LanKVM under Accessibility."
         }
         return "Paired Macs can switch to Control and use this Mac's mouse and keyboard. To take it back at any time, press ⌃⌥⌘ and the period key here."
+    }
+}
+
+/// Whether paired Macs can reach this Mac over the internet, and what to change on the router
+/// when they can't.
+private struct InternetAccessCard: View {
+    @EnvironmentObject private var core: CoreModel
+
+    private var internet: InternetStatus { core.host.internet }
+
+    private var enabled: Binding<Bool> {
+        Binding(get: { core.host.internet.enabled }, set: { core.setInternetAccess($0) })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Card {
+                HStack(alignment: .top, spacing: 12) {
+                    IconBadge(systemName: "globe", tint: tint)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Internet access")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(Color.lkText)
+                            Spacer()
+                            status
+                        }
+                        Text(explanation)
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color.lkSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Toggle("Let paired Macs connect over the internet", isOn: enabled)
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .font(.system(size: 12))
+                            .padding(.top, 2)
+                        if internet.enabled {
+                            progress
+                        }
+                    }
+                }
+                .padding(14)
+                if internet.enabled {
+                    if internet.isOpen, let address = internet.externalAddress {
+                        CardDivider()
+                        CardRow(icon: "network", tint: .lkSuccess, title: address, detail: addressDetail(address)) {
+                            CopyButton(text: address)
+                        }
+                    }
+                    CardDivider()
+                    PublicAddressRow(saved: internet.publicAddress)
+                }
+            }
+            if internet.enabled && internet.ignored > 0 {
+                Text(ignoredText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.lkSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 2)
+            }
+        }
+    }
+
+    /// While the router is asked, or what's wrong and how to fix it.
+    @ViewBuilder private var progress: some View {
+        if internet.isManual {
+            Text(manualText)
+                .font(.system(size: 12))
+                .foregroundStyle(Color.lkSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if internet.state == .problem {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(problemText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.lkText)
+                    .fixedSize(horizontal: false, vertical: true)
+                if internet.canForwardByHand {
+                    ForEach(Array(manualSteps.enumerated()), id: \.offset) { index, step in
+                        Step(number: index + 1, text: step)
+                    }
+                }
+            }
+            .padding(.top, 2)
+        } else if !internet.isOpen {
+            Text("Asking your router to forward UDP port \(String(internet.port)) to this Mac…")
+                .font(.system(size: 12))
+                .foregroundStyle(Color.lkSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder private var status: some View {
+        if !internet.enabled {
+            StatusPill(text: "Off", color: .lkSecondary)
+        } else if internet.isOpen {
+            StatusPill(text: "Open", color: .lkSuccess)
+        } else if internet.isManual {
+            StatusPill(text: "Manual setup", color: .lkAccent)
+        } else if internet.isUnreachable {
+            StatusPill(text: "Not reachable", color: .lkWarning)
+        } else if internet.state == .problem {
+            StatusPill(text: "Needs setup", color: .lkWarning)
+        } else {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                StatusPill(text: "Opening…", color: .lkSecondary)
+            }
+        }
+    }
+
+    private var tint: Color {
+        if internet.isOpen { return .lkSuccess }
+        if internet.isManual { return .lkAccent }
+        return internet.enabled && internet.state == .problem ? .lkWarning : .lkAccent
+    }
+
+    /// Only ever promises what's true now; the "no answer" is about the internet (on the network,
+    /// a new Mac is asked for a code).
+    private var explanation: String {
+        if !internet.enabled {
+            return "Paired Macs can only connect on your network. Turn this on to let them connect over the internet too."
+        }
+        if internet.isOpen {
+            return "Macs that paired with this one on your network can connect over the internet. Anyone else on the internet gets no answer."
+        }
+        return "Once the internet can reach this Mac, Macs that paired with it on your network can connect from anywhere. Anyone else on the internet gets no answer."
+    }
+
+    /// The router may give another port than LanKVM's when that one is taken there.
+    private func addressDetail(_ address: String) -> String {
+        let port = String(internet.port)
+        guard internet.state == .mapped else { return "Use this address on your other Macs · UDP port \(port)" }
+        let opened = address.split(separator: ":").last.map(String.init) ?? port
+        return opened == port ? "Your router opened port \(port)" : "Your router opened port \(opened) (\(port) was taken)"
+    }
+
+    private var problemText: String {
+        let port = String(internet.port)
+        switch internet.problem ?? .other {
+        case .noResponse:
+            return "Your router didn't answer when LanKVM asked it to open a port. Turn on UPnP or NAT-PMP in its settings, or forward the port yourself."
+        case .unsupported:
+            return "Your router can't open ports automatically. Forward the port yourself."
+        case .disabled:
+            return "Automatic port forwarding is turned off on your router. Turn on UPnP or NAT-PMP in its settings, or forward the port yourself."
+        case .doubleNat:
+            let router = internet.routerAddress.map { " (its address, \($0), is private)" } ?? ""
+            return "Your router is behind another router\(router), so LanKVM can't open the port to the internet by itself. Forward UDP port \(port) on the outer router too, or put one of them in bridge mode."
+        case .cgnat:
+            let router = internet.routerAddress.map { " (your router got \($0))" } ?? ""
+            return "Your internet provider shares one public address among many customers\(router), so the internet can't reach this Mac. Ask your provider for a public IPv4 address."
+        case .noRouter:
+            return "This Mac isn't connected to a network with a router, so the internet can't reach it."
+        case .serviceDown:
+            return "macOS's network service isn't responding, so LanKVM can't ask your router to open a port. It keeps trying."
+        case .firewall:
+            return "The macOS Firewall is blocking LanKVM. Allow incoming connections for LanKVM in System Settings → Network → Firewall → Options."
+        case .other:
+            return "LanKVM couldn't get your router to open a port. Forward the port yourself."
+        }
+    }
+
+    /// LanKVM can't learn the address the internet sees (behind two routers, not even the
+    /// router knows it), so the last step is always to enter it.
+    private var manualSteps: [String] {
+        let port = String(internet.port)
+        let local = internet.localAddress ?? "this Mac"
+        var steps: [String]
+        if internet.problem == .doubleNat {
+            steps = [
+                "Forward UDP port \(port) to \(internet.routerAddress ?? "your router") in the outer router's settings.",
+                "Make sure your own router forwards UDP port \(port) to \(local).",
+            ]
+        } else {
+            steps = ["Forward UDP port \(port) to \(local) in your router's settings."]
+        }
+        if let address = internet.localAddress {
+            steps.append("Reserve \(address) for this Mac in your router, so the forward keeps pointing at it.")
+        }
+        steps.append("Enter your network's public address or a dynamic DNS name under Public address below.")
+        return steps
+    }
+
+    /// The router didn't open the port and the user entered a public address: they forward it
+    /// themselves, which LanKVM can't check.
+    private var manualText: String {
+        let port = String(internet.port)
+        let local = internet.localAddress ?? "this Mac"
+        let check = internet.problem == .doubleNat
+            ? "Using your manual port forwards: make sure UDP port \(port) on the outer router points to \(internet.routerAddress ?? "your router"), and on your router to \(local)."
+            : "Using your manual port forward: make sure UDP port \(port) points to \(local)."
+        guard internet.localAddress != nil else { return check }
+        return check + " Reserve that address for this Mac in your router so it doesn't change."
+    }
+
+    /// The core counts packets, not devices: one scanner, or one forgotten Mac retrying, adds several.
+    private var ignoredText: String {
+        let count = internet.ignored
+        return count == 1 ? "Ignored 1 packet from the internet that didn't come from a paired Mac since LanKVM started."
+            : "Ignored \(count.formatted()) packets from the internet that didn't come from a paired Mac since LanKVM started."
+    }
+}
+
+/// The address paired Macs use to reach this one over the internet, as the user typed it. Saved on
+/// Return, when the field loses focus, or when it goes away.
+private struct PublicAddressRow: View {
+    @EnvironmentObject private var core: CoreModel
+    /// What the core has now.
+    let saved: String
+    @State private var draft: String
+    @FocusState private var focused: Bool
+
+    init(saved: String) {
+        self.saved = saved
+        _draft = State(initialValue: saved)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            IconBadge(systemName: "link")
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Public address")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.lkText)
+                HStack(spacing: 8) {
+                    TextField("home.example.com or 203.0.113.7", text: $draft)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12, design: .monospaced))
+                        .focused($focused)
+                        .onSubmit(save)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Color.lkText.opacity(0.04), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(focused ? Color.lkAccent.opacity(0.7) : Color.lkBorder))
+                        .frame(maxWidth: 340)
+                    if edited {
+                        Button("Save", action: save)
+                            .buttonStyle(SecondaryButtonStyle())
+                    }
+                }
+                Text("If your router's address changes, use a dynamic DNS name here. Paired Macs learn it the next time they connect.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.lkSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .onChange(of: focused) { _, isFocused in
+            if !isFocused { save() }
+        }
+        // The core's copy wins once saved (it tidies what was typed).
+        .onChange(of: saved) { _, value in draft = value }
+        .onDisappear(perform: save)
+    }
+
+    private var trimmed: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    private var edited: Bool { trimmed != saved }
+
+    private func save() {
+        guard edited else { return }
+        core.setPublicAddress(trimmed)
     }
 }
 

@@ -62,10 +62,21 @@ pub fn short_hex(fp: &Fingerprint) -> String {
     s
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+/// Writes a file only this user can read (mode 0600): keys and secrets. Written next to it and
+/// then renamed over it, so it is never left half-written and never keeps the looser mode an
+/// existing file had.
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut name = path.file_name().context("no file name")?.to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true).mode(0o600);
-    std::io::Write::write_all(&mut opts.open(path)?, bytes)?;
+    let mut file = opts.open(&tmp)?;
+    // The mode above only applies to a file it creates.
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    std::io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
     Ok(())
 }

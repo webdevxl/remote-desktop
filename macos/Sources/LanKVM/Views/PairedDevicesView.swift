@@ -39,6 +39,7 @@ struct PairedDevicesView: View {
 
 private struct DeviceSection: View {
     @EnvironmentObject private var core: CoreModel
+    @Environment(\.openWindow) private var openWindow
     let title: String
     let icon: String
     let devices: [PairedDevice]
@@ -51,13 +52,32 @@ private struct DeviceSection: View {
                 Card {
                     ForEach(Array(devices.enumerated()), id: \.element.id) { index, device in
                         if index > 0 { CardDivider() }
-                        CardRow(icon: icon, tint: .lkAccent, title: device.name, detail: "Device ID \(device.deviceId)", monospacedDetail: true) {
-                            Button("Forget") { core.forget(device, canControlThisMac: canControlThisMac) }
-                                .buttonStyle(SecondaryButtonStyle(destructive: true))
+                        CardRow(icon: icon, tint: .lkAccent, title: device.name, detail: detail(device), monospacedDetail: true) {
+                            HStack(spacing: 8) {
+                                // A Mac this one controls, with an address that reaches it from anywhere.
+                                if !canControlThisMac, let address = device.internetAddress {
+                                    Button("Connect") { open(address) }
+                                        .buttonStyle(SecondaryButtonStyle())
+                                        .help("Connect to “\(device.name)” over the internet at \(address)")
+                                }
+                                Button("Forget") { core.forget(device, canControlThisMac: canControlThisMac) }
+                                    .buttonStyle(SecondaryButtonStyle(destructive: true))
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    private func detail(_ device: PairedDevice) -> String {
+        guard !canControlThisMac, let address = device.internetAddress else { return "Device ID \(device.deviceId)" }
+        // On its own line: joined with " · ", the default window width wraps it after the "·".
+        return "Device ID \(device.deviceId)\nInternet \(address)"
+    }
+
+    private func open(_ address: String) {
+        let id = core.connect(to: address)
+        openWindow(id: "viewer", value: id)
     }
 }

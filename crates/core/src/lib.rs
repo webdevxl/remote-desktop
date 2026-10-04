@@ -7,6 +7,8 @@ pub mod control;
 mod displays;
 pub mod ffi;
 mod host;
+mod internet;
+pub mod rate;
 mod render;
 mod stats;
 mod view;
@@ -21,16 +23,17 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use platform_mac::{permissions, system};
 use protocol::{CursorState, DEFAULT_PORT, DisplayChoice, InputMsg};
-use quinn::Endpoint;
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
+use transport::endpoint::Network;
 use transport::identity::{DeviceIdentity, Fingerprint, short_hex};
 use transport::pairing::TrustStore;
 
 pub use crate::client::{FrameProbe, ProbeFrame};
 pub use crate::stats::FrameTiming;
 use crate::client::{Session, SessionEvent, SessionInfo};
+use crate::internet::{HostInternet, InternetHosts};
 
 /// Notifications for the UI. Delivered on arbitrary threads.
 #[derive(Serialize, Debug)]
@@ -93,6 +96,8 @@ pub struct Trust {
     pub viewers: Mutex<TrustStore>,
     /// Macs this one has paired with as a viewer.
     pub hosts: Mutex<TrustStore>,
+    /// How to reach those Macs over the internet: the keys they gave this one.
+    pub(crate) internet_hosts: Mutex<InternetHosts>,
 }
 
 #[derive(Serialize, Clone)]
@@ -113,7 +118,7 @@ pub struct RecentHost {
 
 pub struct Core {
     rt: tokio::runtime::Runtime,
-    endpoint: Endpoint,
+    network: Network,
     trust: Arc<Trust>,
     host: Arc<host::HostCtx>,
     events: EventSink,
@@ -151,6 +156,9 @@ pub struct CoreOptions {
     pub guard_pid: Option<i32>,
     /// Tests: end control this long after granting it (`LANKVM_TEST_CONTROL_TTL`, seconds).
     pub control_ttl: Option<std::time::Duration>,
+    /// Tests: treat connections over loopback as internet ones, so internet access can be tried
+    /// on one Mac (`LANKVM_TEST_LOOPBACK_IS_INTERNET=1`). The router is then left alone.
+    pub loopback_is_internet: bool,
 }
 
 impl CoreOptions {
@@ -168,6 +176,7 @@ impl CoreOptions {
                 .and_then(|v| v.parse::<f64>().ok())
                 .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
                 .filter(|d| !d.is_zero()),
+            loopback_is_internet: std::env::var("LANKVM_TEST_LOOPBACK_IS_INTERNET").is_ok_and(|v| v == "1"),
         }
     }
 }
@@ -180,19 +189,24 @@ impl Core {
     pub fn start_with(events: EventSink, options: CoreOptions) -> Result<Arc<Self>> {
         init_logging();
         let activity = Activity(system::begin_latency_critical_activity());
-        let CoreOptions { data_dir: dir, port, video, backend, allow_same_mac_control, guard_pid, control_ttl } = options;
+        let CoreOptions { data_dir: dir, port, video, backend, allow_same_mac_control, guard_pid, control_ttl, loopback_is_internet } =
+            options;
         // Video decode runs synchronously on these (3-6 ms a frame); enough workers keep the
         // connection drivers and input writer from waiting behind it.
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
         let identity = DeviceIdentity::load_or_create(&dir)?;
-        let endpoint = {
+        let network = {
             let _guard = rt.enter();
-            transport::endpoint::make_endpoint(SocketAddr::from(([0, 0, 0, 0], port)), &identity)
+            Network::bind(SocketAddr::from(([0, 0, 0, 0], port)), &identity)
                 .with_context(|| format!("Can't listen on UDP port {port}. Is LanKVM already running?"))?
         };
-        let port = endpoint.local_addr()?.port();
+        if loopback_is_internet {
+            tracing::warn!("loopback counts as the internet (LANKVM_TEST_LOOPBACK_IS_INTERNET)");
+            network.gate.set_loopback_is_internet(true);
+        }
+        let port = network.endpoint.local_addr()?.port();
         let device_id = short_hex(&identity.fingerprint);
-        tracing::info!(addr = %endpoint.local_addr()?, %device_id, "listening");
+        tracing::info!(addr = %network.endpoint.local_addr()?, %device_id, "listening");
         tracing::info!(
             screen_capture = permissions::screen_capture_allowed(),
             input_control = permissions::input_control_allowed(),
@@ -203,6 +217,7 @@ impl Core {
             fingerprint: identity.fingerprint,
             viewers: Mutex::new(TrustStore::load(&dir.join("trusted-viewers.txt"))),
             hosts: Mutex::new(TrustStore::load(&dir.join("trusted-hosts.txt"))),
+            internet_hosts: Mutex::new(InternetHosts::load(&dir.join("internet-hosts.json"))),
         });
         // The first keyboard event a process creates must be made on the main thread (it loads
         // the keyboard layout); lk_start runs there. Elsewhere (tests) it would do no good.
@@ -210,6 +225,16 @@ impl Core {
             platform_mac::inject::warm_up();
         }
         let settings_path = dir.join("host-settings.json");
+        let settings = control::HostSettings::load(&settings_path);
+        let internet = HostInternet::new(
+            internet::load_or_create_secret(&dir)?,
+            network.gate.clone(),
+            trust.clone(),
+            port,
+            events.clone(),
+            settings.internet_access,
+            settings.public_address.clone(),
+        );
         if backend != control::Backend::Hid {
             tracing::warn!(?backend, "injected input is redirected (LANKVM_INJECT)");
         }
@@ -219,8 +244,9 @@ impl Core {
             status: Mutex::new(host::HostStatus::default()),
             events: events.clone(),
             trust: trust.clone(),
-            settings: Mutex::new(control::HostSettings::load(&settings_path)),
+            settings: Mutex::new(settings),
             settings_path,
+            internet: internet.clone(),
             backend,
             injected_tag: platform_mac::inject::new_injected_tag(),
             rt: rt.handle().clone(),
@@ -247,12 +273,15 @@ impl Core {
                 }
             });
         }
-        rt.spawn(host::run(endpoint.clone(), host.clone()));
+        // Before the first connection: the gate starts with internet access off.
+        internet.sync_keys();
+        internet.apply_mapping();
+        rt.spawn(host::run(network.clone(), host.clone()));
 
         let this_mac = ThisMac { name: system::device_name(), addresses: local_addresses(), port, device_id };
         Ok(Arc::new(Self {
             rt,
-            endpoint,
+            network,
             trust,
             host,
             events,
@@ -265,7 +294,8 @@ impl Core {
     }
 
     /// Before the app quits: lets go of everything held on this Mac for a remote viewer, and of
-    /// everything this Mac holds on remote Macs, so no key stays down anywhere. Blocks briefly.
+    /// everything this Mac holds on remote Macs, so no key stays down anywhere. Blocks briefly
+    /// (deleting the port mapping on the router gets a second at most).
     pub fn shutdown(&self) {
         // First, so sessions ending below don't start removing displays: quitting removes them.
         self.host.displays.shutdown();
@@ -276,9 +306,12 @@ impl Core {
         }
         // Tell every peer (viewers of this Mac included) the connection is over, rather than
         // leaving them to time out, and give that a moment to go out.
-        self.endpoint.close(0u32.into(), b"LanKVM quit");
-        let endpoint = self.endpoint.clone();
+        self.network.endpoint.close(0u32.into(), b"LanKVM quit");
+        let endpoint = self.network.endpoint.clone();
         let _ = self.rt.block_on(async { tokio::time::timeout(std::time::Duration::from_millis(300), endpoint.wait_idle()).await });
+        // Then delete the port mapping on the router (mDNSResponder does that without the
+        // socket). A daemon that hangs gets a second, then deletes it itself once LanKVM quits.
+        self.host.internet.stop_mapping(std::time::Duration::from_secs(1));
     }
 
     pub fn this_mac(&self) -> &ThisMac {
@@ -290,16 +323,22 @@ impl Core {
     }
 
     pub fn paired_devices(&self) -> PairedDevices {
-        let list = |store: &Mutex<TrustStore>| {
+        let list = |store: &Mutex<TrustStore>, internet: Option<&InternetHosts>| {
             store
                 .lock()
                 .unwrap()
                 .entries()
                 .iter()
-                .map(|(fp, name)| PairedDevice { fingerprint: hex(fp), device_id: short_hex(fp), name: name.clone() })
+                .map(|(fp, name)| PairedDevice {
+                    fingerprint: hex(fp),
+                    device_id: short_hex(fp),
+                    name: name.clone(),
+                    internet_address: internet.and_then(|i| i.address(fp)),
+                })
                 .collect()
         };
-        PairedDevices { viewers: list(&self.trust.viewers), hosts: list(&self.trust.hosts) }
+        let internet = self.trust.internet_hosts.lock().unwrap();
+        PairedDevices { viewers: list(&self.trust.viewers, None), hosts: list(&self.trust.hosts, Some(&internet)) }
     }
 
     pub fn recent_hosts(&self) -> Vec<RecentHost> {
@@ -349,12 +388,13 @@ impl Core {
                 }
                 SessionEvent::Display { request, info, reason, message } => Event::Display { session: id, request, info, reason, message },
                 SessionEvent::StreamError { message, width, height } => Event::StreamError { session: id, message, width, height },
+                SessionEvent::TrustChanged => Event::TrustChanged,
             };
             (core.events)(event);
         });
         let session = Session::start(
             self.rt.handle(),
-            self.endpoint.clone(),
+            self.network.clone(),
             self.trust.clone(),
             target,
             max_size,
@@ -471,6 +511,26 @@ impl Core {
         self.host.set_allow_control(allow);
     }
 
+    /// Whether paired Macs may connect over the internet. On asks the router to forward the
+    /// port; off stops that and ends the sessions that came over the internet. Returns at once.
+    pub fn set_internet_access(&self, on: bool) {
+        self.host.set_internet_access(on);
+    }
+
+    /// The address paired Macs are told to use over the internet (a dynamic DNS name or an IP,
+    /// with or without a port); "" for none.
+    pub fn set_public_address(&self, address: &str) {
+        self.host.set_public_address(address);
+    }
+
+    /// Tests: treat connections over loopback as internet ones (see
+    /// [`CoreOptions::loopback_is_internet`]).
+    #[doc(hidden)]
+    pub fn set_loopback_is_internet(&self, on: bool) {
+        self.network.gate.set_loopback_is_internet(on);
+        self.host.internet.update_mapping();
+    }
+
     /// Fresh check of the Accessibility permission (the host status includes it too).
     pub fn control_permission(&self) -> bool {
         self.host.backend.permitted()
@@ -487,7 +547,11 @@ impl Core {
         if let Err(e) = store.lock().unwrap().remove(&fp) {
             tracing::warn!("forget device: {e:#}");
         }
-        if kind != "host" {
+        if kind == "host" {
+            self.trust.internet_hosts.lock().unwrap().remove(&fp);
+        } else {
+            // Its knocks go unanswered from now on.
+            self.host.internet.sync_keys();
             self.host.close_viewers_with(&fp);
             self.host.displays.forget(fp, format!("{} forgot this Mac.", system::device_name()));
         }
@@ -511,6 +575,10 @@ pub struct PairedDevice {
     pub fingerprint: String,
     pub device_id: String,
     pub name: String,
+    /// A host's address over the internet: where this Mac last reached it, or else where it
+    /// said to reach it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internet_address: Option<String>,
 }
 
 #[derive(Serialize)]
