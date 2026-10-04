@@ -25,12 +25,15 @@ use serde::Serialize;
 use transport::video::{Reassembler, tile_of};
 
 use crate::Trust;
+use crate::rendezvous::{RelaySession, Rendezvous};
 use crate::stats::{FrameTiming, Stats, StatsView};
 use crate::view::{TileImage, ViewHandle, ViewSlot};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The same over the internet, where a host that doesn't take this Mac's knock never answers.
 const CONNECT_TIMEOUT_INTERNET: Duration = Duration::from_secs(10);
+/// A target naming a paired host by its fingerprint, as Paired Devices connects to one.
+const PAIRED_TARGET: &str = "lankvm:";
 const PING_INTERVAL: Duration = Duration::from_millis(500);
 /// A tile frame missing packets for this long is considered lost even if no newer one arrives.
 const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_millis(60);
@@ -81,6 +84,9 @@ pub struct SessionInfo {
     pub display_unavailable: String,
     /// Connected over the internet, not on the local network.
     pub internet: bool,
+    /// Its traffic goes through a LanKVM server's relay: the routers wouldn't let a direct path
+    /// through.
+    pub relayed: bool,
 }
 
 /// The host display a session shows, as the UI sees it.
@@ -213,6 +219,7 @@ impl Session {
         rt: &tokio::runtime::Handle,
         network: Network,
         trust: Arc<Trust>,
+        rendezvous: Arc<Rendezvous>,
         target: String,
         max_size: (u32, u32),
         max_fps: u32,
@@ -228,6 +235,7 @@ impl Session {
             async move {
                 let ctx = RunCtx {
                     trust,
+                    rendezvous,
                     max_size,
                     max_fps,
                     shared,
@@ -366,6 +374,7 @@ async fn resolve(target: &str) -> Result<SocketAddr> {
 
 struct RunCtx {
     trust: Arc<Trust>,
+    rendezvous: Arc<Rendezvous>,
     max_size: (u32, u32),
     /// The viewer screen's refresh rate: no point streaming faster.
     max_fps: u32,
@@ -378,28 +387,54 @@ struct RunCtx {
 }
 
 async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
-    let addr = resolve(target).await?;
-    let internet = network.gate.is_internet(addr);
-    let conn = if internet {
-        connect_over_internet(&network, target, addr, &ctx.trust).await?
-    } else {
-        tokio::time::timeout(CONNECT_TIMEOUT, network.endpoint.connect(addr, "lankvm")?)
-            .await
-            .map_err(|_| anyhow!("no answer from {addr} — is LanKVM running there?"))?
-            .context("connect")?
+    // A paired host named by its fingerprint, or an address. The relay session a connection
+    // through a LanKVM server uses lasts as long as the session.
+    let paired = paired_target(target)?;
+    // How messages name the host: by its name when connecting to it as a paired Mac, looked up
+    // first, as this Mac may forget it meanwhile.
+    let name = paired.and_then(|host| host_name(&ctx.trust, &host));
+    let (conn, addr, internet, _relay) = match paired {
+        Some(host) => {
+            let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host).await?;
+            let addr = conn.remote_address();
+            (conn, addr, internet, relay)
+        }
+        None => {
+            let addr = resolve(target).await?;
+            let internet = network.gate.is_internet(addr);
+            let conn = if internet {
+                connect_over_internet(&network, target, addr, &ctx.trust).await?
+            } else {
+                tokio::time::timeout(CONNECT_TIMEOUT, network.endpoint.connect(addr, "lankvm")?)
+                    .await
+                    .map_err(|_| anyhow!("no answer from {addr} — is LanKVM running there?"))?
+                    .context("connect")?
+            };
+            (conn, addr, internet, None)
+        }
     };
+    // At the start of a sentence, and within one.
+    let who = match (&name, paired) {
+        (Some(name), _) => name.clone(),
+        (None, Some(_)) => "That Mac".to_string(),
+        (None, None) => format!("The Mac at {target}"),
+    };
+    let within = name.unwrap_or_else(|| "that Mac".to_string());
     *ctx.conn_slot.lock().unwrap() = Some(conn.clone());
     let host_fp = peer_fingerprint(&conn).context("host sent no certificate")?;
     let trusts_host = ctx.trust.hosts.lock().unwrap().contains(&host_fp);
     // Forgotten while connecting.
     if internet && !trusts_host {
         conn.close(0u32.into(), b"");
-        bail!("The Mac at {target} isn't the one this Mac paired with.");
+        match paired {
+            Some(_) => bail!("This Mac forgot {within} while connecting to it."),
+            None => bail!("The Mac at {target} isn't the one this Mac paired with."),
+        }
     }
 
     // From here until the host says what it shows, a close without a word means it turned this
     // Mac away.
-    let away = |e| turned_away(e, &conn, internet, target);
+    let away = |e| turned_away(e, &conn, internet, &who);
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| away(e.into()))?;
     let hello = ClientMsg::Hello {
         version: PROTOCOL_VERSION,
@@ -430,6 +465,7 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
                     display_available: DisplayReason::NONE.0,
                     display_unavailable: String::new(),
                     internet,
+                    relayed: network.gate.is_relayed(addr),
                 };
             }
             // Never over the internet: a host there only asks if something is off (it forgot
@@ -451,7 +487,8 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
                 conn.close(0u32.into(), b"rejected");
                 // Hosts from protocol 1 said only "protocol version N not supported (host speaks 1)".
                 if reason.starts_with("protocol version ") {
-                    bail!("LanKVM on {addr} is older than this Mac's. Update LanKVM there, then quit and reopen it.");
+                    let on = if paired.is_some() { within.clone() } else { addr.to_string() };
+                    bail!("LanKVM on {on} is older than this Mac's. Update LanKVM there, then quit and reopen it.");
                 }
                 bail!("{reason}");
             }
@@ -476,8 +513,10 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     };
     let RunCtx { trust, shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, .. } = ctx;
     tracing::info!(?info, "connected");
-    // Where it was reached, to try first next time (and show under Paired Devices).
-    let remembered = internet && trust.internet_hosts.lock().unwrap().remember_used(&host_fp, target);
+    // Where it was reached, to try first next time (and show under Paired Devices). A paired
+    // host connected to by name was reached at one of the addresses known already, or through
+    // its server.
+    let remembered = internet && paired.is_none() && trust.internet_hosts.lock().unwrap().remember_used(&host_fp, target);
     *shared.info.lock().unwrap() = Some(info.clone());
     events(SessionEvent::Connected(info));
     if remembered {
@@ -592,13 +631,111 @@ async fn connect_over_internet(network: &Network, target: &str, addr: SocketAddr
     }
 }
 
+/// The paired host a `lankvm:<fingerprint>` target names; None for an address.
+fn paired_target(target: &str) -> Result<Option<Fingerprint>> {
+    let Some(fingerprint) = target.strip_prefix(PAIRED_TARGET) else { return Ok(None) };
+    crate::from_hex(fingerprint.trim()).map(Some).ok_or_else(|| anyhow!("{target} doesn't name a paired Mac."))
+}
+
+/// What connecting to a paired host by fingerprint reached.
+struct Reached {
+    conn: Connection,
+    /// Over the internet. (An address a host announced can also lead to the local network.)
+    internet: bool,
+    /// The LanKVM server's relay session the connection goes through, if it does.
+    relay: Option<RelaySession>,
+}
+
+/// Connects to paired host `host` over the internet, as Paired Devices does: at every address it
+/// announced or was reached at, and through its LanKVM server, all at once. The first to reach
+/// that host wins, and the others are given up (a relay session one of them started ends).
+async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trust: &Trust, host: Fingerprint) -> Result<Reached> {
+    if !trust.hosts.lock().unwrap().contains(&host) {
+        bail!("This Mac isn't paired with that Mac any more. Connect to it on the same network and enter its code to pair again.");
+    }
+    // At the start of a sentence, and within one.
+    let name = host_name(trust, &host);
+    let who = name.clone().unwrap_or_else(|| "That Mac".to_string());
+    let within = name.unwrap_or_else(|| "that Mac".to_string());
+    let way = trust.internet_hosts.lock().unwrap().way_to(&host);
+    let Some(way) = way.filter(|w| w.rendezvous.is_some() || !w.addresses.is_empty()) else {
+        bail!(
+            "{who} hasn't told this Mac how to reach it over the internet. Turn on internet access on {within} (This Mac in \
+             LanKVM), connect to it once on the same network, then try again."
+        );
+    };
+    let key = way.key;
+    let mut attempts = tokio::task::JoinSet::new();
+    if !rendezvous.force_relay() {
+        for address in way.addresses {
+            let (network, within) = (network.clone(), within.clone());
+            attempts.spawn(async move { (false, connect_at(&network, &within, &address, key).await) });
+        }
+    }
+    if let Some((server, id)) = way.rendezvous {
+        let (network, rendezvous, who) = (network.clone(), rendezvous.clone(), who.clone());
+        attempts.spawn(async move {
+            let introduced = rendezvous.connect(&who, &server, id, key).await;
+            // The address the server named can be on the local network (a server may name any):
+            // the host then takes the connection for one from there, and so does this Mac. A
+            // relay session's address counts as the internet.
+            let reached = introduced.map(|i| Reached { internet: network.gate.is_internet(i.conn.remote_address()), conn: i.conn, relay: i.relay });
+            (true, reached)
+        });
+    }
+    // Dropping the set (on an answer) gives up on the other attempts.
+    let (mut through_server, mut direct) = (None, None);
+    while let Some(attempt) = attempts.join_next().await {
+        let Ok((via_server, result)) = attempt else { continue };
+        let error = match result {
+            Ok(reached) if peer_fingerprint(&reached.conn) == Some(host) => return Ok(reached),
+            Ok(reached) => {
+                reached.conn.close(0u32.into(), b"");
+                anyhow!("The Mac that answered isn't {within}.")
+            }
+            Err(e) => e,
+        };
+        if via_server { &mut through_server } else { &mut direct }.get_or_insert(error);
+    }
+    // What the server said is the surer news (the host isn't online, or doesn't answer); then
+    // what the address tried first came to.
+    Err(through_server.or(direct).unwrap_or_else(|| anyhow!("Couldn't connect to {within}.")))
+}
+
+/// Connects to paired host `name` (as named within a sentence) at `address`, one it announced or
+/// was reached at.
+async fn connect_at(network: &Network, name: &str, address: &str, key: AccessKey) -> Result<Reached> {
+    let addr = resolve(address).await?;
+    if !network.gate.is_internet(addr) {
+        // A name that leads to the local network here (the host's own name, at home).
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, network.endpoint.connect(addr, "lankvm")?)
+            .await
+            .map_err(|_| anyhow!("No answer from {name} at {address}."))?
+            .context("connect")?;
+        return Ok(Reached { conn, internet: false, relay: None });
+    }
+    let connecting = network.endpoint.connect_with(network.internet_client_config(key), addr, "lankvm").context("connect")?;
+    let conn = tokio::time::timeout(CONNECT_TIMEOUT_INTERNET, connecting)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "No answer from {name} at {address}. On that Mac, check that internet access is on (This Mac in LanKVM) and that \
+                 its router forwards UDP port {} to it. Its public address may also have changed.",
+                addr.port()
+            )
+        })?
+        .context("connect")?;
+    Ok(Reached { conn, internet: true, relay: None })
+}
+
 /// `e`, unless the host closed the connection without a word over the internet: it took this
 /// Mac's knock but not its certificate (it forgot this Mac while it connected, or this Mac's
-/// identity is new), and says nothing more to a device it doesn't know.
-fn turned_away(e: anyhow::Error, conn: &Connection, internet: bool, target: &str) -> anyhow::Error {
+/// identity is new), and says nothing more to a device it doesn't know. `who` names the host
+/// ("The Mac at 203.0.113.7", or its name).
+fn turned_away(e: anyhow::Error, conn: &Connection, internet: bool, who: &str) -> anyhow::Error {
     match conn.close_reason() {
         Some(ConnectionError::ApplicationClosed(close)) if internet && close.error_code.into_inner() == 0 && close.reason.is_empty() => anyhow!(
-            "The Mac at {target} turned this Mac away. Connect to it on the same network once more, then try again over the internet."
+            "{who} turned this Mac away. Connect to it on the same network once more, then try again over the internet."
         ),
         _ => e,
     }
@@ -644,15 +781,16 @@ fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents, host: 
         HostMsg::InputAck { seq, received_us, injected_us } => shared.stats.lock().unwrap().on_input_ack(seq, received_us, injected_us),
         HostMsg::Display(state) => on_display(state, shared, events),
         HostMsg::VideoIdle { update, mask } => *shared.video_idle.lock().unwrap() = Some((update, mask)),
-        HostMsg::InternetAccess { key, addresses } => {
+        HostMsg::InternetAccess { key, addresses, rendezvous_server, rendezvous_id } => {
             let Ok(key) = AccessKey::try_from(key.as_slice()) else {
                 tracing::warn!(len = key.len(), "ignoring an internet access key of the wrong size");
                 return;
             };
             // Before the lock: a host sending a great many costs next to nothing.
             let addresses = crate::internet::clean_announced(addresses);
-            tracing::info!(?addresses, "host's internet addresses");
-            if host.trust.internet_hosts.lock().unwrap().set_announced(host.fingerprint, key, addresses) {
+            let rendezvous = crate::internet::clean_rendezvous(rendezvous_server, rendezvous_id);
+            tracing::info!(?addresses, server = rendezvous.as_ref().map(|(server, _)| server.as_str()), "host's internet addresses");
+            if host.trust.internet_hosts.lock().unwrap().set_announced(host.fingerprint, key, addresses, rendezvous) {
                 events(SessionEvent::TrustChanged);
             }
         }

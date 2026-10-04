@@ -199,6 +199,9 @@ pub struct ViewerView {
     pub virtual_display: bool,
     /// It connected over the internet.
     pub internet: bool,
+    /// Its traffic goes through a LanKVM server's relay (`address` then stands for the relay
+    /// session, in 240.0.0.0/4).
+    pub relayed: bool,
 }
 
 #[derive(Serialize)]
@@ -238,6 +241,7 @@ impl HostCtx {
                         display_id,
                         virtual_display: virtual_displays.iter().any(|d| d.display_id == display_id),
                         internet: v.internet,
+                        relayed: self.internet.is_relayed(v.addr),
                     }
                 })
                 .collect(),
@@ -310,6 +314,28 @@ impl HostCtx {
             }
         }
         self.internet.set_public_address(address);
+        self.changed();
+    }
+
+    /// The LanKVM server ("host:port") this Mac registers with while internet access is on, as
+    /// the user typed it, or "" for none.
+    pub fn set_rendezvous_server(&self, address: &str) {
+        let address = address.trim().to_string();
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.rendezvous_server = address.clone();
+            if let Err(e) = settings.save(&self.settings_path) {
+                tracing::warn!("save host settings: {e:#}");
+            }
+        }
+        tracing::info!(server = address, "LanKVM server");
+        // Sessions through the old server's relay end: this Mac stops listening to it in a
+        // moment (see `Rendezvous::set_host_addr`).
+        if self.internet.set_rendezvous_server(&address) {
+            for v in self.status.lock().unwrap().viewers.iter().filter(|v| self.internet.is_relayed(v.addr)) {
+                v.conn.close(8u32.into(), b"LanKVM server changed");
+            }
+        }
         self.changed();
     }
 
@@ -638,9 +664,12 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
     screen.announce(0, DisplayReason::NONE, String::new());
     // How to reach this Mac over the internet, now or once that is turned on (after Display:
     // the viewer reads that first).
+    let (rendezvous_server, rendezvous_id) = ctx.internet.rendezvous_announced();
     let _ = out.try_send(HostMsg::InternetAccess {
         key: ctx.internet.access_key(&client_fp).to_vec(),
         addresses: ctx.internet.announced_addresses(),
+        rendezvous_server,
+        rendezvous_id,
     });
 
     // While controlled, notice within a second if the Accessibility permission is withdrawn.

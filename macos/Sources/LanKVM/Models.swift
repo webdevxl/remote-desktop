@@ -100,9 +100,18 @@ struct InternetStatus: Equatable {
     /// Packets from the internet that didn't come from a paired Mac, dropped since LanKVM started
     /// (scanners, their retries, and Macs that were forgotten). Not a count of devices.
     var ignored: UInt64 = 0
+    /// The LanKVM server that introduces paired Macs to this one, with no router setup.
+    var server = InternetServer()
 
-    /// Paired Macs can reach this one: the router forwards the port, or nothing needs forwarding.
+    /// Paired Macs can reach this one directly: the router forwards the port, or nothing needs
+    /// forwarding.
     var isOpen: Bool { enabled && (state == .mapped || state == .public) }
+
+    /// Paired Macs can reach this one through the LanKVM server, whatever the router does.
+    var viaServer: Bool { enabled && server.state == .registered }
+
+    /// Paired Macs can reach this one, one way or the other.
+    var isReachable: Bool { isOpen || viaServer }
 
     /// Nothing on this Mac or its router can fix it: the network itself keeps the internet out.
     var isUnreachable: Bool {
@@ -126,7 +135,7 @@ struct InternetStatus: Equatable {
 
 extension InternetStatus: Decodable {
     private enum CodingKeys: String, CodingKey {
-        case enabled, state, problem, externalAddress, routerAddress, localAddress, port, publicAddress, announced, ignored
+        case enabled, state, problem, externalAddress, routerAddress, localAddress, port, publicAddress, announced, ignored, server
     }
 
     /// Every field is optional. A state this app doesn't know is shown as a problem it can't name
@@ -145,6 +154,48 @@ extension InternetStatus: Decodable {
         publicAddress = c.lenient(String.self, .publicAddress) ?? ""
         announced = c.lenient([String].self, .announced) ?? []
         ignored = c.lenient(UInt64.self, .ignored) ?? 0
+        server = c.lenient(InternetServer.self, .server) ?? InternetServer()
+    }
+}
+
+/// The LanKVM server (`server` in `InternetView`): this Mac stays registered with it, so paired
+/// Macs find it from anywhere and punch a direct path through both routers. When the routers
+/// won't allow that, it passes along their traffic, which stays encrypted end to end.
+struct InternetServer: Equatable {
+    enum State: String {
+        /// No server set, or internet access is off.
+        case off
+        /// Registering with it.
+        case connecting
+        /// Paired Macs can reach this Mac through it.
+        case registered
+        /// It didn't answer. The core keeps trying.
+        case unreachable
+        /// A state this app doesn't know: nothing is said about the server, and the router's
+        /// status and steps show as if there were none.
+        case other
+    }
+
+    /// "host:port" as set, or "" when turned off.
+    var address = ""
+    var state = State.off
+    /// Where the server sees this Mac on the internet ("203.0.113.7:51234"), once registered.
+    var observed: String?
+}
+
+extension InternetServer: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case address, state, observed
+    }
+
+    /// A state this app doesn't know promises nothing either way, and hides none of the router's
+    /// guidance (as connecting would).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        address = c.lenient(String.self, .address) ?? ""
+        let stateName = c.lenient(String.self, .state)
+        state = stateName.flatMap(State.init) ?? (stateName != nil && !address.isEmpty ? .other : .off)
+        observed = c.lenient(String.self, .observed).flatMap { $0.isEmpty ? nil : $0 }
     }
 }
 
@@ -160,11 +211,13 @@ struct Viewer: Decodable, Identifiable, Equatable {
     var virtualDisplay: Bool = false
     /// It connected over the internet, not from the local network.
     var internet: Bool = false
+    /// Its traffic goes through the LanKVM server: the routers wouldn't let a direct path through.
+    var relayed: Bool = false
 }
 
 extension Viewer {
     private enum CodingKeys: String, CodingKey {
-        case id, name, address, deviceId, controlling, displayId, virtualDisplay, internet
+        case id, name, address, deviceId, controlling, displayId, virtualDisplay, internet, relayed
     }
 
     init(from decoder: Decoder) throws {
@@ -177,6 +230,7 @@ extension Viewer {
         displayId = c.lenient(UInt32.self, .displayId) ?? 0
         virtualDisplay = c.lenient(Bool.self, .virtualDisplay) ?? false
         internet = c.lenient(Bool.self, .internet) ?? false
+        relayed = c.lenient(Bool.self, .relayed) ?? false
     }
 }
 
@@ -233,12 +287,15 @@ struct PairedDevice: Decodable, Identifiable, Equatable {
     /// A Mac this one controls: where it was last reached, or told this Mac to reach it, over the
     /// internet ("203.0.113.7:47800"). Nil when unknown.
     var internetAddress: String?
+    /// A Mac this one controls that it can try to reach over the internet: it told this Mac its
+    /// LanKVM server, or an address. Connect with `lk_connect("lankvm:" + fingerprint)`.
+    var reachable = false
     var id: String { fingerprint }
 }
 
 extension PairedDevice {
     private enum CodingKeys: String, CodingKey {
-        case fingerprint, deviceId, name, internetAddress
+        case fingerprint, deviceId, name, internetAddress, reachable
     }
 
     init(from decoder: Decoder) throws {
@@ -247,6 +304,7 @@ extension PairedDevice {
         deviceId = try c.decode(String.self, forKey: .deviceId)
         name = try c.decode(String.self, forKey: .name)
         internetAddress = c.lenient(String.self, .internetAddress).flatMap { $0.isEmpty ? nil : $0 }
+        reachable = c.lenient(Bool.self, .reachable) ?? false
     }
 }
 
@@ -281,12 +339,14 @@ struct SessionInfo: Decodable, Equatable {
     var displayUnavailable = ""
     /// Connected over the internet, not on the local network.
     var internet = false
+    /// Through the LanKVM server: the routers wouldn't let a direct path through.
+    var relayed = false
 }
 
 extension SessionInfo {
     private enum CodingKeys: String, CodingKey {
         case hostName, hostId, sameMachine, address, width, height, fps, codec, display, displayAvailable, displayUnavailable,
-             internet
+             internet, relayed
     }
 
     /// Lenient about everything but the stream itself: one field this app can't read would drop
@@ -306,6 +366,7 @@ extension SessionInfo {
         displayAvailable = c.lenient(Int.self, .displayAvailable) ?? DisplayReason.none
         displayUnavailable = c.lenient(String.self, .displayUnavailable) ?? ""
         internet = c.lenient(Bool.self, .internet) ?? false
+        relayed = c.lenient(Bool.self, .relayed) ?? false
     }
 }
 

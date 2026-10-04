@@ -38,7 +38,7 @@ struct ConnectView: View {
                     Card {
                         ForEach(Array(core.recents.enumerated()), id: \.element.id) { index, recent in
                             if index > 0 { CardDivider() }
-                            RecentRow(recent: recent) { open(recent.address) }
+                            RecentRow(recent: recent) { open(recent.address, label: recent.name) }
                         }
                     }
                 }
@@ -58,8 +58,9 @@ struct ConnectView: View {
         open(trimmed)
     }
 
-    private func open(_ address: String) {
-        let id = core.connect(to: address)
+    /// A recent Mac's window shows its name: its address may be "lankvm:" and a fingerprint.
+    private func open(_ address: String, label: String? = nil) {
+        let id = core.connect(to: address, label: label)
         openWindow(id: "viewer", value: id)
     }
 }
@@ -69,9 +70,14 @@ private struct RecentRow: View {
     let action: () -> Void
     @State private var hovering = false
 
+    /// A paired Mac connected to from Paired Devices is "lankvm:" and its fingerprint: no address
+    /// worth reading.
+    private var paired: Bool { recent.address.hasPrefix("lankvm:") }
+
     var body: some View {
         Button(action: action) {
-            CardRow(icon: "desktopcomputer", tint: .lkAccent, title: recent.name, detail: recent.address, monospacedDetail: true) {
+            CardRow(icon: "desktopcomputer", tint: .lkAccent, title: recent.name, detail: paired ? "Over the internet" : recent.address,
+                    monospacedDetail: !paired) {
                 Image(systemName: "arrow.right")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(hovering ? Color.lkAccent : Color.lkSecondary)

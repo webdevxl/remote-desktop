@@ -54,11 +54,12 @@ private struct DeviceSection: View {
                         if index > 0 { CardDivider() }
                         CardRow(icon: icon, tint: .lkAccent, title: device.name, detail: detail(device), monospacedDetail: true) {
                             HStack(spacing: 8) {
-                                // A Mac this one controls, with an address that reaches it from anywhere.
-                                if !canControlThisMac, let address = device.internetAddress {
-                                    Button("Connect") { open(address) }
+                                // A Mac this one controls that it can reach from anywhere: through
+                                // the LanKVM server, or at an address it told this Mac.
+                                if !canControlThisMac, device.reachable || device.internetAddress != nil {
+                                    Button("Connect") { open(device) }
                                         .buttonStyle(SecondaryButtonStyle())
-                                        .help("Connect to “\(device.name)” over the internet at \(address)")
+                                        .help(connectHelp(device))
                                 }
                                 Button("Forget") { core.forget(device, canControlThisMac: canControlThisMac) }
                                     .buttonStyle(SecondaryButtonStyle(destructive: true))
@@ -76,8 +77,16 @@ private struct DeviceSection: View {
         return "Device ID \(device.deviceId)\nInternet \(address)"
     }
 
-    private func open(_ address: String) {
-        let id = core.connect(to: address)
+    private func connectHelp(_ device: PairedDevice) -> String {
+        guard !device.reachable, let address = device.internetAddress else { return "Connect to “\(device.name)” over the internet" }
+        return "Connect to “\(device.name)” over the internet at \(address)"
+    }
+
+    /// The core tries every way it knows to that Mac ("lankvm:" and its fingerprint); a core that
+    /// doesn't say `reachable` only knows the address.
+    private func open(_ device: PairedDevice) {
+        guard let target = device.reachable ? "lankvm:\(device.fingerprint)" : device.internetAddress else { return }
+        let id = core.connect(to: target, label: device.name)
         openWindow(id: "viewer", value: id)
     }
 }

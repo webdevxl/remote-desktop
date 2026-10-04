@@ -8,7 +8,10 @@
 //! The socket sits behind a [`Gate`]: from outside the local network only paired viewers that
 //! knock get an answer. Connections over the internet get their own transport settings, picked
 //! per connection with [`Network::internet_server_config`] and [`Network::internet_client_config`].
+//! The same socket talks to rendezvous servers and punches through routers
+//! ([`Network::send_raw`]); connections relayed by a server are internet ones like any other.
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +53,7 @@ pub fn make_endpoint(bind: SocketAddr, identity: &DeviceIdentity) -> Result<Endp
 pub struct Network {
     pub endpoint: Endpoint,
     pub gate: Arc<Gate>,
+    socket: Arc<GatedSocket>,
     internet_server: Arc<quinn::ServerConfig>,
     internet_client: quinn::ClientConfig,
 }
@@ -93,9 +97,9 @@ impl Network {
         let runtime = quinn::default_runtime().context("no async runtime")?;
         let socket = Arc::new(GatedSocket::new(runtime.wrap_udp_socket(socket)?, gate.clone()));
         let mut endpoint =
-            Endpoint::new_with_abstract_socket(endpoint_config, Some(server_config), socket, runtime)?;
+            Endpoint::new_with_abstract_socket(endpoint_config, Some(server_config), socket.clone(), runtime)?;
         endpoint.set_default_client_config(client_config);
-        Ok(Self { endpoint, gate, internet_server: Arc::new(internet_server), internet_client })
+        Ok(Self { endpoint, gate, socket, internet_server: Arc::new(internet_server), internet_client })
     }
 
     /// Server config for a connection from the internet (`Incoming::accept_with`).
@@ -109,6 +113,16 @@ impl Network {
         let mut config = self.internet_client.clone();
         config.initial_dst_cid_provider(Arc::new(move || ConnectionId::new(&knock_cid(&key, now_unix()))));
         config
+    }
+
+    /// Sends `bytes` to `destination` from the endpoint's socket as one datagram, past quinn: a
+    /// rendezvous control message, or a punch. The server then sees the address QUIC uses, and a
+    /// punch opens the router for it. Waits briefly if the socket's send buffer is full; an error
+    /// then. Other failures (no route, say) quinn's socket only logs: the datagram is lost, as it
+    /// could be on the way, and the request's resends and timeouts deal with it. So is one to a
+    /// relay session's address (240.0.0.0/4), which a server may name but nobody has.
+    pub async fn send_raw(&self, destination: SocketAddr, bytes: &[u8]) -> io::Result<()> {
+        self.socket.send_raw(destination, bytes).await
     }
 }
 

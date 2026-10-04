@@ -105,7 +105,11 @@ pub enum HostMsg {
     /// host (32 bytes, the same on every connection) and the addresses the host announces for it
     /// ("203.0.113.7:47800", "home.example.com:47800"), empty while internet access is off. Sent
     /// after the first [`HostMsg::Display`].
-    InternetAccess { key: Vec<u8>, addresses: Vec<String> },
+    ///
+    /// `rendezvous_server` ("host:port") and `rendezvous_id` (16 bytes) say where the host
+    /// registers to be introduced to its viewers with no router setup, and under what ID; both
+    /// empty while internet access or the server is off.
+    InternetAccess { key: Vec<u8>, addresses: Vec<String>, rendezvous_server: String, rendezvous_id: Vec<u8> },
 }
 
 /// Which of the host's displays a client watches.
@@ -950,7 +954,8 @@ mod tests {
         assert_eq!(encode(&ClientMsg::RequestKeyframes { tiles: 5 }).unwrap(), [8, 5]);
         assert_eq!(encode(&ClientMsg::NoFullFrame).unwrap(), [9]);
         assert_eq!(encode(&HostMsg::VideoIdle { update: 1, mask: 2 }).unwrap(), [10, 1, 2]);
-        assert_eq!(encode(&HostMsg::InternetAccess { key: vec![7], addresses: vec!["a".into()] }).unwrap(), [11, 1, 7, 1, 1, 97]);
+        let access = HostMsg::InternetAccess { key: vec![7], addresses: vec!["a".into()], rendezvous_server: "b".into(), rendezvous_id: vec![9] };
+        assert_eq!(encode(&access).unwrap(), [11, 1, 7, 1, 1, 97, 1, 98, 1, 9]);
         let state = DisplayState {
             request: 0,
             display: DisplayChoice::Main,
@@ -1131,8 +1136,13 @@ mod tests {
     #[test]
     fn internet_access_round_trips() {
         for m in [
-            HostMsg::InternetAccess { key: (0..32).collect(), addresses: vec!["203.0.113.7:47800".into(), "home.example.com:47801".into()] },
-            HostMsg::InternetAccess { key: vec![0xff; 32], addresses: Vec::new() },
+            HostMsg::InternetAccess {
+                key: (0..32).collect(),
+                addresses: vec!["203.0.113.7:47800".into(), "home.example.com:47801".into()],
+                rendezvous_server: "178.156.129.211:3478".into(),
+                rendezvous_id: (100..116).collect(),
+            },
+            HostMsg::InternetAccess { key: vec![0xff; 32], addresses: Vec::new(), rendezvous_server: String::new(), rendezvous_id: Vec::new() },
         ] {
             assert_eq!(decode::<HostMsg>(&encode(&m).unwrap()).unwrap(), m);
         }

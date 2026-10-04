@@ -46,7 +46,7 @@ struct ThisMacView: View {
                     ForEach(Array(core.host.viewers.enumerated()), id: \.element.id) { index, viewer in
                         if index > 0 { CardDivider() }
                         CardRow(icon: viewer.controlling ? "cursorarrow.rays" : "eye", tint: .lkAccent, title: viewer.name,
-                                detail: "\(viewer.controlling ? "Controlling" : "Viewing") · \(viewer.address)\(viewer.internet ? " · over the internet" : "")",
+                                detail: "\(viewer.controlling ? "Controlling" : "Viewing") · \(route(viewer))",
                                 monospacedDetail: true) {
                             HStack(spacing: 8) {
                                 if viewer.controlling {
@@ -66,6 +66,13 @@ struct ThisMacView: View {
                 VirtualDisplaysSection()
             }
         }
+    }
+
+    /// Where a viewer is, and how it reaches this Mac when it isn't the local network. Through the
+    /// LanKVM server, the address is one the core made up for the relay: not worth showing.
+    private func route(_ viewer: Viewer) -> String {
+        if viewer.relayed { return "over the internet (relayed)" }
+        return viewer.internet ? "\(viewer.address) · over the internet" : viewer.address
     }
 }
 
@@ -291,12 +298,14 @@ private struct RemoteControlCard: View {
     }
 }
 
-/// Whether paired Macs can reach this Mac over the internet, and what to change on the router
-/// when they can't.
+/// Whether paired Macs can reach this Mac over the internet: through the LanKVM server, with no
+/// router setup, or directly once the router forwards the port; and what to change on the router
+/// when neither works.
 private struct InternetAccessCard: View {
     @EnvironmentObject private var core: CoreModel
 
     private var internet: InternetStatus { core.host.internet }
+    private var server: InternetServer { core.host.internet.server }
 
     private var enabled: Binding<Bool> {
         Binding(get: { core.host.internet.enabled }, set: { core.setInternetAccess($0) })
@@ -325,6 +334,7 @@ private struct InternetAccessCard: View {
                             .font(.system(size: 12))
                             .padding(.top, 2)
                         if internet.enabled {
+                            serverStatus
                             progress
                         }
                     }
@@ -338,7 +348,9 @@ private struct InternetAccessCard: View {
                         }
                     }
                     CardDivider()
-                    PublicAddressRow(saved: internet.publicAddress)
+                    AddressFieldRow(field: .publicAddress, saved: internet.publicAddress)
+                    CardDivider()
+                    AddressFieldRow(field: .server, saved: server.address)
                 }
             }
             if internet.enabled && internet.ignored > 0 {
@@ -351,13 +363,52 @@ private struct InternetAccessCard: View {
         }
     }
 
-    /// While the router is asked, or what's wrong and how to fix it.
+    /// How the LanKVM server is doing, when one is set: the way in that needs no router setup.
+    @ViewBuilder private var serverStatus: some View {
+        switch server.state {
+        case .registered:
+            StatusLine(icon: "checkmark.circle.fill", tint: .lkSuccess,
+                       text: "Reachable from anywhere through the LanKVM server — no router setup needed.",
+                       detail: server.observed.map { "The server sees this Mac at \($0)." })
+                .padding(.top, 2)
+        case .connecting:
+            StatusLine(icon: "arrow.triangle.2.circlepath", text: "Connecting to the LanKVM server…")
+                .padding(.top, 2)
+        case .unreachable:
+            StatusLine(icon: "exclamationmark.triangle.fill", tint: .lkWarning,
+                       text: "Couldn't reach the LanKVM server at \(server.address).", detail: unreachableDetail)
+                .padding(.top, 2)
+        case .off, .other:
+            EmptyView()
+        }
+    }
+
+    /// Only the router's way in is left: say whether there is one. The router's status below
+    /// says what's wrong with it.
+    private var unreachableDetail: String {
+        if internet.isOpen { return "LanKVM keeps trying. Meanwhile, paired Macs connect through your router." }
+        if internet.isManual { return "LanKVM keeps trying. Until it gets through, paired Macs can only connect directly, through your router." }
+        return "LanKVM keeps trying. Until it gets through, paired Macs can't connect over the internet."
+    }
+
+    /// While the router is asked, or what's wrong and how to fix it. Once the LanKVM server
+    /// introduces paired Macs, the router only matters for a direct connection.
     @ViewBuilder private var progress: some View {
         if internet.isManual {
             Text(manualText)
                 .font(.system(size: 12))
                 .foregroundStyle(Color.lkSecondary)
                 .fixedSize(horizontal: false, vertical: true)
+        } else if server.state == .registered {
+            if !internet.isOpen && internet.state == .problem && internet.canForwardByHand {
+                Text(directText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.lkSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } else if server.state == .connecting {
+            // The server may make the router's setup unnecessary in a moment.
+            EmptyView()
         } else if internet.state == .problem {
             VStack(alignment: .leading, spacing: 6) {
                 Text(problemText)
@@ -382,10 +433,15 @@ private struct InternetAccessCard: View {
     @ViewBuilder private var status: some View {
         if !internet.enabled {
             StatusPill(text: "Off", color: .lkSecondary)
-        } else if internet.isOpen {
+        } else if internet.isReachable {
             StatusPill(text: "Open", color: .lkSuccess)
         } else if internet.isManual {
             StatusPill(text: "Manual setup", color: .lkAccent)
+        } else if server.state == .connecting {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                StatusPill(text: "Connecting…", color: .lkSecondary)
+            }
         } else if internet.isUnreachable {
             StatusPill(text: "Not reachable", color: .lkWarning)
         } else if internet.state == .problem {
@@ -399,8 +455,8 @@ private struct InternetAccessCard: View {
     }
 
     private var tint: Color {
-        if internet.isOpen { return .lkSuccess }
-        if internet.isManual { return .lkAccent }
+        if internet.isReachable { return .lkSuccess }
+        if internet.isManual || server.state == .connecting { return .lkAccent }
         return internet.enabled && internet.state == .problem ? .lkWarning : .lkAccent
     }
 
@@ -409,6 +465,9 @@ private struct InternetAccessCard: View {
     private var explanation: String {
         if !internet.enabled {
             return "Paired Macs can only connect on your network. Turn this on to let them connect over the internet too."
+        }
+        if internet.viaServer {
+            return "Macs that paired with this one on your network can connect over the internet; anyone else gets no answer. The LanKVM server only introduces your Macs to each other. When routers block a direct path, it passes their traffic along, encrypted so that it can't read it."
         }
         if internet.isOpen {
             return "Macs that paired with this one on your network can connect over the internet. Anyone else on the internet gets no answer."
@@ -471,6 +530,17 @@ private struct InternetAccessCard: View {
         return steps
     }
 
+    /// The LanKVM server works, but the router didn't open the port: forwarding it by hand lets
+    /// paired Macs connect directly when the routers won't let a path through by themselves.
+    private var directText: String {
+        let port = String(internet.port)
+        let local = internet.localAddress ?? "this Mac"
+        let forward = internet.problem == .doubleNat
+            ? "forward UDP port \(port) to \(internet.routerAddress ?? "your router") on the outer router and to \(local) on yours"
+            : "forward UDP port \(port) to \(local) in your router's settings"
+        return "For a direct connection without going through the server, \(forward), then enter your network's public address below."
+    }
+
     /// The router didn't open the port and the user entered a public address: they forward it
     /// themselves, which LanKVM can't check.
     private var manualText: String {
@@ -491,45 +561,42 @@ private struct InternetAccessCard: View {
     }
 }
 
-/// The address paired Macs use to reach this one over the internet, as the user typed it. Saved on
-/// Return, when the field loses focus, or when it goes away.
-private struct PublicAddressRow: View {
+/// An address for internet access, as the user typed it: the one paired Macs use to reach this
+/// Mac, or the LanKVM server's. Saved on Return, when the field loses focus, or when it goes away.
+private struct AddressFieldRow: View {
+    enum Field {
+        case publicAddress
+        /// Advanced, so kept to two lines: its title beside the field.
+        case server
+    }
+
     @EnvironmentObject private var core: CoreModel
+    let field: Field
     /// What the core has now.
     let saved: String
     @State private var draft: String
     @FocusState private var focused: Bool
 
-    init(saved: String) {
+    init(field: Field, saved: String) {
+        self.field = field
         self.saved = saved
         _draft = State(initialValue: saved)
     }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            IconBadge(systemName: "link")
+            IconBadge(systemName: field == .server ? "server.rack" : "link")
             VStack(alignment: .leading, spacing: 6) {
-                Text("Public address")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color.lkText)
-                HStack(spacing: 8) {
-                    TextField("home.example.com or 203.0.113.7", text: $draft)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 12, design: .monospaced))
-                        .focused($focused)
-                        .onSubmit(save)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(Color.lkText.opacity(0.04), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .strokeBorder(focused ? Color.lkAccent.opacity(0.7) : Color.lkBorder))
-                        .frame(maxWidth: 340)
-                    if edited {
-                        Button("Save", action: save)
-                            .buttonStyle(SecondaryButtonStyle())
+                if field == .server {
+                    HStack(spacing: 10) {
+                        title
+                        input
                     }
+                } else {
+                    title
+                    input
                 }
-                Text("If your router's address changes, use a dynamic DNS name here. Paired Macs learn it the next time they connect.")
+                Text(note)
                     .font(.system(size: 12))
                     .foregroundStyle(Color.lkSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -545,13 +612,85 @@ private struct PublicAddressRow: View {
         .onDisappear(perform: save)
     }
 
+    private var title: some View {
+        Text(field == .server ? "LanKVM server" : "Public address")
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(Color.lkText)
+    }
+
+    private var input: some View {
+        HStack(spacing: 8) {
+            TextField(field == .server ? "178.156.129.211:3478" : "home.example.com or 203.0.113.7", text: $draft)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, design: .monospaced))
+                .focused($focused)
+                .onSubmit(save)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(Color.lkText.opacity(0.04), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .strokeBorder(focused ? Color.lkAccent.opacity(0.7) : Color.lkBorder))
+                .frame(maxWidth: field == .server ? 240 : 340)
+            if edited {
+                Button("Save", action: save)
+                    .buttonStyle(SecondaryButtonStyle())
+            }
+        }
+    }
+
+    /// Empty, the server field shows the usual server as its placeholder: say that it's off.
+    private var note: String {
+        switch field {
+        case .publicAddress:
+            "If your router's address changes, use a dynamic DNS name here. Paired Macs learn it the next time they connect."
+        case .server where saved.isEmpty:
+            "Off: paired Macs reach this Mac only through your router. Enter a LanKVM server to connect with no router setup."
+        case .server:
+            "Introduces paired Macs to this one. Change it only if you run your own; clear it to turn the server off."
+        }
+    }
+
     private var trimmed: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     private var edited: Bool { trimmed != saved }
 
     private func save() {
         guard edited else { return }
-        core.setPublicAddress(trimmed)
+        switch field {
+        case .publicAddress: core.setPublicAddress(trimmed)
+        case .server: core.setRendezvousServer(trimmed)
+        }
+    }
+}
+
+/// A line of status in a card: an icon beside a sentence, and a detail under it. The sentence
+/// lines up with the text of the steps.
+private struct StatusLine: View {
+    let icon: String
+    var tint = Color.lkSecondary
+    let text: String
+    var detail: String?
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(text)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.lkText)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail {
+                    Text(detail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.lkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+        }
     }
 }
 

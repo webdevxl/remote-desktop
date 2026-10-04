@@ -98,9 +98,9 @@ pub extern "C" fn lk_recent_hosts() -> *mut c_char {
     core().map_or(std::ptr::null_mut(), |c| json(&c.recent_hosts()))
 }
 
-/// Connects to `target` (IP, `ip:port` or hostname). `max_width`/`max_height` are the viewer's
-/// screen size in pixels and `max_fps` its refresh rate. Returns a session id (0 if the core
-/// isn't running).
+/// Connects to `target` (IP, `ip:port` or hostname; `lankvm:<fingerprint>` for a paired host over
+/// the internet). `max_width`/`max_height` are the viewer's screen size in pixels and `max_fps`
+/// its refresh rate. Returns a session id (0 if the core isn't running).
 ///
 /// # Safety
 /// `target` must be a valid NUL-terminated string.
@@ -445,6 +445,19 @@ pub unsafe extern "C" fn lk_set_public_address(address: *const c_char) {
     let address = unsafe { arg(address) };
     if let Some(c) = core() {
         c.set_public_address(&address);
+    }
+}
+
+/// The LanKVM server ("host:port") that introduces paired Macs to this one over the internet,
+/// with no router setup (saved). "" (or null) turns that off.
+///
+/// # Safety
+/// `address` must be null or a valid NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lk_set_rendezvous_server(address: *const c_char) {
+    let address = unsafe { arg(address) };
+    if let Some(c) = core() {
+        c.set_rendezvous_server(&address);
     }
 }
 

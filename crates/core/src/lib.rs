@@ -10,6 +10,7 @@ mod host;
 mod internet;
 pub mod rate;
 mod render;
+mod rendezvous;
 mod stats;
 mod view;
 
@@ -29,11 +30,13 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use transport::endpoint::Network;
 use transport::identity::{DeviceIdentity, Fingerprint, short_hex};
 use transport::pairing::TrustStore;
+use transport::rendezvous::{DEFAULT_SERVER, RendezvousIdentity};
 
 pub use crate::client::{FrameProbe, ProbeFrame};
 pub use crate::stats::FrameTiming;
 use crate::client::{Session, SessionEvent, SessionInfo};
 use crate::internet::{HostInternet, InternetHosts};
+use crate::rendezvous::Rendezvous;
 
 /// Notifications for the UI. Delivered on arbitrary threads.
 #[derive(Serialize, Debug)]
@@ -121,6 +124,8 @@ pub struct Core {
     network: Network,
     trust: Arc<Trust>,
     host: Arc<host::HostCtx>,
+    /// Introductions through LanKVM servers, as host and as viewer.
+    rendezvous: Arc<Rendezvous>,
     events: EventSink,
     this_mac: ThisMac,
     recents: Mutex<Recents>,
@@ -159,6 +164,13 @@ pub struct CoreOptions {
     /// Tests: treat connections over loopback as internet ones, so internet access can be tried
     /// on one Mac (`LANKVM_TEST_LOOPBACK_IS_INTERNET=1`). The router is then left alone.
     pub loopback_is_internet: bool,
+    /// The LanKVM server this Mac registers with as a host, instead of the setting
+    /// (`LANKVM_RENDEZVOUS`); "" turns it off. None: the setting. Tests set it, always: none may
+    /// reach the real server.
+    pub rendezvous: Option<String>,
+    /// Tests: connecting to a paired Mac by fingerprint goes straight to its LanKVM server's
+    /// relay, without trying its addresses or punching (`LANKVM_TEST_FORCE_RELAY=1`).
+    pub force_relay: bool,
 }
 
 impl CoreOptions {
@@ -177,6 +189,10 @@ impl CoreOptions {
                 .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
                 .filter(|d| !d.is_zero()),
             loopback_is_internet: std::env::var("LANKVM_TEST_LOOPBACK_IS_INTERNET").is_ok_and(|v| v == "1"),
+            // An instance testing internet access on one Mac doesn't register with the real
+            // LanKVM server unless told to.
+            rendezvous: std::env::var("LANKVM_RENDEZVOUS").ok().or_else(|| testing_internet().then(String::new)),
+            force_relay: std::env::var("LANKVM_TEST_FORCE_RELAY").is_ok_and(|v| v == "1"),
         }
     }
 }
@@ -189,8 +205,18 @@ impl Core {
     pub fn start_with(events: EventSink, options: CoreOptions) -> Result<Arc<Self>> {
         init_logging();
         let activity = Activity(system::begin_latency_critical_activity());
-        let CoreOptions { data_dir: dir, port, video, backend, allow_same_mac_control, guard_pid, control_ttl, loopback_is_internet } =
-            options;
+        let CoreOptions {
+            data_dir: dir,
+            port,
+            video,
+            backend,
+            allow_same_mac_control,
+            guard_pid,
+            control_ttl,
+            loopback_is_internet,
+            rendezvous: rendezvous_override,
+            force_relay,
+        } = options;
         // Video decode runs synchronously on these (3-6 ms a frame); enough workers keep the
         // connection drivers and input writer from waiting behind it.
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
@@ -226,6 +252,22 @@ impl Core {
         }
         let settings_path = dir.join("host-settings.json");
         let settings = control::HostSettings::load(&settings_path);
+        if let Some(server) = &rendezvous_override {
+            tracing::warn!(server, "the LanKVM server is set for this run, not by the setting (LANKVM_RENDEZVOUS; \"\": none)");
+        }
+        if force_relay {
+            tracing::warn!("connections to paired Macs go through the LanKVM server's relay (LANKVM_TEST_FORCE_RELAY)");
+        }
+        let rendezvous_server = rendezvous_override.clone().unwrap_or_else(|| settings.rendezvous_server.clone());
+        let rendezvous = Rendezvous::start(
+            network.clone(),
+            load_or_create_rendezvous_identity(&dir)?,
+            rt.handle().clone(),
+            events.clone(),
+            force_relay,
+            loopback_is_internet || testing_internet(),
+            rendezvous_override.as_deref().map(str::trim) == Some(DEFAULT_SERVER),
+        );
         let internet = HostInternet::new(
             internet::load_or_create_secret(&dir)?,
             network.gate.clone(),
@@ -234,6 +276,7 @@ impl Core {
             events.clone(),
             settings.internet_access,
             settings.public_address.clone(),
+            rendezvous.clone(),
         );
         if backend != control::Backend::Hid {
             tracing::warn!(?backend, "injected input is redirected (LANKVM_INJECT)");
@@ -276,6 +319,8 @@ impl Core {
         // Before the first connection: the gate starts with internet access off.
         internet.sync_keys();
         internet.apply_mapping();
+        rendezvous.set_host_server(&rendezvous_server);
+        rendezvous.set_host_enabled(internet.enabled());
         rt.spawn(host::run(network.clone(), host.clone()));
 
         let this_mac = ThisMac { name: system::device_name(), addresses: local_addresses(), port, device_id };
@@ -284,6 +329,7 @@ impl Core {
             network,
             trust,
             host,
+            rendezvous,
             events,
             this_mac,
             recents: Mutex::new(Recents::load(&dir.join("recent-hosts.txt"))),
@@ -304,6 +350,10 @@ impl Core {
         for s in &sessions {
             s.close();
         }
+        // While the socket is still open: the LanKVM server forgets this Mac now rather than in
+        // a minute or so.
+        let rendezvous = self.rendezvous.clone();
+        self.rt.block_on(async move { rendezvous.shutdown().await });
         // Tell every peer (viewers of this Mac included) the connection is over, rather than
         // leaving them to time out, and give that a moment to go out.
         self.network.endpoint.close(0u32.into(), b"LanKVM quit");
@@ -334,6 +384,7 @@ impl Core {
                     device_id: short_hex(fp),
                     name: name.clone(),
                     internet_address: internet.and_then(|i| i.address(fp)),
+                    reachable: internet.is_some_and(|i| i.reachable(fp)),
                 })
                 .collect()
         };
@@ -345,8 +396,10 @@ impl Core {
         self.recents.lock().unwrap().entries.clone()
     }
 
-    /// Opens a viewer session; progress arrives as events tagged with the returned id.
-    /// `max_size` and `max_fps` describe this Mac's screen (pixels, refresh rate).
+    /// Opens a viewer session; progress arrives as events tagged with the returned id. `target` is
+    /// an address (IP, `ip:port` or a name), or `lankvm:<fingerprint>` for a paired host reached
+    /// over the internet: at its addresses and through its LanKVM server at once. `max_size` and
+    /// `max_fps` describe this Mac's screen (pixels, refresh rate).
     pub fn connect(self: &Arc<Self>, target: &str, max_size: (u32, u32), max_fps: u32) -> u64 {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
         let target = target.trim().to_string();
@@ -396,6 +449,7 @@ impl Core {
             self.rt.handle(),
             self.network.clone(),
             self.trust.clone(),
+            self.rendezvous.clone(),
             target,
             max_size,
             max_fps,
@@ -523,6 +577,12 @@ impl Core {
         self.host.set_public_address(address);
     }
 
+    /// The LanKVM server ("host:port") this Mac registers with while internet access is on, so
+    /// paired Macs reach it with no router setup; "" for none. Saved; takes effect at once.
+    pub fn set_rendezvous_server(&self, address: &str) {
+        self.host.set_rendezvous_server(address);
+    }
+
     /// Tests: treat connections over loopback as internet ones (see
     /// [`CoreOptions::loopback_is_internet`]).
     #[doc(hidden)]
@@ -579,6 +639,9 @@ pub struct PairedDevice {
     /// said to reach it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub internet_address: Option<String>,
+    /// A host this Mac knows a way to try over the internet (its LanKVM server, or an address):
+    /// connect with `lankvm:<fingerprint>`.
+    pub reachable: bool,
 }
 
 #[derive(Serialize)]
@@ -619,16 +682,34 @@ impl Recents {
     }
 }
 
-fn hex(fp: &Fingerprint) -> String {
-    fp.iter().map(|b| format!("{b:02x}")).collect()
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn from_hex(s: &str) -> Option<Fingerprint> {
+/// `N` bytes in hex (a fingerprint, a key, an ID).
+fn from_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
     let bytes: Vec<u8> = (0..s.len())
         .step_by(2)
         .map(|i| s.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
         .collect::<Option<_>>()?;
     bytes.try_into().ok()
+}
+
+/// This Mac's key for LanKVM servers (`rendezvous-key.p8`). A damaged one is replaced: paired
+/// viewers then learn the new ID on their next connection on the local network.
+fn load_or_create_rendezvous_identity(dir: &Path) -> Result<RendezvousIdentity> {
+    RendezvousIdentity::load_or_create(dir).or_else(|e| {
+        tracing::warn!("{e:#}: making a new rendezvous key");
+        let _ = std::fs::remove_file(dir.join(transport::rendezvous::KEY_FILE));
+        RendezvousIdentity::load_or_create(dir)
+    })
+}
+
+/// `LANKVM_TEST_LOOPBACK_IS_INTERNET` is set, to anything (not only "1", which makes loopback
+/// count as the internet): this instance tests internet access, and never contacts the real
+/// LanKVM server unless `LANKVM_RENDEZVOUS` names it.
+fn testing_internet() -> bool {
+    std::env::var_os("LANKVM_TEST_LOOPBACK_IS_INTERNET").is_some()
 }
 
 /// `$LANKVM_DATA_DIR` gives an instance its own identity, trust lists and log, so a second copy
@@ -705,7 +786,9 @@ mod tests {
     fn hex_round_trip() {
         let fp: Fingerprint = core::array::from_fn(|i| i as u8 * 7);
         assert_eq!(from_hex(&hex(&fp)), Some(fp));
-        assert_eq!(from_hex("zz"), None);
+        assert_eq!(from_hex::<32>("zz"), None);
+        assert_eq!(from_hex::<2>("0aff"), Some([10, 255]));
+        assert_eq!(from_hex::<2>("0aff00"), None, "the wrong size");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Internet access end to end over real QUIC on loopback. Both cores treat loopback as the
 //! internet (`set_loopback_is_internet`), so connections between them take the internet path:
-//! the gate, knocks, and the checks around them. Nothing is asked of the router.
+//! the gate, knocks, and the checks around them. Nothing is asked of the router. LanKVM servers
+//! are in-process ones (`transport::test_server`): no test reaches the real one.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -10,8 +11,11 @@ use std::time::{Duration, Instant};
 
 use lankvm_core::control::Backend;
 use lankvm_core::{Core, CoreOptions, Event};
-use serde_json::Value;
+use protocol::InputMsg;
+use serde_json::{Value, json};
 use transport::identity::DeviceIdentity;
+use transport::rendezvous::{Message, RendezvousId};
+use transport::test_server::TestServer;
 
 const WAIT: Duration = Duration::from_secs(5);
 /// Longer than the viewer waits for an answer over the internet (10 s).
@@ -25,7 +29,15 @@ struct Peer {
 }
 
 impl Peer {
+    /// A core with no LanKVM server.
     fn start(dir: &Path, backend: Backend) -> Self {
+        Self::start_with(dir, backend, "", false)
+    }
+
+    /// A core registering with LanKVM server `rendezvous` as a host ("" for none). With
+    /// `force_relay`, it reaches paired hosts it connects to by fingerprint through their
+    /// server's relay alone.
+    fn start_with(dir: &Path, backend: Backend, rendezvous: &str, force_relay: bool) -> Self {
         let (tx, events) = channel();
         let tx = Mutex::new(tx);
         let options = CoreOptions {
@@ -37,6 +49,8 @@ impl Peer {
             guard_pid: None,
             control_ttl: None,
             loopback_is_internet: false,
+            rendezvous: Some(rendezvous.to_string()),
+            force_relay,
         };
         let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
         Self { core, events, pending: RefCell::new(Vec::new()) }
@@ -76,9 +90,14 @@ impl Peer {
     /// Connects to `target` and waits for the session to start (Ok: its id and whether it went
     /// over the internet) or end (Err: the error shown).
     fn connect(&self, target: &str, timeout: Duration) -> Result<(u64, bool), String> {
+        self.connect_relayed(target, timeout).map(|(id, internet, _)| (id, internet))
+    }
+
+    /// [`Self::connect`], also saying whether the session goes through a LanKVM server's relay.
+    fn connect_relayed(&self, target: &str, timeout: Duration) -> Result<(u64, bool, bool), String> {
         let id = self.core.connect(target, (1920, 1080), 60);
         self.wait("connected or ended", timeout, |e| match e {
-            Event::Connected { session, info } if session == id => Ok(Ok((id, info.internet))),
+            Event::Connected { session, info } if session == id => Ok(Ok((id, info.internet, info.relayed))),
             Event::Ended { session, error } if session == id => Ok(Err(error.unwrap_or_default())),
             e => Err(e),
         })
@@ -155,13 +174,18 @@ struct Setup {
 /// the viewer got its key), both now treating loopback as the internet. Internet access on the
 /// host is as `internet_access` says.
 fn setup(name: &str, internet_access: bool) -> Setup {
+    setup_with(name, internet_access, "")
+}
+
+/// [`setup`], with the host registering with LanKVM server `rendezvous` ("" for none).
+fn setup_with(name: &str, internet_access: bool, rendezvous: &str) -> Setup {
     let root = std::env::temp_dir().join(format!("lankvm-internet-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (host_dir, host_fp) = device(&root, "host");
     let (viewer_dir, viewer_fp) = device(&root, "viewer");
     trust(&host_dir, "trusted-viewers.txt", &[(&viewer_fp, "viewer")]);
     trust(&viewer_dir, "trusted-hosts.txt", &[(&host_fp, "host")]);
-    let host = Peer::start(&host_dir, Backend::Record(root.join("injected.jsonl")));
+    let host = Peer::start_with(&host_dir, Backend::Record(root.join("injected.jsonl")), rendezvous, false);
     let viewer = Peer::start(&viewer_dir, Backend::Hid);
 
     let (id, internet) = viewer.connect(&host.target(), WAIT).expect("connect on the local network");
@@ -315,4 +339,239 @@ fn a_host_that_takes_the_knock_but_not_the_certificate_turns_the_viewer_away() {
     let error = viewer.connect(&target, WAIT).expect_err("turned away");
     assert!(error.starts_with(&format!("The Mac at {target} turned this Mac away.")), "{error}");
     assert!(host.status()["viewers"].as_array().unwrap().is_empty());
+}
+
+/// The in-process LanKVM server, on a runtime of its own (these tests are synchronous).
+struct Server {
+    server: TestServer,
+    _rt: tokio::runtime::Runtime,
+}
+
+impl Server {
+    fn start() -> Self {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let server = rt.block_on(TestServer::start()).unwrap();
+        Self { server, _rt: rt }
+    }
+
+    fn addr(&self) -> String {
+        self.server.addr().to_string()
+    }
+}
+
+/// A host registered with `server`, and a viewer that knows no way to it but the server: it
+/// learned the server and the host's ID in a session over the internet, then started again with
+/// the host's addresses forgotten. With `force_relay`, the viewer goes through the relay alone.
+/// Also the host's ID at the server.
+fn introduced(name: &str, server: &Server, force_relay: bool) -> (Setup, RendezvousId) {
+    let Setup { root, host, viewer, viewer_dir, host_fp, viewer_fp } = setup_with(name, true, &server.addr());
+    wait_until("the host to register", || host.status()["internet"]["server"]["state"] == "registered");
+    let (session, _) = viewer.connect(&host.target(), WAIT).expect("connect over the internet");
+    wait_until("the viewer to learn the server", || internet_host(&viewer_dir, &host_fp)["server"] == server.addr().as_str());
+    viewer.core.disconnect(session);
+    wait_until("the viewer to leave", || host.status()["viewers"].as_array().unwrap().is_empty());
+    let id_hex = internet_host(&viewer_dir, &host_fp)["id"].as_str().unwrap().to_string();
+    let id: RendezvousId = (0..16).map(|i| u8::from_str_radix(&id_hex[2 * i..2 * i + 2], 16).unwrap()).collect::<Vec<_>>().try_into().unwrap();
+    assert_eq!(server.server.registered(&id), Some(host.target().parse().unwrap()));
+
+    drop(viewer);
+    let path = viewer_dir.join("internet-hosts.json");
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    stored[&host_fp]["announced"] = json!([]);
+    stored[&host_fp]["used"] = json!([]);
+    std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    let viewer = Peer::start_with(&viewer_dir, Backend::Hid, "", force_relay);
+    viewer.core.set_loopback_is_internet(true);
+    (Setup { root, host, viewer, viewer_dir, host_fp, viewer_fp }, id)
+}
+
+impl Setup {
+    /// How Paired Devices connects to the host.
+    fn paired_target(&self) -> String {
+        format!("lankvm:{}", self.host_fp)
+    }
+}
+
+#[test]
+fn a_paired_viewer_connects_through_the_lankvm_server() {
+    let server = Server::start();
+    let (s, _) = introduced("rendezvous", &server, false);
+    let shown = &s.host.status()["internet"]["server"];
+    assert_eq!(shown["address"], server.addr().as_str());
+    assert_eq!(shown["state"], "registered");
+    assert_eq!(shown["observed"], s.host.target().as_str());
+    // Paired Devices offers to connect, though no address is known.
+    let paired = serde_json::to_value(s.viewer.core.paired_devices()).unwrap();
+    assert_eq!(paired["hosts"][0]["reachable"], true, "{paired}");
+    assert!(paired["hosts"][0].get("internetAddress").is_none(), "{paired}");
+
+    let (session, internet, relayed) = s.viewer.connect_relayed(&s.paired_target(), WAIT).expect("connect through the server");
+    assert!(internet && !relayed);
+    wait_until("the host to list the viewer", || s.host.status()["viewers"][0]["internet"] == true);
+    assert_eq!(s.host.status()["viewers"][0]["relayed"], false);
+    // Punched through: from Mac to Mac, nothing through the server.
+    assert_eq!((server.server.relay_sessions(), server.server.stats().relayed), (0, 0));
+    // The target is what recent hosts keep; it isn't an address to remember.
+    assert_eq!(s.viewer.core.recent_hosts()[0].address, s.paired_target());
+    assert_eq!(internet_host(&s.viewer_dir, &s.host_fp)["used"], json!([]));
+    s.viewer.core.disconnect(session);
+}
+
+#[test]
+fn a_viewer_connects_through_the_relay_and_takes_control() {
+    let server = Server::start();
+    let (s, _) = introduced("relay", &server, true);
+    let (session, internet, relayed) = s.viewer.connect_relayed(&s.paired_target(), WAIT).expect("connect through the relay");
+    assert!(internet && relayed);
+    wait_until("the host to list the viewer", || s.host.status()["viewers"][0]["relayed"] == true);
+    assert_eq!(s.host.status()["viewers"][0]["internet"], true);
+
+    let request = s.viewer.core.set_control(session, true, false);
+    let active = s.viewer.wait("control answer", WAIT, |e| match e {
+        Event::Control { session: id, request: r, active, .. } if id == session && r == request => Ok(active),
+        e => Err(e),
+    });
+    assert!(active);
+    s.viewer.core.send_input(session, InputMsg::Key { code: 0, down: true, repeat: false });
+    s.viewer.core.send_input(session, InputMsg::Key { code: 0, down: false, repeat: false });
+    let record = s.root.0.join("injected.jsonl");
+    wait_until("the key to reach the host", || {
+        std::fs::read_to_string(&record).unwrap_or_default().lines().any(|l| l.contains("\"keyup\""))
+    });
+    let stats = server.server.stats();
+    assert!(stats.relayed > 10 && stats.dropped == 0, "{stats:?}");
+    assert_eq!(server.server.relay_sessions(), 1);
+    s.viewer.core.disconnect(session);
+    wait_until("the host to see the viewer leave", || s.host.status()["viewers"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn turning_internet_access_off_ends_relayed_sessions_cleanly() {
+    let server = Server::start();
+    let (s, _) = introduced("relay-off", &server, true);
+    let (session, _, relayed) = s.viewer.connect_relayed(&s.paired_target(), WAIT).expect("connect through the relay");
+    assert!(relayed);
+    wait_until("the host to list the viewer", || s.host.status()["viewers"][0]["relayed"] == true);
+
+    // The host's close still goes out through the relay: the session ends at once, without an
+    // error, rather than when the viewer gives up waiting (15 s).
+    s.host.core.set_internet_access(false);
+    let error = s.viewer.wait("session ended", WAIT, |e| match e {
+        Event::Ended { session: id, error } if id == session => Ok(error),
+        e => Err(e),
+    });
+    assert_eq!(error, None);
+}
+
+#[test]
+fn the_relay_takes_over_when_punching_fails() {
+    let server = Server::start();
+    let (s, _) = introduced("lying", &server, false);
+    // The server sends each Mac toward an address that never answers.
+    server.server.set_lie_about_endpoints(true);
+    let (session, internet, relayed) = s.viewer.connect_relayed(&s.paired_target(), NO_ANSWER_WAIT).expect("connect through the relay");
+    assert!(internet && relayed);
+    wait_until("the host to list the viewer", || s.host.status()["viewers"][0]["relayed"] == true);
+    assert_eq!(server.server.relay_sessions(), 1);
+    s.viewer.core.disconnect(session);
+}
+
+#[test]
+fn a_host_with_internet_access_off_isnt_online_at_the_lankvm_server() {
+    let server = Server::start();
+    let (s, id) = introduced("offline", &server, false);
+    s.host.core.set_internet_access(false);
+    assert_eq!(s.host.status()["internet"]["server"]["state"], "off");
+    wait_until("the host to unregister", || server.server.registered(&id).is_none());
+
+    let started = Instant::now();
+    let error = s.viewer.connect(&s.paired_target(), WAIT).expect_err("not online");
+    assert_eq!(error, "host isn't reachable over the internet right now: LanKVM isn't running there, or its internet access is off.");
+    assert!(started.elapsed() < Duration::from_secs(2), "the server says so at once");
+}
+
+#[test]
+fn a_forgotten_viewer_gets_no_answer_through_the_lankvm_server() {
+    let server = Server::start();
+    let (s, _) = introduced("forgotten", &server, false);
+    s.host.core.forget_device("viewer", &s.viewer_fp);
+
+    let error = s.viewer.connect(&s.paired_target(), NO_ANSWER_WAIT).expect_err("no answer");
+    assert_eq!(error, "host didn't answer through the LanKVM server.");
+    assert!(s.host.status()["viewers"].as_array().unwrap().is_empty());
+    assert_eq!(server.server.relay_sessions(), 0);
+}
+
+#[test]
+fn a_lankvm_server_that_is_down_is_named() {
+    let server = Server::start();
+    let (s, _) = introduced("down", &server, false);
+    let addr = server.addr();
+    drop(server);
+
+    // Nothing answers, not even a request any running server answers: the server is down, not
+    // the host quiet. (The host notices at its next keepalive, 20 s on.)
+    let error = s.viewer.connect(&s.paired_target(), NO_ANSWER_WAIT).expect_err("no server");
+    assert_eq!(error, format!("Couldn't reach the LanKVM server at {addr}."));
+}
+
+#[test]
+fn a_lankvm_server_on_the_local_network_isnt_used() {
+    let server = Server::start();
+    let (s, _) = introduced("local-server", &server, false);
+    // To the viewer, the server (on loopback) is on the local network now: it can't introduce
+    // Macs over the internet, and while in use it would keep that address's packets from quinn.
+    s.viewer.core.set_loopback_is_internet(false);
+    let started = Instant::now();
+    let error = s.viewer.connect(&s.paired_target(), WAIT).expect_err("not used");
+    assert_eq!(error, format!("host uses a LanKVM server at {}, which isn't on the internet.", server.addr()));
+    assert!(started.elapsed() < Duration::from_secs(2), "fails at once, without asking");
+}
+
+#[test]
+fn a_host_answers_only_the_challenges_it_asked_for() {
+    let root = std::env::temp_dir().join(format!("lankvm-internet-challenge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _cleanup = TempDir(root.clone());
+    let (dir, _) = device(&root, "host");
+    // A server played by hand, to send what a real one wouldn't.
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    server.set_read_timeout(Some(WAIT)).unwrap();
+    let host = Peer::start_with(&dir, Backend::Hid, &server.local_addr().unwrap().to_string(), false);
+    host.core.set_loopback_is_internet(true);
+    host.core.set_internet_access(true);
+    let mut buf = [0u8; 2048];
+    let mut receive = || {
+        let (len, from) = server.recv_from(&mut buf).expect("a request");
+        (Message::decode(&buf[..len]).expect("a message"), from)
+    };
+    let (Message::RegisterBegin { .. }, host_addr) = receive() else { panic!("not a REGISTER_BEGIN") };
+    server.send_to(&Message::Challenge { cookie: [1; 16] }.encode(), host_addr).unwrap();
+    let (Message::Register { cookie: [1, ..], .. }, _) = receive() else { panic!("not a REGISTER with the cookie") };
+    server.send_to(&Message::Registered { ttl_secs: 75, observed: host_addr }.encode(), host_addr).unwrap();
+    wait_until("the host to register", || host.status()["internet"]["server"]["state"] == "registered");
+
+    // A challenge out of the blue, as anyone passing for the server could send: no registering
+    // with its cookie, and the card still says registered.
+    server.send_to(&Message::Challenge { cookie: [2; 16] }.encode(), host_addr).unwrap();
+    server.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let sent = server.recv_from(&mut buf).ok().and_then(|(len, _)| Message::decode(&buf[..len]));
+    assert!(sent.is_none(), "{sent:?}");
+    assert_eq!(host.status()["internet"]["server"]["state"], "registered");
+}
+
+#[test]
+fn a_mac_with_no_way_to_a_paired_host_says_so() {
+    let s = setup("no-way", false);
+    let started = Instant::now();
+    let error = s.viewer.connect(&format!("lankvm:{}", s.host_fp), WAIT).expect_err("no way");
+    assert!(error.starts_with("host hasn't told this Mac how to reach it over the internet."), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2), "fails at once, without trying");
+    let paired = serde_json::to_value(s.viewer.core.paired_devices()).unwrap();
+    assert_eq!(paired["hosts"][0]["reachable"], false, "{paired}");
+
+    let error = s.viewer.connect(&format!("lankvm:{}", "ab".repeat(32)), WAIT).expect_err("not paired");
+    assert!(error.starts_with("This Mac isn't paired with that Mac any more."), "{error}");
+    let error = s.viewer.connect("lankvm:nonsense", WAIT).expect_err("not a fingerprint");
+    assert_eq!(error, "lankvm:nonsense doesn't name a paired Mac.");
 }

@@ -35,6 +35,11 @@ final class CoreModel: ObservableObject {
         case doubleNat
         /// The router didn't answer, and the user forwarded the port and entered the public address.
         case manual
+        /// The router didn't answer, but the LanKVM server introduces paired Macs: reachable with
+        /// no router setup, with a Mac connected through the server.
+        case server
+        /// The router didn't answer, and the LanKVM server doesn't either.
+        case noServer
     }
 
     /// Sample state for UI snapshots (`--snapshot`), without starting the network core.
@@ -44,8 +49,10 @@ final class CoreModel: ObservableObject {
         var viewers = [Viewer(id: 1, name: "Studio", address: "192.168.1.31", deviceId: "9f12:0ab3:77c1:e402", controlling: screenAllowed,
                               displayId: displays ? 5 : 1, virtualDisplay: displays)]
         var pairedViewers = [PairedDevice(fingerprint: "aa", deviceId: "9f12:0ab3:77c1:e402", name: "Studio")]
-        if internet == .open {
-            viewers.append(Viewer(id: 2, name: "MacBook Air", address: "198.51.100.24", deviceId: "c3a9:51e0:0d7b:9e26", internet: true))
+        if internet == .open || internet == .server {
+            // Through the server, the core reports the address it made up for the relay.
+            viewers.append(Viewer(id: 2, name: "MacBook Air", address: internet == .server ? "::ffff:240.0.0.1" : "198.51.100.24",
+                                  deviceId: "c3a9:51e0:0d7b:9e26", internet: true, relayed: internet == .server))
             pairedViewers.append(PairedDevice(fingerprint: "dd", deviceId: "c3a9:51e0:0d7b:9e26", name: "MacBook Air"))
         }
         host = HostStatus(
@@ -64,14 +71,19 @@ final class CoreModel: ObservableObject {
             viewers: pairedViewers,
             hosts: [
                 PairedDevice(fingerprint: "bb", deviceId: "41de:93a0:c2f7:118b", name: "Mac mini",
-                             internetAddress: internet == .off ? nil : "198.51.100.17:47800"),
-                PairedDevice(fingerprint: "cc", deviceId: "07b9:5c2e:a1d4:6f30", name: "Studio"),
+                             internetAddress: internet == .off ? nil : "198.51.100.17:47800", reachable: internet == .server),
+                // Through the server, a Mac is reachable without an address.
+                PairedDevice(fingerprint: "cc", deviceId: "07b9:5c2e:a1d4:6f30", name: "Studio", reachable: internet == .server),
             ]
         )
         recents = [
             RecentHost(address: "192.168.1.40", name: "Mac mini"),
             RecentHost(address: "192.168.1.31", name: "Studio"),
         ]
+        if internet == .server {
+            // Connected to from Paired Devices, through the server.
+            recents.insert(RecentHost(address: "lankvm:" + String(repeating: "07b95c2ea1d46f30", count: 4), name: "Studio"), at: 0)
+        }
         canShareScreen = screenAllowed
     }
 
@@ -91,8 +103,17 @@ final class CoreModel: ObservableObject {
         case .manual:
             InternetStatus(enabled: true, state: .problem, problem: .noResponse, localAddress: "192.168.1.23",
                            publicAddress: "home.example.com", announced: ["home.example.com:47800"], ignored: 4)
+        case .server:
+            InternetStatus(enabled: true, state: .problem, problem: .noResponse, localAddress: "192.168.1.23", ignored: 12,
+                           server: InternetServer(address: sampleServer, state: .registered, observed: "203.0.113.7:51234"))
+        case .noServer:
+            InternetStatus(enabled: true, state: .problem, problem: .noResponse, localAddress: "192.168.1.23",
+                           server: InternetServer(address: sampleServer, state: .unreachable))
         }
     }
+
+    /// The server LanKVM uses unless told otherwise (`HostSettings` in crates/core).
+    private static let sampleServer = "178.156.129.211:3478"
 
     func start() {
         guard thisMac == nil, startError == nil else { return }
@@ -251,15 +272,16 @@ final class CoreModel: ObservableObject {
 
     // MARK: Viewer sessions
 
-    /// Starts a session and returns its id, to open a viewer window for.
-    func connect(to target: String) -> UInt64 {
+    /// Starts a session and returns its id, to open a viewer window for. `label`: what the window
+    /// calls the Mac until it answers (the target itself if nil).
+    func connect(to target: String, label: String? = nil) -> UInt64 {
         let screen = NSScreen.main ?? NSScreen.screens.first
         let scale = screen?.backingScaleFactor ?? 2
         let size = screen?.frame.size ?? CGSize(width: 1920, height: 1080)
         // ProMotion screens run at 120 Hz: frames twice as often means input shows up sooner.
         let fps = UInt32(max(30, screen?.maximumFramesPerSecond ?? 60))
         let id = lk_connect(target, UInt32(size.width * scale), UInt32(size.height * scale), fps)
-        sessions[id] = SessionModel(id: id, target: target)
+        sessions[id] = SessionModel(id: id, target: target, label: label)
         return id
     }
 
@@ -474,6 +496,13 @@ final class CoreModel: ObservableObject {
         refreshHost()
     }
 
+    /// The LanKVM server ("host:port") that introduces paired Macs to this one over the internet.
+    /// "" turns it off: paired Macs then reach this Mac only through its router.
+    func setRendezvousServer(_ address: String) {
+        lk_set_rendezvous_server(address)
+        refreshHost()
+    }
+
     // MARK: Accessibility (needed to be controlled, and to send Dock gestures)
 
     /// Asks macOS to let LanKVM post and filter input: shows the system prompt the first time
@@ -590,6 +619,8 @@ final class SessionModel: ObservableObject, Identifiable {
 
     let id: UInt64
     let target: String
+    /// The Mac's name until it answers: its paired name for a "lankvm:" target, else the target.
+    let label: String
     @Published var phase: Phase = .connecting
     @Published var mode: Mode = .view
     @Published var control: ControlStatus = .off
@@ -624,16 +655,17 @@ final class SessionModel: ObservableObject, Identifiable {
     /// Whether the session ever showed the remote screen (for wording when it ends).
     var wasConnected = false
 
-    init(id: UInt64, target: String) {
+    init(id: UInt64, target: String, label: String? = nil) {
         self.id = id
         self.target = target
+        self.label = label ?? target
     }
 
     var isControlling: Bool { control == .active }
 
     var hostName: String {
         if case .connected(let info) = phase { return info.hostName }
-        return target
+        return label
     }
 
     private var toastGeneration = 0

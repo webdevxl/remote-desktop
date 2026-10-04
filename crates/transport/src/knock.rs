@@ -14,6 +14,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -104,6 +105,10 @@ impl KnockKeys {
         }
         None
     }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &(Fingerprint, hmac::Key)> {
+        self.0.iter()
+    }
 }
 
 /// Compares in a time that depends only on the length, so how fast a guess is rejected tells a
@@ -130,18 +135,19 @@ pub(crate) enum Seen {
     Replayed,
 }
 
-/// Nonces of recent valid knocks and the address each first came from.
+/// Nonces of recent valid knocks (or rendezvous tokens, whose nonces are longer) and the address
+/// each first came from.
 #[derive(Default)]
-pub(crate) struct ReplayCache {
-    first_from: HashMap<Nonce, SocketAddr>,
+pub(crate) struct ReplayCache<N = Nonce> {
+    first_from: HashMap<N, SocketAddr>,
     /// How many of those nonces each address sent.
     knocks_from: HashMap<SocketAddr, usize>,
     /// Oldest first.
-    order: VecDeque<(Nonce, Instant)>,
+    order: VecDeque<(N, Instant)>,
 }
 
-impl ReplayCache {
-    pub(crate) fn note(&mut self, nonce: Nonce, remote: SocketAddr, now: Instant) -> Seen {
+impl<N: Copy + Eq + Hash> ReplayCache<N> {
+    pub(crate) fn note(&mut self, nonce: N, remote: SocketAddr, now: Instant) -> Seen {
         self.expire(now);
         if let Some(&first) = self.first_from.get(&nonce) {
             return if first == remote { Seen::Again } else { Seen::Replayed };

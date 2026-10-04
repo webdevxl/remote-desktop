@@ -26,9 +26,9 @@
 #      HIDDEN=1 (start the host copy hidden: its window never shows),
 #      STATS=1 (the viewer shows its stats overlay; off by default, it changes what's measured).
 # Test knobs pass through when set: LANKVM_TILES, LANKVM_FULL_FRAME_AT, LANKVM_MOTION,
-# LANKVM_ENCODER_PROPS, LANKVM_LOG_STATS and LANKVM_TEST_LOOPBACK_IS_INTERNET to the host copy;
-# those and LANKVM_CONNECT_DISPLAY,
-# LANKVM_KEEP_WARM_MS and MTL_HUD_ENABLED to the viewer (scripts/second-instance.sh).
+# LANKVM_ENCODER_PROPS, LANKVM_LOG_STATS, LANKVM_TEST_LOOPBACK_IS_INTERNET and LANKVM_RENDEZVOUS to
+# the host copy; those and LANKVM_CONNECT_DISPLAY, LANKVM_KEEP_WARM_MS and MTL_HUD_ENABLED to the
+# viewer (scripts/second-instance.sh).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -105,7 +105,7 @@ host)
     *) echo "error: mode is record, hid or pid" >&2; exit 2 ;;
     esac
     knobs=()
-    for var in LANKVM_TILES LANKVM_FULL_FRAME_AT LANKVM_MOTION LANKVM_ENCODER_PROPS LANKVM_LOG_STATS LANKVM_TEST_LOOPBACK_IS_INTERNET; do
+    for var in LANKVM_TILES LANKVM_FULL_FRAME_AT LANKVM_MOTION LANKVM_ENCODER_PROPS LANKVM_LOG_STATS LANKVM_TEST_LOOPBACK_IS_INTERNET LANKVM_RENDEZVOUS; do
         if [[ -n "${!var:-}" ]]; then knobs+=(--env "$var=${!var}"); fi
     done
     # -j: launched hidden, so its window stays off the screen (it's only a host).

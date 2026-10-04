@@ -2,7 +2,8 @@
 
 Low-latency remote desktop for Macs on the same local network, built as a software network KVM.
 Every Mac runs the same app. Others on the LAN can view it, and it can connect to them by IP.
-Paired Macs can also connect over the internet, if the Mac they connect to turns that on.
+Paired Macs can also connect over the internet, if the Mac they connect to turns that on, with
+no router setup: a small LanKVM server introduces them to each other.
 
 **Status:** prototype. You enter an IP, enter a PIN once, and see the other Mac's screen. Each
 viewer window has two modes: **View** only looks; **Control** uses the other Mac's keyboard and
@@ -203,30 +204,48 @@ as one full frame (above 1: never).
 
 ### Connecting over the internet
 
-Off by default, and only for Macs that have paired.
+Off by default, and only for Macs that have paired. Nothing to set up on either router.
 
 1. **Pair on the same network first.** Connect once from the other Mac on your network and enter
    the code. Pairing never happens over the internet. On every connection the host also hands
-   the viewer its key for knocking from the internet (see Security model).
+   the viewer its key for the internet, and says how to reach it there (see Security model).
 2. On the Mac to reach, open **This Mac** and turn on **Let paired Macs connect over the
-   internet**. LanKVM asks the router to forward its UDP port (macOS speaks UPnP, NAT-PMP and
-   PCP for it). When the router does, the card shows the address to use, e.g.
-   `203.0.113.7:47800`. When it doesn't, the card says why and what to forward by hand: UDP port
-   47800 to this Mac's address on the network, e.g. `192.168.1.20`. Reserve that address for
-   the Mac in the router's settings (a DHCP reservation), so the forward keeps pointing at it.
-3. Most home connections get a new public address now and then. If you have a dynamic DNS name,
-   or forwarded the port by hand, enter it under **Public address**, e.g. `home.example.com`
-   (the port is added if you leave it out). The host tells its paired Macs where to reach it
-   each time they connect. Once they know it at an address, they don't knock anywhere else (see
-   Security model): if the address changed and has no name, connect once on the local network
-   so the host can tell them the new one.
-4. On the other Mac, type that address in **Connect**, or click **Connect** next to the Mac in
-   **Paired Devices**, which shows the address it last reached it at or was told.
+   internet**. It registers with the LanKVM server (`178.156.129.211:3478`, UDP) and stays in
+   touch with it, which also keeps its router open for it. The card says *Reachable from
+   anywhere through the LanKVM server* once it is.
+3. Connect from the other Mac once more on the local network while internet access is on there,
+   so it learns the way. From then on, click **Connect** next to the Mac in **Paired Devices**,
+   from anywhere.
+
+The server only introduces the two Macs. Each sends a few packets straight at the other's public
+address, which opens both routers, and the session then runs directly from Mac to Mac. Where
+routers won't let a direct path through (some give every destination its own outside port, and
+carrier-grade NAT or strict firewalls block it), the server passes the session's packets along
+instead: still encrypted end to end, so the server can't read them, and the viewer window says
+*Internet · relayed*. A direct path has the lower latency.
+
+The **LanKVM server** field under internet access on This Mac picks another server (`host:port`),
+or none when left empty: then paired Macs reach the Mac only directly, as below. It has to be on
+the internet (paired Macs don't use one on a local network), and changing it ends the sessions
+relayed through the old one. The server is the `lankvm-rendezvous` service in the hivex-crm
+repository.
+
+**A direct path through the router (optional).** LanKVM also asks the router to forward its UDP
+port (macOS speaks UPnP, NAT-PMP and PCP for it). When the router does, the card shows the
+address, e.g. `203.0.113.7:47800`, and paired Macs try it along with the server. When it doesn't,
+the card says what to forward by hand: UDP port 47800 to this Mac's address on the network, e.g.
+`192.168.1.20`. Reserve that address for the Mac in the router's settings (a DHCP reservation),
+so the forward keeps pointing at it. Most home connections get a new public address now and then:
+if you have a dynamic DNS name, or forwarded the port by hand, enter it under **Public address**,
+e.g. `home.example.com` (the port is added if you leave it out). The host tells its paired Macs
+where to reach it each time they connect. Once they know it at an address, they don't knock
+anywhere else (see Security model). You can also type the address in **Connect**.
 
 Two Macs behind one router can both be reachable: the router gives the second one another
 outside port, and its card shows the address with that port, e.g. `203.0.113.7:47801`. (Or
-start it with its own `LANKVM_PORT`.) Turning the setting off removes the forward and ends the
-sessions that came over the internet; sessions on the local network carry on.
+start it with its own `LANKVM_PORT`.) Turning the setting off removes the forward, takes the Mac
+off the LanKVM server and ends the sessions that came over the internet; sessions on the local
+network carry on.
 
 Over the internet the picture follows the connection: changes go out as tiles only, at up to
 60 fps, and the bitrate starts at 12 Mbit/s and rises as far as the connection allows, backing off
@@ -298,9 +317,16 @@ real QUIC on loopback while the host records what it would inject (`crates/core/
 
 **Internet access on one Mac.** `LANKVM_TEST_LOOPBACK_IS_INTERNET=1` makes an instance treat
 loopback as the internet, so its connections over `127.0.0.1` go through the gate, the knock and
-the internet checks; the router is left alone. Pair the two instances without it first (pairing
-never runs over the internet), then restart both with it. `crates/core/tests/internet_loopback.rs`
-does the same in `cargo test`.
+the internet checks; the router is left alone, and so is the LanKVM server unless
+`LANKVM_RENDEZVOUS` names one. Pair the two instances without it first (pairing never runs over
+the internet), then restart both with it. `crates/core/tests/internet_loopback.rs` does the same
+in `cargo test`, with an in-process LanKVM server (`transport::test_server`) for connecting
+through a server: punched, relayed, and when that server lies about where each Mac is.
+
+`LANKVM_RENDEZVOUS=host:port` sets the LanKVM server an instance registers with, in place of the
+setting (`LANKVM_RENDEZVOUS=` with nothing: none). `LANKVM_TEST_FORCE_RELAY=1` makes a viewer
+reach paired Macs (Connect in Paired Devices) through their server's relay alone, without trying
+a direct path.
 
 **The viewer window, measured from outside.** `scripts/viewer-bench.sh [MODE [LABEL]]` runs the
 host copy, a virtual display animated by Frame Source and the GUI viewer copy (LanKVM 2), and
@@ -331,6 +357,16 @@ and unlocked while it runs.
   local network. The viewer keeps it in `internet-hosts.json` (likewise private). After the
   knock, TLS still has to prove the device holds the certificate the key was made for, and the
   device has to be paired.
+- **The LanKVM server** knows each registered host by an ID derived from a key only that host has
+  (`rendezvous-key.p8`, private): nobody else can register under its ID or move it elsewhere. A
+  viewer asks for an introduction with a token made from its access key, for that request and the
+  current 10-minute period; only the host checks it, and it answers nothing that doesn't check
+  out (nor a copy from another address). So a stranger who learns a host's ID gets no answer from
+  it, through the server or otherwise. What the server learns: the public addresses of the Macs
+  that use it, their IDs, when they connect, and how much traffic it relays. It can't read or
+  alter a session (TLS 1.3 end to end, with the certificates pinned) or pose as either Mac. The
+  worst it can do is refuse its service, or introduce a Mac to the wrong address, where the
+  session fails like any wrong address would.
 - **Forget** revokes a viewer's key at once and ends its sessions. Turning internet access off
   stops all knocks and ends every session that came over the internet.
 - Pairing only happens on the local network: a host never shows a code for a connection from
@@ -375,6 +411,11 @@ and unlocked while it runs.
   Accessibility on the Mac you control *from* too (Privacy & Security → Accessibility). Pinch,
   rotate and page swipes work without it.
 - **Reset a permission:** `tccutil reset ScreenCapture dev.lankvm.LanKVM` (or `Accessibility`)
+- **"… isn't reachable over the internet right now":** the LanKVM server doesn't know that Mac:
+  LanKVM isn't running there, or its internet access is off. **"Couldn't reach the LanKVM server
+  at …":** this Mac's network blocks it (UDP 3478), or the server is down. **"… didn't answer
+  through the LanKVM server":** that Mac no longer takes this one's key (it forgot this Mac:
+  connect on the local network once more), or the two clocks differ by over 10 minutes.
 - **"No answer from …" over the internet:** on the Mac you connect to, look at This Mac →
   Internet access. *The router didn't answer* or *can't open ports automatically*: turn on UPnP
   or NAT-PMP in the router's settings, or forward UDP port 47800 to the address shown yourself.
@@ -406,9 +447,9 @@ and unlocked while it runs.
 | Path | What |
 |---|---|
 | `crates/protocol` | Wire messages, video packet header |
-| `crates/transport` | QUIC endpoint, LAN congestion control, identity, pairing, packetizer/reassembler, the gate that keeps the port silent to the internet (`gate.rs`, `knock.rs`, `cid.rs`) |
+| `crates/transport` | QUIC endpoint, LAN congestion control, identity, pairing, packetizer/reassembler, the gate that keeps the port silent to the internet (`gate.rs`, `knock.rs`, `cid.rs`), the LanKVM server's protocol and relay on the socket (`rendezvous.rs`, with an in-process server for tests in `test_server.rs`) |
 | `crates/platform-mac` | ScreenCaptureKit capture, finding the tiles that changed (`tiler.rs`), VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), virtual displays (`virtual_display.rs`), router port mapping (`portmap.rs`) |
-| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), virtual displays for viewers (`displays.rs`), internet access keys, addresses and port mapping (`internet.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
+| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), virtual displays for viewers (`displays.rs`), internet access keys, addresses and port mapping (`internet.rs`), registration with and introductions through the LanKVM server (`rendezvous.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
 | `macos/` | SwiftUI app (SwiftPM). `Sources/CLanKVM/include/lankvm.h` is the C interface |
 | `scripts/bundle.sh` | Builds and signs `LanKVM.app` |
 | `scripts/make-icon.swift` | Regenerates `macos/Resources/AppIcon.icns` |

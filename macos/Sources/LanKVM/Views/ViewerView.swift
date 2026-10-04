@@ -28,9 +28,9 @@ struct ViewerView: View {
         .onDisappear { core.disconnect(sessionId) }
     }
 
-    private func reconnect(_ target: String) {
+    private func reconnect(_ target: String, label: String) {
         core.disconnect(sessionId)
-        sessionId = core.connect(to: target)
+        sessionId = core.connect(to: target, label: label)
     }
 }
 
@@ -38,7 +38,8 @@ private struct ViewerContent: View {
     @EnvironmentObject private var core: CoreModel
     @ObservedObject var session: SessionModel
     @ObservedObject var controls: SessionControlModel
-    let reconnect: (String) -> Void
+    /// The target and label to connect to again.
+    let reconnect: (String, String) -> Void
     let close: () -> Void
     @AppStorage("showStats") private var showStats = true
 
@@ -46,12 +47,12 @@ private struct ViewerContent: View {
         ZStack {
             switch session.phase {
             case .connecting:
-                ConnectingView(target: session.target, cancel: close)
+                ConnectingView(target: session.label, cancel: close)
             case .needsPin:
                 ZStack {
                     Color.lkBackground
                     PinEntryView(
-                        hostLabel: session.target,
+                        hostLabel: session.label,
                         onSubmit: { core.submitPin($0, for: session.id) },
                         onCancel: close
                     )
@@ -73,7 +74,7 @@ private struct ViewerContent: View {
                 }
             case .ended(let error):
                 EndedView(target: session.target, error: error, wasConnected: session.wasConnected,
-                          reconnect: { reconnect(session.target) }, close: close)
+                          reconnect: { reconnect(session.target, session.label) }, close: close)
             }
         }
         .navigationTitle(title)
@@ -115,7 +116,7 @@ private struct ViewerContent: View {
 
     private var title: String {
         if case .connected(let info) = session.phase { return info.hostName }
-        return session.target
+        return session.label
     }
 
     private var subtitle: String {
@@ -548,9 +549,7 @@ struct StatsHUD: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text(verbatim: "\(String(info.width))×\(String(info.height)) · \(info.codec.uppercased())\(info.internet ? " · Internet" : "")")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                streamLabel
             }
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(ms(stats?.totalMs))
@@ -594,6 +593,26 @@ struct StatsHUD: View {
 
     private func ms(_ v: Double?) -> String {
         v.map { String(format: "%.1f", $0) } ?? "–"
+    }
+
+    /// "3024×1964 · HEVC", and how it travels when that isn't the local network: on a line of its
+    /// own when it doesn't fit beside it (relayed).
+    private var streamLabel: some View {
+        let stream = "\(String(info.width))×\(String(info.height)) · \(info.codec.uppercased())"
+        let route = info.internet ? (info.relayed ? "Internet · relayed" : "Internet") : nil
+        return ViewThatFits(in: .horizontal) {
+            label(route.map { "\(stream) · \($0)" } ?? stream)
+            VStack(alignment: .trailing, spacing: 2) {
+                label(stream)
+                if let route { label(route) }
+            }
+        }
+    }
+
+    private func label(_ text: String) -> some View {
+        Text(verbatim: text)
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundStyle(.secondary)
     }
 
     private var latencyColor: Color {

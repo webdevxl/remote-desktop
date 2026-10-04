@@ -64,19 +64,30 @@ enum Snapshot {
     }
 
     /// Internet access: This Mac when the router opened the port, when it needs setting up by hand
-    /// (behind one router or two) and once it was set up by hand, the Macs this one controls with
-    /// their internet address, and the statistics of a session over the internet.
+    /// (behind one router or two), once it was set up by hand, through the LanKVM server, and when
+    /// neither the router nor the server answers; the Macs this one controls with their internet
+    /// address or through the server, a recent Mac reached through the server, and the
+    /// statistics of a session over the internet, direct and relayed.
     private static func renderInternet(info: SessionInfo, stats: SessionStats, appearance: NSAppearance.Name, suffix: String,
                                        into dir: URL) {
         let core = CoreModel.shared
-        for (name, internet) in [("open", CoreModel.SampleInternet.open), ("setup", .setup), ("doublenat", .doubleNat), ("manual", .manual)] {
+        for (name, internet) in [("open", CoreModel.SampleInternet.open), ("setup", .setup), ("doublenat", .doubleNat), ("manual", .manual),
+                                 ("server", .server), ("noserver", .noServer)] {
             core.loadSampleState(screenAllowed: true, internet: internet)
-            render(ContentView(selection: .thisMac).environmentObject(core), size: CGSize(width: 900, height: 1100),
+            // The server's lines make the card longer: still down to the Macs connected now.
+            let height: CGFloat = internet == .server || internet == .noServer ? 1250 : 1100
+            render(ContentView(selection: .thisMac).environmentObject(core), size: CGSize(width: 900, height: height),
                    appearance: appearance, to: dir.appendingPathComponent("thisMac-internet-\(name)-\(suffix).png"))
         }
-        core.loadSampleState(screenAllowed: true, internet: .open)
-        render(ContentView(selection: .paired).environmentObject(core), size: CGSize(width: 900, height: 620),
-               appearance: appearance, to: dir.appendingPathComponent("paired-internet-\(suffix).png"))
+        for (name, internet) in [("internet", CoreModel.SampleInternet.open), ("server", .server)] {
+            core.loadSampleState(screenAllowed: true, internet: internet)
+            render(ContentView(selection: .paired).environmentObject(core), size: CGSize(width: 900, height: 620),
+                   appearance: appearance, to: dir.appendingPathComponent("paired-\(name)-\(suffix).png"))
+        }
+        // A Mac connected to through the server is a recent without an address to show.
+        core.loadSampleState(screenAllowed: true, internet: .server)
+        render(ContentView(selection: .connect).environmentObject(core), size: CGSize(width: 900, height: 620),
+               appearance: appearance, to: dir.appendingPathComponent("connect-server-\(suffix).png"))
 
         var remote = info
         remote.address = "198.51.100.17:47800"
@@ -86,13 +97,17 @@ enum Snapshot {
         slower.networkMs = 19.4
         slower.totalMs = 36.3
         slower.rttMs = 38.2
-        render(
-            ZStack(alignment: .topLeading) {
-                LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
-                StatsHUD(sessionId: 0, info: remote, sample: slower).padding(12)
-            }.environmentObject(core),
-            size: CGSize(width: 520, height: 320), appearance: appearance,
-            to: dir.appendingPathComponent("hud-internet-\(suffix).png"))
+        var relayed = remote
+        relayed.relayed = true
+        for (name, info) in [("internet", remote), ("relayed", relayed)] {
+            render(
+                ZStack(alignment: .topLeading) {
+                    LinearGradient(colors: [Color(hex: 0x2B4A6F), Color(hex: 0x8A5A44)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    StatsHUD(sessionId: 0, info: info, sample: slower).padding(12)
+                }.environmentObject(core),
+                size: CGSize(width: 520, height: 320), appearance: appearance,
+                to: dir.appendingPathComponent("hud-\(name)-\(suffix).png"))
+        }
     }
 
     /// Virtual displays: the banners while switching and when it went wrong, the dimmed screen

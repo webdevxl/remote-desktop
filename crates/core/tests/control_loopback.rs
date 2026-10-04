@@ -41,6 +41,9 @@ impl Peer {
             guard_pid: None,
             control_ttl: None,
             loopback_is_internet: false,
+            // Never the real LanKVM server.
+            rendezvous: Some(String::new()),
+            force_relay: false,
         };
         let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
         Self { core, events, pending: RefCell::new(Vec::new()) }
@@ -472,6 +475,9 @@ fn same_mac_control_is_refused_without_the_override() {
         guard_pid: None,
         control_ttl: None,
         loopback_is_internet: false,
+        // Never the real LanKVM server.
+        rendezvous: Some(String::new()),
+        force_relay: false,
     };
     let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
     let host = Peer { core, events, pending: RefCell::new(Vec::new()) };
@@ -493,6 +499,9 @@ fn start_host(dir: &Path, backend: Backend, ttl: Option<Duration>) -> Peer {
         guard_pid: None,
         control_ttl: ttl,
         loopback_is_internet: false,
+        // Never the real LanKVM server.
+        rendezvous: Some(String::new()),
+        force_relay: false,
     };
     let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
     Peer { core, events, pending: RefCell::new(Vec::new()) }

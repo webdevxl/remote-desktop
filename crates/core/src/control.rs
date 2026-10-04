@@ -49,11 +49,19 @@ pub struct HostSettings {
     /// The address paired Macs are told to use over the internet, as the user typed it (a
     /// dynamic DNS name or an IP, with or without a port), or "".
     pub public_address: String,
+    /// The LanKVM server this Mac registers with while internet access is on, so paired Macs
+    /// reach it with no router setup ("host:port"). "" turns that off, and stays off.
+    pub rendezvous_server: String,
 }
 
 impl Default for HostSettings {
     fn default() -> Self {
-        Self { allow_control: true, internet_access: false, public_address: String::new() }
+        Self {
+            allow_control: true,
+            internet_access: false,
+            public_address: String::new(),
+            rendezvous_server: transport::rendezvous::DEFAULT_SERVER.to_string(),
+        }
     }
 }
 
@@ -790,9 +798,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(HostSettings::load(&path).allow_control);
         assert!(!HostSettings::load(&path).internet_access, "internet access is opt-in");
-        let saved = HostSettings { allow_control: false, internet_access: true, public_address: "home.example.com".into() };
+        assert_eq!(HostSettings::load(&path).rendezvous_server, "178.156.129.211:3478");
+        let saved = HostSettings {
+            allow_control: false,
+            internet_access: true,
+            public_address: "home.example.com".into(),
+            rendezvous_server: "rendezvous.example.com:3478".into(),
+        };
         saved.save(&path).unwrap();
         assert_eq!(HostSettings::load(&path), saved);
+        // No server, by choice: stays that way rather than coming back as the default.
+        let none = HostSettings { rendezvous_server: String::new(), ..HostSettings::default() };
+        none.save(&path).unwrap();
+        assert_eq!(HostSettings::load(&path).rendezvous_server, "");
         // Files from before internet access load with its defaults.
         std::fs::write(&path, br#"{ "allowControl": false }"#).unwrap();
         assert_eq!(HostSettings::load(&path), HostSettings { allow_control: false, ..HostSettings::default() });
