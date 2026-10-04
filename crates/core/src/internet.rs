@@ -275,6 +275,18 @@ impl HostInternet {
     /// by itself, but a viewer that knows it takes the public IP typed for it as this Mac's and
     /// connects through the server.
     pub(crate) fn announced_addresses(&self) -> Vec<String> {
+        let mut addresses = self.internet_addresses();
+        // And where it is on its own network, which viewers keep apart: one at home with it that
+        // was given the public IP connects there directly. (Not while loopback stands in for the
+        // internet: the viewer is on this Mac, and its local network would always win.)
+        if self.enabled() && !self.gate.loopback_is_internet() {
+            addresses.extend(crate::local_addresses().into_iter().map(|ip| format!("{ip}:{}", self.port)));
+        }
+        addresses
+    }
+
+    /// [`Self::announced_addresses`] on the internet only.
+    fn internet_addresses(&self) -> Vec<String> {
         if !self.enabled() {
             return Vec::new();
         }
@@ -291,7 +303,7 @@ impl HostInternet {
         let public_address = self.public_address.lock().unwrap().clone();
         let mut view = build_view(self.enabled(), self.map_state(), self.port, public_address, lan_address(), self.gate.stats().ignored);
         view.server = self.rendezvous.host_view();
-        view.announced = self.announced_addresses();
+        view.announced = self.internet_addresses();
         view
     }
 }
@@ -437,6 +449,16 @@ pub(crate) fn same_address(a: &str, b: &str) -> bool {
     normalized(a) == normalized(b)
 }
 
+/// Whether `address` is an IP on a local network (private, link-local or unique-local), not one
+/// to reach over the internet. Loopback isn't: tests stand it in for the internet.
+fn is_lan_address(address: &str) -> bool {
+    match with_port(address, DEFAULT_PORT).parse::<SocketAddr>().map(|a| a.ip().to_canonical()) {
+        Ok(IpAddr::V4(v4)) => v4.is_private() || v4.is_link_local(),
+        Ok(IpAddr::V6(v6)) => (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        Err(_) => false,
+    }
+}
+
 /// The addresses a host announced, fit to keep: trimmed, without empty, overlong or repeated
 /// ones, and only the first few. Only so many are looked at, so a host sending a great many
 /// costs this Mac next to nothing.
@@ -490,6 +512,9 @@ struct InternetHost {
     used: Vec<String>,
     /// The LanKVM server it registers with and its ID there, as of the last connection.
     rendezvous: Option<(String, RendezvousId)>,
+    /// Its addresses on its own local network, as of the last connection: when this Mac is on
+    /// that network too (both at home, the public IP typed), connecting there is direct.
+    lan: Vec<String>,
 }
 
 /// An entry of `internet-hosts.json`, keyed by the host's fingerprint (hex).
@@ -505,6 +530,8 @@ struct Stored {
     server: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lan: Vec<String>,
 }
 
 /// How to reach a paired host over the internet (see [`InternetHosts::way_to`]).
@@ -514,6 +541,8 @@ pub(crate) struct Way {
     pub(crate) addresses: Vec<String>,
     /// Its LanKVM server and its ID there.
     pub(crate) rendezvous: Option<(String, RendezvousId)>,
+    /// Its addresses on its local network.
+    pub(crate) lan: Vec<String>,
 }
 
 impl InternetHosts {
@@ -524,7 +553,7 @@ impl InternetHosts {
             .into_iter()
             .filter_map(|(fp, s)| {
                 let rendezvous = from_hex(&s.id).filter(|_| !s.server.is_empty()).map(|id| (s.server, id));
-                Some((from_hex(&fp)?, InternetHost { key: from_hex(&s.key)?, announced: s.announced, used: s.used, rendezvous }))
+                Some((from_hex(&fp)?, InternetHost { key: from_hex(&s.key)?, announced: s.announced, used: s.used, rendezvous, lan: s.lan }))
             })
             .collect();
         Self { path: path.to_path_buf(), hosts }
@@ -536,7 +565,7 @@ impl InternetHosts {
             .iter()
             .map(|(fp, h)| {
                 let (server, id) = h.rendezvous.as_ref().map_or_else(Default::default, |(server, id)| (server.clone(), hex(id)));
-                (hex(fp), Stored { key: hex(&h.key), announced: h.announced.clone(), used: h.used.clone(), server, id })
+                (hex(fp), Stored { key: hex(&h.key), announced: h.announced.clone(), used: h.used.clone(), server, id, lan: h.lan.clone() })
             })
             .collect();
         let result = serde_json::to_vec_pretty(&stored).map_err(anyhow::Error::from).and_then(|bytes| write_private(&self.path, &bytes));
@@ -545,9 +574,9 @@ impl InternetHosts {
         }
     }
 
-    /// Records what `host` said on connecting: this Mac's key for it, where it can be reached,
-    /// and its LanKVM server and ID there (see [`clean_rendezvous`]). True if that changed
-    /// anything.
+    /// Records what `host` said on connecting: this Mac's key for it, where it can be reached
+    /// (its addresses on its own local network apart), and its LanKVM server and ID there (see
+    /// [`clean_rendezvous`]). True if that changed anything.
     pub(crate) fn set_announced(
         &mut self,
         host: Fingerprint,
@@ -555,15 +584,21 @@ impl InternetHosts {
         addresses: Vec<String>,
         rendezvous: Option<(String, RendezvousId)>,
     ) -> bool {
-        let announced = clean_announced(addresses);
-        if self.hosts.get(&host).is_some_and(|h| h.key == key && h.announced == announced && h.rendezvous == rendezvous) {
+        let (lan, announced): (Vec<String>, Vec<String>) = clean_announced(addresses).into_iter().partition(|a| is_lan_address(a));
+        if self.hosts.get(&host).is_some_and(|h| h.key == key && h.announced == announced && h.rendezvous == rendezvous && h.lan == lan) {
             return false;
         }
-        let entry =
-            self.hosts.entry(host).or_insert_with(|| InternetHost { key, announced: Vec::new(), used: Vec::new(), rendezvous: None });
+        let entry = self.hosts.entry(host).or_insert_with(|| InternetHost {
+            key,
+            announced: Vec::new(),
+            used: Vec::new(),
+            rendezvous: None,
+            lan: Vec::new(),
+        });
         entry.key = key;
         entry.announced = announced;
         entry.rendezvous = rendezvous;
+        entry.lan = lan;
         self.save();
         true
     }
@@ -611,7 +646,7 @@ impl InternetHosts {
                 addresses.push(address.clone());
             }
         }
-        Some(Way { key: entry.key, addresses, rendezvous: entry.rendezvous.clone() })
+        Some(Way { key: entry.key, addresses, rendezvous: entry.rendezvous.clone(), lan: entry.lan.clone() })
     }
 
     /// The paired hosts `target` (as typed, resolved to `resolved`) may be, with the keys to
@@ -675,6 +710,11 @@ impl InternetHosts {
             .filter_map(|(fp, host)| Some((rank(host)?, *fp)))
             .min_by_key(|(rank, _)| *rank)
             .map(|(_, fp)| fp)
+    }
+
+    /// Whether any paired host told this Mac its LanKVM server.
+    pub(crate) fn any_server(&self, trusted: &TrustStore) -> bool {
+        self.hosts.iter().any(|(fp, host)| host.rendezvous.is_some() && trusted.contains(fp))
     }
 
     /// Whether any paired host gave this Mac a key.
@@ -911,6 +951,27 @@ mod tests {
         let none = trusted(&TempDir::new("candidates-none").0, &[]);
         assert!(hosts.candidates("203.0.113.7", resolved, &none).is_empty());
         assert!(!hosts.any_key(&none));
+    }
+
+    #[test]
+    fn addresses_on_the_hosts_own_network_are_kept_apart() {
+        let dir = TempDir::new("lan");
+        let path = dir.0.join("internet-hosts.json");
+        let mut hosts = InternetHosts::load(&path);
+        let said = || -> Vec<String> {
+            ["203.0.113.7:51000", "192.168.1.98:47800", "[fd00::5]:47800", "169.254.3.4:47800", "127.0.0.1:47800"].map(String::from).to_vec()
+        };
+        assert!(hosts.set_announced(fp(1), key(1), said(), None));
+        let way = hosts.way_to(&fp(1)).unwrap();
+        // Loopback stays: tests stand it in for the internet.
+        assert_eq!(way.addresses, ["203.0.113.7:51000", "127.0.0.1:47800"]);
+        assert_eq!(way.lan, ["192.168.1.98:47800", "[fd00::5]:47800", "169.254.3.4:47800"]);
+        assert_eq!(hosts.address(&fp(1)).as_deref(), Some("203.0.113.7:51000"), "Paired Devices shows an internet address");
+        assert!(!hosts.set_announced(fp(1), key(1), said(), None), "nothing new");
+        assert_eq!(InternetHosts::load(&path).way_to(&fp(1)).unwrap().lan, way.lan, "kept");
+        // A typed local address is no public IP of the host.
+        let all = trusted(&dir.0, &[1]);
+        assert_eq!(hosts.known_at("192.168.1.98", addr("192.168.1.98:47800"), &all), None);
     }
 
     #[test]

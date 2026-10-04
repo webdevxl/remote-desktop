@@ -169,6 +169,21 @@ impl Default for ServerView {
     }
 }
 
+/// The server sees the host at another public IP than the one asked for: it isn't the Mac meant.
+#[derive(Debug)]
+pub(crate) struct Elsewhere {
+    name: String,
+    ip: IpAddr,
+}
+
+impl std::fmt::Display for Elsewhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} isn't at {}.", self.name, self.ip)
+    }
+}
+
+impl std::error::Error for Elsewhere {}
+
 /// A connection a LanKVM server brought about, and the relay session it goes through if it does
 /// (keep it for as long as the connection).
 pub(crate) struct Introduced {
@@ -608,7 +623,10 @@ impl Rendezvous {
     /// `key`: asks the server to introduce this Mac, punches toward the address it names and
     /// connects there, and goes through the server's relay when that doesn't work in time. The
     /// host answers only a token made with `key`; its certificate is the caller's to check.
-    pub(crate) async fn connect(self: &Arc<Self>, name: &str, server: &str, id: RendezvousId, key: AccessKey) -> Result<Introduced> {
+    /// `at`: a public IP the user typed for it. The server says where it sees the host before
+    /// introducing them, and a host it sees elsewhere isn't the one meant (several paired Macs
+    /// may each be asked, when the IP is new to this Mac).
+    pub(crate) async fn connect(self: &Arc<Self>, name: &str, server: &str, id: RendezvousId, key: AccessKey, at: Option<IpAddr>) -> Result<Introduced> {
         let unreachable = || anyhow!("Couldn't reach the LanKVM server at {server}.");
         let offline = || anyhow!("{name} isn't reachable over the internet right now: LanKVM isn't running there, or its internet access is off.");
         let didnt_answer = || anyhow!("{name} didn't answer through the LanKVM server.");
@@ -630,12 +648,20 @@ impl Rendezvous {
         }
         let lease = self.lease(addr);
 
-        if !self.force_relay {
+        // Where the host is has to be known first when the user named it by its IP, relay or not.
+        if !self.force_relay || at.is_some() {
             let nonce = random_bytes();
             let connect = Message::Connect { id, nonce, token: token(&key, &id, &nonce, now_unix()) };
             match self.ask(addr, nonce, &connect).await {
                 Answer::Message(Message::Peer { host, .. }) => {
-                    if let Some(conn) = self.punch_through(host, nonce, key).await {
+                    if let Some(ip) = at
+                        && host.ip().to_canonical() != ip.to_canonical()
+                    {
+                        return Err(Elsewhere { name: name.to_string(), ip }.into());
+                    }
+                    if !self.force_relay
+                        && let Some(conn) = self.punch_through(host, nonce, key).await
+                    {
                         return Ok(Introduced { conn, relay: None });
                     }
                 }

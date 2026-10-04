@@ -380,6 +380,8 @@ fn introduced(name: &str, server: &Server, force_relay: bool) -> (Setup, Rendezv
     let mut stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     stored[&host_fp]["announced"] = json!([]);
     stored[&host_fp]["used"] = json!([]);
+    // Its address on the local network too: this Mac is on it, so that would be the way in.
+    stored[&host_fp]["lan"] = json!([]);
     std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
     let viewer = Peer::start_with(&viewer_dir, Backend::Hid, "", force_relay);
     viewer.core.set_loopback_is_internet(true);
@@ -415,6 +417,23 @@ fn a_paired_viewer_connects_through_the_lankvm_server() {
     // The target is what recent hosts keep; it isn't an address to remember.
     assert_eq!(s.viewer.core.recent_hosts()[0].address, s.paired_target());
     assert_eq!(internet_host(&s.viewer_dir, &s.host_fp)["used"], json!([]));
+    s.viewer.core.disconnect(session);
+}
+
+#[test]
+fn a_public_ip_this_mac_doesnt_know_reaches_the_host_through_its_server() {
+    let server = Server::start();
+    let (s, _) = introduced("by-ip", &server, false);
+    // The host's public IP with a port its router doesn't forward: a socket that never answers
+    // stands in for it, so the knock there goes nowhere. The server sees the host at that IP.
+    let host: std::net::SocketAddr = s.host.target().parse().unwrap();
+    let unforwarded = std::net::UdpSocket::bind((host.ip(), 0)).unwrap();
+    let target = format!("{}:{}", host.ip(), unforwarded.local_addr().unwrap().port());
+    let (session, internet, relayed) = s.viewer.connect_relayed(&target, WAIT).expect("connect by the public IP");
+    assert!(internet && !relayed);
+    wait_until("the host to list the viewer", || s.host.status()["viewers"][0]["internet"] == true);
+    // Remembered: next time it is a known address of the host.
+    assert_eq!(internet_host(&s.viewer_dir, &s.host_fp)["used"], json!([target]));
     s.viewer.core.disconnect(session);
 }
 

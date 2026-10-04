@@ -749,7 +749,7 @@ pub(crate) fn is_this_mac(ip: IpAddr) -> bool {
 }
 
 /// Private IPv4 addresses of this Mac, i.e. what to type on the other machine.
-fn local_addresses() -> Vec<String> {
+pub(crate) fn local_addresses() -> Vec<String> {
     let mut addrs: Vec<String> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()

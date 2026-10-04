@@ -20,12 +20,13 @@ use transport::endpoint::{Network, peer_fingerprint};
 use transport::framing::{read_msg, write_msg};
 use transport::identity::Fingerprint;
 use transport::knock::AccessKey;
+use transport::rendezvous::RendezvousId;
 use transport::pairing::client_start;
 use serde::Serialize;
 use transport::video::{Reassembler, tile_of};
 
 use crate::Trust;
-use crate::rendezvous::{RelaySession, Rendezvous};
+use crate::rendezvous::{Elsewhere, RelaySession, Rendezvous};
 use crate::stats::{FrameTiming, Stats, StatsView};
 use crate::view::{TileImage, ViewHandle, ViewSlot};
 
@@ -410,6 +411,11 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
                 let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, Some(target)).await?;
                 let addr = conn.remote_address();
                 (conn, addr, internet, relay)
+            } else if internet && ctx.trust.internet_hosts.lock().unwrap().any_server(&ctx.trust.hosts.lock().unwrap()) {
+                // An IP this Mac doesn't know: its paired Macs' LanKVM servers can say whose it is.
+                let Reached { conn, internet, relay } = connect_by_ip(&network, &ctx.rendezvous, &ctx.trust, target, addr).await?;
+                let addr = conn.remote_address();
+                (conn, addr, internet, relay)
             } else {
                 let conn = if internet {
                     connect_over_internet(&network, target, addr, &ctx.trust).await?
@@ -657,9 +663,10 @@ struct Reached {
 }
 
 /// Connects to paired host `host` over the internet, as Paired Devices does: at every address it
-/// announced or was reached at, and through its LanKVM server, all at once. The first to reach
-/// that host wins, and the others are given up (a relay session one of them started ends).
-/// `typed`: an address the user typed for it, tried too.
+/// announced or was reached at, through its LanKVM server, and at its addresses on its own local
+/// network (in case this Mac is there too), all at once. The first to reach that host wins, and
+/// the others are given up (a relay session one of them started ends). `typed`: an address the
+/// user typed for it, tried too.
 async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trust: &Trust, host: Fingerprint, typed: Option<&str>) -> Result<Reached> {
     if !trust.hosts.lock().unwrap().contains(&host) {
         bail!("This Mac isn't paired with that Mac any more. Connect to it on the same network and enter its code to pair again.");
@@ -669,7 +676,7 @@ async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trus
     let who = name.clone().unwrap_or_else(|| "That Mac".to_string());
     let within = name.unwrap_or_else(|| "that Mac".to_string());
     let way = trust.internet_hosts.lock().unwrap().way_to(&host);
-    let Some(way) = way.filter(|w| w.rendezvous.is_some() || !w.addresses.is_empty()) else {
+    let Some(way) = way.filter(|w| w.rendezvous.is_some() || !w.addresses.is_empty() || !w.lan.is_empty()) else {
         bail!(
             "{who} hasn't told this Mac how to reach it over the internet. Turn on internet access on {within} (This Mac in \
              LanKVM), connect to it once on the same network, then try again."
@@ -684,26 +691,27 @@ async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trus
     }
     let mut attempts = tokio::task::JoinSet::new();
     if !rendezvous.force_relay() {
-        for address in addresses {
+        let lan = way.lan.into_iter().map(|address| (Attempt::Lan, address));
+        for (kind, address) in addresses.into_iter().map(|address| (Attempt::Direct, address)).chain(lan) {
             let (network, within) = (network.clone(), within.clone());
-            attempts.spawn(async move { (false, connect_at(&network, &within, &address, key).await) });
+            attempts.spawn(async move { (kind, connect_at(&network, &within, &address, key).await) });
         }
     }
     if let Some((server, id)) = way.rendezvous {
         let (network, rendezvous, who) = (network.clone(), rendezvous.clone(), who.clone());
         attempts.spawn(async move {
-            let introduced = rendezvous.connect(&who, &server, id, key).await;
+            let introduced = rendezvous.connect(&who, &server, id, key, None).await;
             // The address the server named can be on the local network (a server may name any):
             // the host then takes the connection for one from there, and so does this Mac. A
             // relay session's address counts as the internet.
             let reached = introduced.map(|i| Reached { internet: network.gate.is_internet(i.conn.remote_address()), conn: i.conn, relay: i.relay });
-            (true, reached)
+            (Attempt::Server, reached)
         });
     }
     // Dropping the set (on an answer) gives up on the other attempts.
-    let (mut through_server, mut direct) = (None, None);
+    let (mut through_server, mut direct, mut on_lan) = (None, None, None);
     while let Some(attempt) = attempts.join_next().await {
-        let Ok((via_server, result)) = attempt else { continue };
+        let Ok((kind, result)) = attempt else { continue };
         let error = match result {
             Ok(reached) if peer_fingerprint(&reached.conn) == Some(host) => return Ok(reached),
             Ok(reached) => {
@@ -712,11 +720,85 @@ async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trus
             }
             Err(e) => e,
         };
-        if via_server { &mut through_server } else { &mut direct }.get_or_insert(error);
+        match kind {
+            Attempt::Server => &mut through_server,
+            Attempt::Direct => &mut direct,
+            Attempt::Lan => &mut on_lan,
+        }
+        .get_or_insert(error);
     }
     // What the server said is the surer news (the host isn't online, or doesn't answer); then
-    // what the address tried first came to.
-    Err(through_server.or(direct).unwrap_or_else(|| anyhow!("Couldn't connect to {within}.")))
+    // what the address tried first came to. Its local network is likely not this Mac's: last.
+    Err(through_server.or(direct).or(on_lan).unwrap_or_else(|| anyhow!("Couldn't connect to {within}.")))
+}
+
+/// How [`connect_to_paired`] tries a host.
+#[derive(Clone, Copy)]
+enum Attempt {
+    /// Through its LanKVM server.
+    Server,
+    /// At an address it announced or was reached at.
+    Direct,
+    /// At its address on its own local network.
+    Lan,
+}
+
+/// Connects to the paired Mac at `addr`, a public IP typed as `target` that this Mac doesn't
+/// know yet. As before, it knocks there for the paired Macs that never said where they are; and
+/// it asks the LanKVM server of each paired Mac that has one where it sees that Mac, going on with
+/// the one it sees at that IP. So a Mac's public IP works the first time, even when its router
+/// doesn't forward a port (and the next time, as a known address, it is tried directly too).
+async fn connect_by_ip(network: &Network, rendezvous: &Arc<Rendezvous>, trust: &Arc<Trust>, target: &str, addr: SocketAddr) -> Result<Reached> {
+    let ways: Vec<(Fingerprint, String, (String, RendezvousId), AccessKey)> = {
+        let internet = trust.internet_hosts.lock().unwrap();
+        let hosts = trust.hosts.lock().unwrap();
+        hosts
+            .entries()
+            .iter()
+            .filter_map(|(fp, name)| {
+                let way = internet.way_to(fp)?;
+                Some((*fp, name.clone(), way.rendezvous?, way.key))
+            })
+            .collect()
+    };
+    let mut attempts = tokio::task::JoinSet::new();
+    {
+        let (network, trust, target) = (network.clone(), trust.clone(), target.to_string());
+        attempts.spawn(async move {
+            let conn = connect_over_internet(&network, &target, addr, &trust).await;
+            (None, conn.map(|conn| Reached { conn, internet: true, relay: None }))
+        });
+    }
+    let asked = ways.len();
+    for (host, name, (server, id), key) in ways {
+        let (network, rendezvous) = (network.clone(), rendezvous.clone());
+        let name = if name.is_empty() { "That Mac".to_string() } else { name };
+        attempts.spawn(async move {
+            let introduced = rendezvous.connect(&name, &server, id, key, Some(addr.ip())).await;
+            let reached = introduced.map(|i| Reached { internet: network.gate.is_internet(i.conn.remote_address()), conn: i.conn, relay: i.relay });
+            (Some(host), reached)
+        });
+    }
+    // Dropping the set (on an answer) gives up on the other attempts.
+    let (mut through_server, mut direct) = (None, None);
+    while let Some(attempt) = attempts.join_next().await {
+        let Ok((host, result)) = attempt else { continue };
+        match (host, result) {
+            // The knock checked the host's certificate already.
+            (None, Ok(reached)) => return Ok(reached),
+            (Some(host), Ok(reached)) if peer_fingerprint(&reached.conn) == Some(host) => return Ok(reached),
+            (Some(_), Ok(reached)) => reached.conn.close(0u32.into(), b""),
+            (None, Err(e)) => direct = Some(e),
+            // Seen at another IP: not the Mac meant, nothing to say about it.
+            (Some(_), Err(e)) if e.is::<Elsewhere>() => {}
+            (Some(_), Err(e)) => {
+                through_server.get_or_insert(e);
+            }
+        }
+    }
+    // What a server said is about the Mac meant only when there was just one to ask.
+    let through_server = through_server.filter(|_| asked == 1);
+    Err(through_server.or(direct).unwrap_or_else(|| anyhow!("No answer from {target}.")))
 }
 
 /// Connects to paired host `name` (as named within a sentence) at `address`, one it announced or
