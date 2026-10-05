@@ -23,6 +23,16 @@ mouse as if they were plugged into it, and shares the clipboard with it.
   media engine does faster than many tiles. The encoders run flat out (no B-frames, keyframes
   only on request) and take one frame at a time, always the newest, so a slow frame costs frame
   rate, never latency.
+- **Sharp once still.** A frame gets about its tile's share of the bitrate divided by the frame
+  rate, however long the tile then shows it, so text that changed along with much of the screen
+  (a new window, another tab, the first picture) comes out soft: 32-36 dB at 6144×2560, a fringe
+  around every glyph. Once a tile has shown the same picture for 150 ms, it is encoded again, as
+  an ordinary frame, until a pass changes next to nothing: each pass sharpens it by about 2.5 dB,
+  up to the encoder's finest (about 50 dB, which looks like the screen itself) some 8 passes later.
+  The encoder's rate control moves only a step per frame, so it takes passes: a higher bitrate
+  helps the first only. Passes use at most half the stream's bitrate and go out about 96 KB at a
+  time, so what you do next waits behind 6 ms of them at most. A new screenful at 6144×2560 is at
+  46 dB 0.4 s later and done at 0.9 s; typing or a small edit, about 0.3 s.
 - **UDP, never TCP, for video.** One QUIC connection (quinn) carries TLS 1.3, a reliable control
   stream, and unreliable datagrams for video. A fixed-window congestion controller is used
   because the LAN doesn't need Cubic's backoff. Over the internet the window paces packets at a
@@ -293,7 +303,8 @@ Screen** goes back.
 Set `LANKVM_PORT` to change the UDP port (default 47800). On the viewed Mac, `LANKVM_TILES=COLSxROWS`
 forces the tile grid (`1x1` encodes the whole picture as one stream, as older versions did), and
 `LANKVM_FULL_FRAME_AT` (default 0.6) is the share of the picture that has to change for it to go
-as one full frame (above 1: never).
+as one full frame (above 1: never), and `LANKVM_REFINE=0` stops sharpening still tiles (see Sharp
+once still).
 
 ### Connecting over the internet
 

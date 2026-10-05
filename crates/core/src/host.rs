@@ -1696,6 +1696,169 @@ impl Motion {
     }
 }
 
+/// A tile is sharpened once it has shown the same picture this long (see [`Refinement`]): typing
+/// or a scroll coming to rest doesn't pay for passes the next change makes useless.
+const REFINE_AFTER: Duration = Duration::from_millis(150);
+/// A tile is encoded again at most this many times for one picture. It takes about 8 to reach the
+/// encoder's finest quality from the softest it sends; this bounds what a picture that never
+/// converges (noise) costs.
+const REFINE_MAX_PASSES: u8 = 12;
+/// Sharpening uses at most this share of the stream's bitrate: it waits after each pass for its
+/// bytes to go out at this rate, so the link keeps room for what the user does next.
+const REFINE_SHARE: f64 = 0.5;
+/// One pass sends about this much at most (from what the tiles' last frames weighed, and at least
+/// one tile): an update the user causes meanwhile queues behind no more than that, some 6 ms on
+/// Wi-Fi.
+const REFINE_BURST: usize = 96 * 1024;
+/// Tiles whose encoder never sent a frame of its own go this many to a pass (see
+/// [`Refinement::pick`]).
+const REFINE_FRESH_TILES: usize = 2;
+/// A pass that comes out at most a byte per this many pixels of its tile, or at most
+/// [`REFINE_DONE_FRACTION`] of the picture's biggest pass, changed next to nothing. Two in a row
+/// and the tile is as sharp as it gets (about 49 dB at 3072×320, a few hundred bytes to a few KB a
+/// pass); one alone may be the rate control out of bits for a moment.
+const REFINE_DONE_PIXELS_PER_BYTE: u64 = 1024;
+const REFINE_DONE_FRACTION: usize = 8;
+
+/// Sharpens the tiles that stay still.
+///
+/// A frame gets about its tile's bitrate divided by the expected frame rate (120), however long
+/// the tile then shows it, so text that changed along with much of the screen stays soft: a new
+/// window, another tab, keyframes at the start (measured at 6144×2560 on an M3 Max: 32-36 dB,
+/// fringes around every glyph). Once a tile is still for [`REFINE_AFTER`], its picture is encoded
+/// again, as an ordinary frame: each pass adds about 2.5 dB, until the encoder's finest quantizer
+/// (about 49 dB, indistinguishable from the screen at 1x) some 8 passes later; passes after that
+/// are a few hundred bytes, which is how a tile counts as done. The rate control moves its
+/// quantizer only a step or so per frame, which is why it takes passes: a higher bitrate helps the
+/// first one only, and `Quality` is ignored below 1.0 while a bitrate is set and ignores the
+/// bitrate at 1.0 (hundreds of Mbit/s for a video playing).
+struct Refinement {
+    enabled: bool,
+    tiles: Vec<RefineTile>,
+    /// No pass before then: the last one's bytes are still going out (see [`REFINE_SHARE`]).
+    paced_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RefineTile {
+    /// Nothing to sharpen: as sharp as it gets, or never sent.
+    Done,
+    /// The tile's picture went out at `since` and was encoded again `passes` times since; its
+    /// newest frame weighed `bytes`, and was next to nothing if `small`; its biggest pass, `peak`.
+    Pending { since: Instant, passes: u8, bytes: usize, small: bool, peak: usize },
+}
+
+impl Refinement {
+    fn new(tiles: usize, enabled: bool) -> Self {
+        Self { enabled, tiles: vec![RefineTile::Done; tiles], paced_until: None }
+    }
+
+    /// Tile `i` shows a new picture, which went out (or will, if its frame was lost) in a frame
+    /// of about `bytes`.
+    fn sent(&mut self, i: usize, bytes: usize, now: Instant) {
+        if self.enabled {
+            self.tiles[i] = RefineTile::Pending { since: now, passes: 0, bytes, small: false, peak: 0 };
+        }
+    }
+
+    /// Tile `i` went out again as a keyframe of the same picture (asked for, or its encoder's
+    /// first frame), in a frame of `bytes`: as soft as a new picture, but still all along.
+    fn keyframe(&mut self, i: usize, bytes: usize, now: Instant) {
+        if self.enabled {
+            let since = match self.tiles[i] {
+                RefineTile::Pending { since, .. } => since,
+                RefineTile::Done => now,
+            };
+            self.tiles[i] = RefineTile::Pending { since, passes: 0, bytes, small: false, peak: 0 };
+        }
+    }
+
+    /// Tile `i`, of `pixels`, went out again showing the same picture, in a frame of `bytes`.
+    fn passed(&mut self, i: usize, bytes: usize, pixels: u64) {
+        if let RefineTile::Pending { since, passes, small: was_small, peak, .. } = self.tiles[i] {
+            let passes = passes + 1;
+            let small = bytes as u64 * REFINE_DONE_PIXELS_PER_BYTE <= pixels || bytes * REFINE_DONE_FRACTION <= peak;
+            let done = (small && was_small) || passes >= REFINE_MAX_PASSES;
+            let peak = peak.max(bytes);
+            self.tiles[i] = if done { RefineTile::Done } else { RefineTile::Pending { since, passes, bytes, small, peak } };
+        }
+    }
+
+    /// Tile `i` was in a pass, but its frame didn't go out.
+    fn missed(&mut self, i: usize) {
+        if let RefineTile::Pending { passes, .. } = &mut self.tiles[i] {
+            *passes += 1;
+            if *passes >= REFINE_MAX_PASSES {
+                self.tiles[i] = RefineTile::Done;
+            }
+        }
+    }
+
+    /// When the next pass may go, if any tile wants one.
+    fn due(&self) -> Option<Instant> {
+        let still = self
+            .tiles
+            .iter()
+            .filter_map(|t| match t {
+                RefineTile::Pending { since, .. } => Some(*since + REFINE_AFTER),
+                RefineTile::Done => None,
+            })
+            .min()?;
+        Some(self.paced_until.map_or(still, |paced| paced.max(still)))
+    }
+
+    /// The tiles of the next pass: those still long enough, those with the fewest passes first
+    /// (the first passes sharpen the most), as many as fit in [`REFINE_BURST`] by what their last
+    /// frames weighed, and at least one. Tiles in `fresh` never went out on their own stream (a
+    /// full frame carried them, as at the start): they go first, [`REFINE_FRESH_TILES`] at a
+    /// time. Their encoders' first frame is a keyframe and takes some 35 ms (the session warms
+    /// up; later keyframes take 3), and the media engine warms them one after another, so all 16
+    /// at once would hold up the next update for some 190 ms (M3 Max).
+    fn pick(&self, now: Instant, fresh: u64) -> u64 {
+        let mut ready: Vec<(u8, usize, usize)> = self
+            .tiles
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| match *t {
+                RefineTile::Pending { since, passes, bytes, .. } if now >= since + REFINE_AFTER => Some((passes, i, bytes)),
+                _ => None,
+            })
+            .collect();
+        let first = ready.iter().filter(|&&(_, i, _)| fresh & tile_bit(i) != 0).take(REFINE_FRESH_TILES);
+        let first = first.fold(0, |mask, &(_, i, _)| mask | tile_bit(i));
+        if first != 0 {
+            return first;
+        }
+        ready.sort_unstable();
+        let mut mask = 0;
+        let mut total = 0;
+        for (_, i, bytes) in ready {
+            if mask == 0 || total + bytes <= REFINE_BURST {
+                total += bytes;
+                mask |= tile_bit(i);
+            }
+        }
+        mask
+    }
+
+    /// A pass sent `bytes`: the next waits until they went out at [`REFINE_SHARE`] of `stream_bps`.
+    fn pace(&mut self, bytes: usize, stream_bps: u32, now: Instant) {
+        let rate = (f64::from(stream_bps) * REFINE_SHARE / 8.0).max(1.0);
+        self.paced_until = Some(now + Duration::from_secs_f64(bytes as f64 / rate));
+    }
+}
+
+/// Still tiles are sharpened (see [`Refinement`]) unless `LANKVM_REFINE=0`.
+fn refine_enabled() -> bool {
+    match std::env::var("LANKVM_REFINE").as_deref() {
+        Ok("0") | Ok("off") | Ok("false") => {
+            tracing::info!("still tiles aren't sharpened (LANKVM_REFINE)");
+            false
+        }
+        _ => true,
+    }
+}
+
 /// `LANKVM_TILES=COLSxROWS` forces the tile grid, e.g. `1x1` for one encoder for the whole picture.
 fn tile_grid() -> Option<(u32, u32)> {
     let value = std::env::var("LANKVM_TILES").ok()?;
@@ -2003,6 +2166,8 @@ struct Track {
     /// Tag of the newest frame that went out, and of the newest keyframe that did.
     sent: AtomicU64,
     sent_keyframe: AtomicU64,
+    /// Size of the newest frame that went out (see [`Refinement`]).
+    sent_bytes: AtomicUsize,
     /// A frame came out that never went out: the encoder's references moved on, the viewer's
     /// didn't, so its next frame must be a keyframe.
     repair: AtomicBool,
@@ -2014,6 +2179,7 @@ impl Default for Track {
             emitted: AtomicU64::new(NOT_SENT),
             sent: AtomicU64::new(NOT_SENT),
             sent_keyframe: AtomicU64::new(NOT_SENT),
+            sent_bytes: AtomicUsize::new(0),
             repair: AtomicBool::new(false),
         }
     }
@@ -2034,12 +2200,13 @@ enum Fate {
 impl Track {
     /// The encoder's output callback: sends the frame.
     fn deliver(&self, video: &VideoOut, frame: EncodedFrame, tile: TileRect, stream: (u32, u32)) {
-        let (tag, keyframe) = (frame.tag, frame.keyframe);
+        let (tag, keyframe, bytes) = (frame.tag, frame.keyframe, frame.data.len());
         self.emitted.store(tag, Ordering::Release);
         if video.send(frame, tile, stream) {
             if keyframe {
                 self.sent_keyframe.store(tag, Ordering::Release);
             }
+            self.sent_bytes.store(bytes, Ordering::Release);
             self.sent.store(tag, Ordering::Release);
         } else {
             self.repair.store(true, Ordering::Release);
@@ -2474,6 +2641,16 @@ impl TilerRetry {
     }
 }
 
+/// What the encode thread does next.
+enum Step {
+    /// Send a captured frame's changes, or what was asked for.
+    Update(Option<CapturedFrame>, u64, Work),
+    /// The screen has been still a while.
+    Quiet,
+    /// Sharpen still tiles (see [`Refinement`]).
+    Refine,
+}
+
 fn encode_loop(shared: &Shared, mut pipeline: Pipeline, video: &VideoOut) {
     // On the input-to-photon path: woken promptly and kept on a performance core.
     system::set_thread_interactive();
@@ -2483,7 +2660,6 @@ fn encode_loop(shared: &Shared, mut pipeline: Pipeline, video: &VideoOut) {
     let mut quiet_at: Option<Instant> = None;
     let mut note: Option<(u32, u64)> = None;
     loop {
-        // A frame or requests to send; or None: the screen has been still a while.
         let step = {
             let mut state = shared.state.lock().unwrap();
             loop {
@@ -2506,35 +2682,60 @@ fn encode_loop(shared: &Shared, mut pipeline: Pipeline, video: &VideoOut) {
                 if work_wait == Some(Duration::ZERO) {
                     let frame = if state.retry_at.is_none_or(|t| t <= now) { state.next.take() } else { None };
                     let touched = if frame.is_some() { std::mem::take(&mut state.touched) } else { 0 };
-                    break Some((frame, touched, state.requests.take(now)));
+                    break Step::Update(frame, touched, state.requests.take(now));
                 }
                 if quiet_at.is_some_and(|at| at <= now) {
-                    break None;
+                    break Step::Quiet;
+                }
+                // Last of all, with nothing else to do: sharpening still tiles. Over the internet
+                // it waits for video in QUIC's send buffer to drain too.
+                let refine_wait = pipeline.refinement.due().map(|at| at.saturating_duration_since(now));
+                if refine_wait == Some(Duration::ZERO) {
+                    if !video.backlogged() {
+                        break Step::Refine;
+                    }
+                    state = shared.wake.wait_timeout(state, BACKLOG_RECHECK).unwrap().0;
+                    continue;
                 }
                 let quiet_wait = quiet_at.map(|at| at.saturating_duration_since(now));
-                state = match [work_wait, quiet_wait].into_iter().flatten().min() {
+                state = match [work_wait, quiet_wait, refine_wait].into_iter().flatten().min() {
                     Some(wait) => shared.wake.wait_timeout(state, wait).unwrap().0,
                     None => shared.wake.wait(state).unwrap(),
                 };
             }
         };
-        let Some((frame, touched, work)) = step else {
-            // Before saying the screen is still, make sure nothing of the last frame went unsent.
-            let outcome = pipeline.settle(video);
-            match outcome.update {
-                Some(sent) => {
+        let (frame, touched, work) = match step {
+            Step::Update(frame, touched, work) => (frame, touched, work),
+            Step::Refine => {
+                // A frame not compared whole is first, as before the screen counts as still: each
+                // pass puts that moment off (the viewer hears of the last update only once no more
+                // of its datagrams can be on the way).
+                let outcome = if pipeline.has_unchecked() { pipeline.settle(video) } else { pipeline.refine(video, Instant::now()) };
+                if let Some(sent) = outcome.update {
                     note = Some(sent);
                     quiet_at = Some(Instant::now() + IDLE_NOTE_AFTER);
                 }
-                None => {
-                    if let Some((update, mask)) = note.take() {
-                        video.idle(update, mask);
-                    }
-                    quiet_at = None;
-                }
+                shared.state.lock().unwrap().requests.done(&outcome);
+                continue;
             }
-            shared.state.lock().unwrap().requests.done(&outcome);
-            continue;
+            Step::Quiet => {
+                // Before saying the screen is still, make sure nothing of the last frame went unsent.
+                let outcome = pipeline.settle(video);
+                match outcome.update {
+                    Some(sent) => {
+                        note = Some(sent);
+                        quiet_at = Some(Instant::now() + IDLE_NOTE_AFTER);
+                    }
+                    None => {
+                        if let Some((update, mask)) = note.take() {
+                            video.idle(update, mask);
+                        }
+                        quiet_at = None;
+                    }
+                }
+                shared.state.lock().unwrap().requests.done(&outcome);
+                continue;
+            }
         };
         let tiled = frame.is_some();
         let mut outcome = pipeline.update(video, frame, touched, work);
@@ -2578,6 +2779,7 @@ struct Pipeline {
     tiler: Tiler,
     encoders: TileEncoders,
     motion: Motion,
+    refinement: Refinement,
     /// The full-frame stream's next frame must be a keyframe: one of its frames never reached
     /// the viewer.
     full_keyframe: bool,
@@ -2617,10 +2819,12 @@ impl Pipeline {
         let motion = Motion::new(encoders.bitrate_bps, encoders.tiles.clone(), encoders.video.wan.is_some(), Instant::now());
         let failures = vec![0; encoders.tiles.len() + 1];
         let rebuilds_failed = vec![0; encoders.tiles.len()];
+        let refinement = Refinement::new(encoders.tiles.len(), refine_enabled());
         Self {
             tiler,
             encoders,
             motion,
+            refinement,
             full_keyframe: false,
             compared_all: None,
             distrust: None,
@@ -2837,9 +3041,55 @@ impl Pipeline {
             }
             self.record(route, fate, covered, keyframe, &mut outcome);
         }
+        // For sharpening the tiles once they're still: a new picture starts over (also one whose
+        // frame was lost: it goes again), a keyframe starts the passes over (the rate control makes
+        // it as soft), the same picture again is a pass.
+        let full_bytes = match &self.encoders.full {
+            Some((_, track)) if outcome.full_sent => track.sent_bytes.load(Ordering::Acquire) as u64,
+            _ => 0,
+        };
+        let picture = u64::from(self.encoders.stream.0) * u64::from(self.encoders.stream.1);
+        for (i, tile) in self.encoders.tiles.iter().enumerate() {
+            let (bit, pixels) = (tile_bit(i), u64::from(tile.width) * u64::from(tile.height));
+            let bytes = self.encoders.tracks[i].sent_bytes.load(Ordering::Acquire);
+            if outcome.full_sent && covered & bit != 0 {
+                self.refinement.sent(i, (full_bytes * pixels / picture.max(1)) as usize, now);
+            } else if changed & bit != 0 {
+                self.refinement.sent(i, bytes, now);
+            } else if outcome.sent_keyframes & bit != 0 {
+                self.refinement.keyframe(i, bytes, now);
+            } else if outcome.sent & bit != 0 {
+                self.refinement.passed(i, bytes, pixels);
+            }
+        }
         let sent = outcome.sent | if outcome.full_sent { FULL_FRAME_BIT } else { 0 };
         outcome.update = video.finish_update(tag, sent).map(|update| (update, sent));
         self.repair(&mut outcome);
+        outcome
+    }
+
+    /// One sharpening pass, if one is due by `now` (see [`Refinement`]): the still tiles whose
+    /// turn it is, encoded again from their last content as ordinary frames.
+    fn refine(&mut self, video: &VideoOut, now: Instant) -> Outcome {
+        if self.refinement.due().is_none_or(|at| at > now) {
+            return Outcome::default();
+        }
+        let fresh = (0..self.encoders.tiles.len())
+            .filter(|&i| self.encoders.tracks[i].sent.load(Ordering::Acquire) == NOT_SENT)
+            .fold(0, |mask, i| mask | tile_bit(i));
+        let tiles = self.refinement.pick(now, fresh);
+        let outcome = self.update(video, None, 0, Work { resends: tiles, ..Work::default() });
+        let mut bytes = 0;
+        for i in (0..self.encoders.tiles.len()).filter(|&i| tiles & tile_bit(i) != 0) {
+            if outcome.sent & tile_bit(i) != 0 {
+                bytes += self.encoders.tracks[i].sent_bytes.load(Ordering::Acquire);
+            } else {
+                // Lost, or its encoder failed: it counts as a pass all the same, so a tile that
+                // can't be sent stops being picked.
+                self.refinement.missed(i);
+            }
+        }
+        self.refinement.pace(bytes, self.motion.stream_bps, Instant::now());
         outcome
     }
 
@@ -3672,6 +3922,77 @@ mod tests {
         assert_eq!(motion.retarget(t0 + RETARGET_INTERVAL).len(), tiles.len());
     }
 
+    /// Tiles are sharpened once still, fewest passes first, a burst at a time, paced by the
+    /// stream's bitrate, until a pass changes next to nothing (or the most passes).
+    #[test]
+    fn refinement_waits_for_still_tiles_and_stops_when_they_are_sharp() {
+        let t0 = Instant::now();
+        let pixels = 3072 * 320;
+        let mut r = Refinement::new(4, true);
+        assert_eq!(r.due(), None);
+        r.sent(0, 40_000, t0);
+        r.sent(1, 40_000, t0 + Duration::from_millis(50));
+        r.sent(2, 40_000, t0);
+        // Not before a tile was still for a while; then those that were.
+        assert_eq!(r.due(), Some(t0 + REFINE_AFTER));
+        assert_eq!(r.pick(t0 + REFINE_AFTER, 0), 0b0101);
+        // Tile 0 is still soft; tile 2's pass changed next to nothing, and so does its next: done.
+        r.passed(0, 30_000, pixels);
+        r.passed(2, 600, pixels);
+        assert!(matches!(r.tiles[2], RefineTile::Pending { passes: 1, small: true, .. }));
+        r.passed(2, 400, pixels);
+        assert_eq!(r.tiles[2], RefineTile::Done);
+        // One small pass between big ones is the rate control out of bits, not a sharp tile.
+        let mut starved = Refinement::new(1, true);
+        starved.sent(0, 40_000, t0);
+        for bytes in [600, 30_000, 600, 30_000] {
+            starved.passed(0, bytes, pixels);
+        }
+        assert!(matches!(starved.tiles[0], RefineTile::Pending { passes: 4, .. }));
+        // The next pass waits for this one's bytes at half the stream's bitrate.
+        r.pace(30_600, 100_000_000, t0 + REFINE_AFTER);
+        let paced = t0 + REFINE_AFTER + Duration::from_secs_f64(30_600.0 / 6_250_000.0);
+        assert_eq!(r.due(), Some(paced));
+        // Fewest passes first, then whatever else fits in a burst: tile 1 (no pass yet), not
+        // tile 3 (too big with it), tile 0.
+        r.sent(3, 90_000, t0);
+        assert_eq!(r.pick(paced + REFINE_AFTER, 0), 0b0011);
+        // Tiles that never went out on their own stream go first, a couple at a time.
+        assert_eq!(r.pick(paced + REFINE_AFTER, 0b1000), 0b1000);
+        assert_eq!(r.pick(paced + REFINE_AFTER, 0b1011), 0b0011);
+        // A tile bigger than a burst still goes, alone.
+        let mut big = Refinement::new(2, true);
+        big.sent(0, REFINE_BURST * 2, t0);
+        big.sent(1, REFINE_BURST, t0);
+        assert_eq!(big.pick(t0 + REFINE_AFTER, 0), 0b01);
+        // A pass far smaller than the picture's biggest counts as next to nothing too.
+        let mut drop = Refinement::new(1, true);
+        drop.sent(0, 40_000, t0);
+        for bytes in [38_000, 4_000, 2_500] {
+            drop.passed(0, bytes, pixels);
+        }
+        assert_eq!(drop.tiles[0], RefineTile::Done);
+        // A picture that never gets sharp (noise) stops after the most passes (one is done).
+        for _ in 2..REFINE_MAX_PASSES {
+            r.passed(0, 30_000, pixels);
+        }
+        assert!(matches!(r.tiles[0], RefineTile::Pending { passes, .. } if passes == REFINE_MAX_PASSES - 1));
+        r.missed(0);
+        assert_eq!(r.tiles[0], RefineTile::Done);
+        // A keyframe of the same picture starts the passes over, not the wait.
+        r.keyframe(1, 50_000, t0 + Duration::from_secs(5));
+        assert_eq!(r.tiles[1], RefineTile::Pending { since: t0 + Duration::from_millis(50), passes: 0, bytes: 50_000, small: false, peak: 0 });
+        // A new picture starts over; a tile that isn't pending ignores passes.
+        r.sent(2, 5_000, t0 + Duration::from_secs(1));
+        assert!(matches!(r.tiles[2], RefineTile::Pending { passes: 0, .. }));
+        r.passed(0, 30_000, pixels);
+        assert_eq!(r.tiles[0], RefineTile::Done);
+        // Off: nothing is ever pending.
+        let mut off = Refinement::new(1, false);
+        off.sent(0, 40_000, t0);
+        assert_eq!(off.due(), None);
+    }
+
     #[test]
     fn over_the_internet_keyframes_are_a_round_trip_apart() {
         let t0 = Instant::now();
@@ -4039,7 +4360,9 @@ mod tests {
         let (host_conn, conn) = loopback("loop").await;
         let (w, h) = (640u32, 384u32);
         let video = Arc::new(VideoOut::new(host_conn.clone(), false));
-        let pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        let mut pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        // Exactly these frames: no sharpening passes in between (see `still_tiles_are_sharpened`).
+        pipeline.refinement.enabled = false;
         let shared = Arc::new(Shared {
             state: Mutex::default(),
             wake: Condvar::new(),
@@ -4253,6 +4576,113 @@ mod tests {
         assert_eq!(out.sent, 0b1000);
     }
 
+    /// Once still, tiles go out again from their last content, as ordinary frames, each pass an
+    /// update of its own, until a pass changes next to nothing; a tile that changes starts over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn still_tiles_are_sharpened() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("refine").await;
+        let (w, h) = (640u32, 384u32);
+        let video = Arc::new(VideoOut::new(host_conn, false));
+        let mut pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        pipeline.refinement.enabled = true;
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        // Noise on the left (soft at the tiles' bitrate), flat grey on the right (sharp at once);
+        // `s` changes the right half.
+        let picture = |s: u8| {
+            move |p: usize, x: usize, y: usize| {
+                if x < 320 {
+                    ((x as u32).wrapping_mul(0x9E37_79B1) ^ (y as u32).wrapping_mul(0x85EB_CA77) ^ p as u32).wrapping_mul(0xC2B2_AE3D).to_be_bytes()[0]
+                } else if p == 0 {
+                    100u8.wrapping_add(s)
+                } else {
+                    128
+                }
+            }
+        };
+        let out = tokio::task::block_in_place(|| pipeline.update(&video, Some(nv12(w as usize, h as usize, picture(0))), u64::MAX, Work::default()));
+        assert_eq!(out.sent, 0b11);
+        receive(&conn, &mut reassemblers, 2).await;
+        // Not while the tiles may still be changing.
+        let t0 = Instant::now();
+        assert_eq!(tokio::task::block_in_place(|| pipeline.refine(&video, t0)).update, None);
+
+        // Passes in real time, paced as the encode thread paces them (the rate control goes by
+        // the frames' timestamps).
+        let mut passes = [0u32; 2];
+        while let Some(due) = pipeline.refinement.due() {
+            tokio::time::sleep_until(due.into()).await;
+            let out = tokio::task::block_in_place(|| pipeline.refine(&video, Instant::now()));
+            let (update, mask) = out.update.expect("a pass goes out");
+            let frames = receive(&conn, &mut reassemblers, mask.count_ones() as usize).await;
+            for f in &frames {
+                assert_eq!((f.update, f.update_mask, f.keyframe), (update, mask, false));
+                passes[usize::from(f.tile.index)] += 1;
+            }
+            assert!(passes.iter().all(|&n| n <= u32::from(REFINE_MAX_PASSES)), "{passes:?}");
+        }
+        // The flat tile was as sharp as it gets at once: two passes of next to nothing.
+        assert_eq!(passes[1], 2, "{passes:?}");
+        assert!(passes[0] >= 2, "{passes:?}");
+        // The right half changes: only it is sharpened again.
+        let out = tokio::task::block_in_place(|| pipeline.update(&video, Some(nv12(w as usize, h as usize, picture(9))), u64::MAX, Work::default()));
+        assert_eq!(out.sent, 0b10);
+        receive(&conn, &mut reassemblers, 1).await;
+        assert!(matches!(pipeline.refinement.tiles[..], [RefineTile::Done, RefineTile::Pending { passes: 0, .. }]));
+    }
+
+    /// The encode thread sharpens still tiles by itself, after telling the viewer the screen went
+    /// still, and tells it again which update was the last once the passes are over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_encode_thread_sharpens_still_tiles() {
+        let _encoders = encoders_turn();
+        let (host_conn, conn) = loopback("loop-refine").await;
+        let (w, h) = (640u32, 384u32);
+        let video = Arc::new(VideoOut::new(host_conn.clone(), false));
+        let mut pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        pipeline.refinement.enabled = true;
+        let shared = Arc::new(Shared {
+            state: Mutex::default(),
+            wake: Condvar::new(),
+            layout: pipeline.encoders.tiles.clone(),
+            tiles: 0b11,
+            full: AtomicBool::new(false),
+            hints: false,
+        });
+        let (notes_tx, mut notes) = mpsc::channel(8);
+        video.set_notices(notes_tx);
+        let thread = std::thread::spawn({
+            let (shared, video) = (shared.clone(), video.clone());
+            move || encode_loop(&shared, pipeline, &video)
+        });
+        let mut reassemblers: Vec<_> = (0..MAX_TILES).map(|_| transport::video::Reassembler::new()).collect();
+        // Flat: as sharp as it gets at once, so two passes of next to nothing each.
+        shared.on_captured(nv12(w as usize, h as usize, |p, _, _| if p == 0 { 90 } else { 128 }));
+        assert_eq!(summary(&receive(&conn, &mut reassemblers, 2).await), [(0, 0, 0b11, true), (1, 0, 0b11, true)]);
+        let note = tokio::time::timeout(Duration::from_millis(500), notes.recv()).await.unwrap();
+        assert_eq!(note, Some(HostMsg::VideoIdle { update: 0, mask: 0b11 }));
+        let Some(HostMsg::VideoIdle { update, mask }) = tokio::time::timeout(Duration::from_secs(2), notes.recv()).await.unwrap() else {
+            panic!("no second note");
+        };
+        let mut frames = Vec::new();
+        while let Ok(Ok(datagram)) = tokio::time::timeout(Duration::from_millis(100), conn.read_datagram()).await {
+            let tile = transport::video::tile_of(&datagram).unwrap();
+            if let Some(assembled) = reassemblers[usize::from(tile)].push(&datagram) {
+                frames.push(protocol::decode::<VideoFrame>(&assembled.data).unwrap());
+            }
+        }
+        assert!(frames.iter().all(|f| !f.keyframe && f.update >= 1), "{:?}", summary(&frames));
+        for tile in 0..2u8 {
+            assert_eq!(frames.iter().filter(|f| f.tile.index == tile).count(), 2, "{:?}", summary(&frames));
+        }
+        let last = frames.iter().map(|f| f.update).max().unwrap();
+        assert_eq!(update, last);
+        assert_eq!(mask, frames.iter().filter(|f| f.update == last).fold(0, |m, f| m | f.tile.bit()));
+        shared.state.lock().unwrap().stop = true;
+        shared.wake.notify_one();
+        tokio::task::block_in_place(|| thread.join().unwrap());
+    }
+
     /// An encoder that keeps refusing frames is made again, and its tile's next frame is a
     /// keyframe; the full frame's is dropped.
     #[tokio::test(flavor = "multi_thread")]
@@ -4278,7 +4708,9 @@ mod tests {
         let (host_conn, conn) = loopback("quiet").await;
         let (w, h) = (640u32, 384u32);
         let video = Arc::new(VideoOut::new(host_conn.clone(), false));
-        let pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        let mut pipeline = pipeline(&video, w, h, (2, 1), 2.0);
+        // Exactly these frames: no sharpening passes in between (see `still_tiles_are_sharpened`).
+        pipeline.refinement.enabled = false;
         let shared = Arc::new(Shared {
             state: Mutex::default(),
             wake: Condvar::new(),
