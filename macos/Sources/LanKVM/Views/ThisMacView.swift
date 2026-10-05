@@ -16,6 +16,8 @@ struct ThisMacView: View {
 
             RemoteControlCard()
 
+            MicrophoneCard()
+
             InternetAccessCard()
 
             if let mac = core.thisMac {
@@ -46,7 +48,7 @@ struct ThisMacView: View {
                     ForEach(Array(core.host.viewers.enumerated()), id: \.element.id) { index, viewer in
                         if index > 0 { CardDivider() }
                         CardRow(icon: viewer.controlling ? "cursorarrow.rays" : "eye", tint: .lkAccent, title: viewer.name,
-                                detail: "\(viewer.controlling ? "Controlling" : "Viewing") · \(route(viewer))",
+                                detail: "\(viewer.controlling ? "Controlling" : "Viewing")\(viewer.microphone ? " · Microphone on" : "") · \(route(viewer))",
                                 monospacedDetail: true) {
                             HStack(spacing: 8) {
                                 if viewer.controlling {
@@ -295,6 +297,100 @@ private struct RemoteControlCard: View {
             return "To use this Mac's mouse and keyboard from another Mac, macOS needs to allow LanKVM under Accessibility."
         }
         return "Paired Macs can switch to Control and use this Mac's mouse and keyboard, and its clipboard if they share theirs. To take it back at any time, press ⌃⌥⌘ and the period key here."
+    }
+}
+
+/// LanKVM Microphone: an input apps here can pick, which plays the microphone of a Mac viewing this
+/// one when that Mac shares it. Needs a driver, installed with an administrator password.
+private struct MicrophoneCard: View {
+    @EnvironmentObject private var core: CoreModel
+
+    var body: some View {
+        Card {
+            HStack(alignment: .top, spacing: 12) {
+                IconBadge(systemName: core.host.microphoneReady ? "mic" : "mic.slash", tint: core.host.microphoneReady ? .lkAccent : .lkSecondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Microphone")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.lkText)
+                        Spacer()
+                        status
+                    }
+                    Text(explanation)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Color.lkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let error = core.microphoneDriverError {
+                        Text(error)
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color.lkWarning)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 8) {
+                        actions
+                        if core.microphoneDriverBusy {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                    .disabled(core.microphoneDriverBusy)
+                    .padding(.top, 4)
+                }
+            }
+            .padding(14)
+        }
+    }
+
+    private var listeners: [Viewer] { core.host.viewers.filter(\.microphone) }
+
+    @ViewBuilder private var status: some View {
+        if let viewer = listeners.first {
+            StatusPill(text: listeners.count > 1 ? "\(listeners.count) Macs’ microphones on" : "\(viewer.name)’s microphone on", color: .lkAccent)
+        } else if core.host.microphoneReady {
+            StatusPill(text: core.microphoneDriver.outdated ? "Update available" : "Ready", color: core.microphoneDriver.outdated ? .lkWarning : .lkSuccess)
+        } else if core.microphoneDriver.installed {
+            StatusPill(text: "Not loaded", color: .lkWarning)
+        } else {
+            StatusPill(text: "Not installed", color: .lkSecondary)
+        }
+    }
+
+    @ViewBuilder private var actions: some View {
+        if !core.microphoneDriver.installed {
+            Button("Install…") { core.installMicrophoneDriver() }
+                .buttonStyle(PrimaryButtonStyle())
+                .disabled(!core.microphoneDriver.bundled)
+                .help("Asks for an administrator password, and restarts this Mac’s sound for a moment")
+        } else {
+            if core.microphoneDriver.outdated {
+                Button("Update…") { core.installMicrophoneDriver() }
+                    .buttonStyle(PrimaryButtonStyle())
+            }
+            if !core.host.microphoneReady {
+                Button("Restart Audio…") { core.restartAudio() }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .help("Restarts this Mac’s sound, which loads LanKVM Microphone")
+            }
+            Button("Remove…") { core.removeMicrophoneDriver() }
+                .buttonStyle(SecondaryButtonStyle(destructive: true))
+        }
+    }
+
+    private var explanation: String {
+        if core.microphoneDriverBusy {
+            return "Waiting for this Mac’s sound to restart…"
+        }
+        if !core.microphoneDriver.installed {
+            if !core.microphoneDriver.bundled {
+                return "This build of LanKVM doesn’t include LanKVM Microphone. Build the app with scripts/bundle.sh."
+            }
+            return "Install LanKVM Microphone so a paired Mac that views this one can lend it its microphone, for calls and recordings here. Installing asks for an administrator password and restarts this Mac’s sound for a moment."
+        }
+        if !core.host.microphoneReady {
+            return "LanKVM Microphone is installed, but this Mac’s sound hasn’t loaded it yet. Restart Audio, or restart the Mac."
+        }
+        let pick = "Apps here can choose LanKVM Microphone as their microphone. It plays the microphone of a paired Mac viewing this one, once that Mac turns on Share Microphone."
+        return core.host.allowControl ? pick : pick + " Turn on Let paired Macs control this Mac first: until then they can only view."
     }
 }
 

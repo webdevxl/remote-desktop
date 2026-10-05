@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LanKVM Microphone's bundle. scripts/build-audio-driver.sh fills in the version. -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
+    <key>CFBundleExecutable</key><string>LanKVMMicrophone</string>
+    <key>CFBundleIdentifier</key><string>dev.lankvm.LanKVM.microphone</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>LanKVM Microphone</string>
+    <key>CFBundlePackageType</key><string>BNDL</string>
+    <key>CFBundleShortVersionString</key><string>__VERSION__</string>
+    <key>CFBundleVersion</key><string>__BUILD__</string>
+    <key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <!-- The factory LanKVMMicrophone.c exports, for the Audio Server plug-in type. -->
+    <key>CFPlugInFactories</key>
+    <dict>
+        <key>D4C8563A-8F15-4138-97FC-D86FEA669ADE</key><string>LanKVMMicrophone_Create</string>
+    </dict>
+    <key>CFPlugInTypes</key>
+    <dict>
+        <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+        <array><string>D4C8563A-8F15-4138-97FC-D86FEA669ADE</string></array>
+    </dict>
+    <key>AudioServerPlugIn_MachServices</key><array/>
+    <key>sandboxSafe</key><true/>
+</dict>
+</plist>

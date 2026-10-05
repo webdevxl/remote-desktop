@@ -101,6 +101,11 @@ private struct ViewerContent: View {
                         .help("Show “\(info.hostName)” at the size of this screen")
                 }
                 ToolbarItemGroup(placement: .primaryAction) {
+                    Toggle(isOn: Binding(get: { session.microphone != .off }, set: { core.setMicrophone($0, for: session.id) })) {
+                        Label("Microphone", systemImage: session.microphone == .on ? "mic.fill" : "mic.slash")
+                    }
+                    .help(session.microphoneUnavailable
+                          ?? "Share this Mac’s microphone: apps on “\(info.hostName)” hear it as LanKVM Microphone")
                     Toggle(isOn: $showStats) {
                         Label("Statistics", systemImage: "gauge.with.dots.needle.33percent")
                     }

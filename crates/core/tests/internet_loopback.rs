@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lankvm_core::control::Backend;
-use lankvm_core::{ClipboardBackend, Core, CoreOptions, Event};
+use lankvm_core::{AudioBackend, ClipboardBackend, Core, CoreOptions, Event};
 use protocol::InputMsg;
 use serde_json::{Value, json};
 use transport::identity::DeviceIdentity;
@@ -53,6 +53,8 @@ impl Peer {
             force_relay,
             // Never the user's clipboard.
             clipboard: ClipboardBackend::Off,
+            // Never the user's microphone.
+            audio: AudioBackend::OFF,
         };
         let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
         Self { core, events, pending: RefCell::new(Vec::new()) }

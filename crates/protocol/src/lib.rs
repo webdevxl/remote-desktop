@@ -12,6 +12,9 @@
 //! - a unidirectional **clipboard stream** per clipboard transfer, either way, while the client
 //!   controls the host and shares its clipboard (see [`ClipboardHeader`]). Each is its own stream,
 //!   so a big image never holds up control messages or input.
+//! - unreliable **datagrams** client→host with the client's microphone, while the host takes it
+//!   (see [`ClientMsg::Microphone`] and [`MicPacket`]): 10 ms of audio each, played into the
+//!   host's "LanKVM Microphone".
 //!
 //! Every unidirectional stream starts with one byte saying what it carries ([`STREAM_INPUT`],
 //! [`STREAM_CLIPBOARD`]).
@@ -22,7 +25,7 @@
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const DEFAULT_PORT: u16 = 47800;
 pub const ALPN: &[u8] = b"lankvm/1";
 /// Upper bound for a single control message; protects against garbage length prefixes.
@@ -77,6 +80,10 @@ pub enum ClientMsg {
     /// `Welcome` and whenever it changes. A host shares its clipboard only with the client that
     /// controls it, and only once that client said yes.
     ShareClipboard { on: bool },
+    /// Asks the host to play the client's microphone into its "LanKVM Microphone" (true), or to
+    /// stop (false). The host answers with [`HostMsg::Microphone`]; the client sends its audio
+    /// ([`MicPacket`]s) only while that says it's active.
+    Microphone { on: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -120,6 +127,10 @@ pub enum HostMsg {
     /// registers to be introduced to its viewers with no router setup, and under what ID; both
     /// empty while internet access or the server is off.
     InternetAccess { key: Vec<u8>, addresses: Vec<String>, rendezvous_server: String, rendezvous_id: Vec<u8> },
+    /// Whether the host plays the client's microphone now: answering [`ClientMsg::Microphone`],
+    /// and whenever that changes on the host's side. Also sent as the session starts, to say
+    /// whether the client could share its microphone (`reason`).
+    Microphone(MicrophoneState),
 }
 
 /// Which of the host's displays a client watches.
@@ -257,6 +268,81 @@ impl DisplayReason {
     pub const NO_VIDEO: Self = Self(9);
     /// The host has as many virtual displays as it makes.
     pub const TOO_MANY: Self = Self(10);
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct MicrophoneState {
+    /// The host plays the client's microphone into its "LanKVM Microphone" now.
+    pub active: bool,
+    /// Why it doesn't, or wouldn't if asked ([`MicrophoneReason::NONE`] when it does, or could).
+    pub reason: MicrophoneReason,
+    /// The reason in words, naming the host, for the client to show. Empty for `NONE`.
+    pub message: String,
+}
+
+/// Why a host doesn't play a client's microphone. A number rather than an enum, so a reason added
+/// later still decodes; a client shows the message of a code it doesn't know.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct MicrophoneReason(pub u16);
+
+impl MicrophoneReason {
+    pub const NONE: Self = Self(0);
+    /// The host doesn't have the LanKVM Microphone driver (or its audio system hasn't loaded it).
+    pub const NOT_INSTALLED: Self = Self(1);
+    /// The host's "Let paired Macs control this Mac" setting is off.
+    pub const TURNED_OFF: Self = Self(2);
+    /// Playing into the driver failed on the host; trying again may work.
+    pub const FAILED: Self = Self(3);
+    /// The host's user stopped it.
+    pub const STOPPED_BY_HOST: Self = Self(4);
+    // The client's own reasons, never sent by a host:
+    /// The client couldn't open its microphone.
+    pub const CAPTURE_FAILED: Self = Self(100);
+    /// The client's microphone is its own "LanKVM Microphone": it would send back what other Macs
+    /// sent it.
+    pub const LOOPBACK: Self = Self(101);
+    /// The client has no microphone.
+    pub const NO_INPUT: Self = Self(102);
+}
+
+/// Sample rate of the microphone audio clients send.
+pub const MIC_SAMPLE_RATE: u32 = 48_000;
+/// Samples (mono) in one [`MicPacket`]: 10 ms.
+pub const MIC_PACKET_SAMPLES: usize = 480;
+
+/// One datagram of a client's microphone: 10 ms of 48 kHz mono audio as little-endian 16-bit
+/// samples, after a kind byte ([`MicPacket::KIND`]) and a sequence number (counting the client's
+/// packets on the connection, from 0, wrapping), so the host can tell lost packets from late ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MicPacket {
+    pub seq: u32,
+    pub samples: Vec<i16>,
+}
+
+impl MicPacket {
+    /// First byte of a microphone datagram: kinds tell client datagrams apart, should others come.
+    pub const KIND: u8 = 1;
+    pub const LEN: usize = 5 + 2 * MIC_PACKET_SAMPLES;
+
+    pub fn write(seq: u32, samples: &[i16; MIC_PACKET_SAMPLES]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::LEN);
+        out.push(Self::KIND);
+        out.extend_from_slice(&seq.to_le_bytes());
+        for sample in samples {
+            out.extend_from_slice(&sample.to_le_bytes());
+        }
+        out
+    }
+
+    /// None if it isn't a whole microphone datagram.
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() != Self::LEN || buf[0] != Self::KIND {
+            return None;
+        }
+        let seq = u32::from_le_bytes(buf[1..5].try_into().ok()?);
+        let samples = buf[5..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+        Some(Self { seq, samples })
+    }
 }
 
 /// Minimum spacing between [`HostMsg::InputAck`]s.
@@ -1057,6 +1143,9 @@ mod tests {
         assert_eq!(encode(&ClientMsg::RequestKeyframes { tiles: 5 }).unwrap(), [8, 5]);
         assert_eq!(encode(&ClientMsg::NoFullFrame).unwrap(), [9]);
         assert_eq!(encode(&ClientMsg::ShareClipboard { on: true }).unwrap(), [10, 1]);
+        assert_eq!(encode(&ClientMsg::Microphone { on: true }).unwrap(), [11, 1]);
+        let mic = MicrophoneState { active: false, reason: MicrophoneReason::NOT_INSTALLED, message: "x".into() };
+        assert_eq!(encode(&HostMsg::Microphone(mic)).unwrap(), [12, 0, 1, 1, 120]);
         assert_eq!(encode(&HostMsg::VideoIdle { update: 1, mask: 2 }).unwrap(), [10, 1, 2]);
         let access = HostMsg::InternetAccess { key: vec![7], addresses: vec!["a".into()], rendezvous_server: "b".into(), rendezvous_id: vec![9] };
         assert_eq!(encode(&access).unwrap(), [11, 1, 7, 1, 1, 97, 1, 98, 1, 9]);
@@ -1359,6 +1448,27 @@ mod tests {
         assert!(ClipboardHeader { too_large: 1, ..header }.check().is_err(), "too large comes without data");
         assert!(MAX_CLIPBOARD_BYTES_INTERNET < MAX_CLIPBOARD_BYTES);
         assert_ne!(STREAM_INPUT, STREAM_CLIPBOARD);
+    }
+
+    #[test]
+    fn mic_packets_round_trip_and_are_checked() {
+        let mut samples = [0i16; MIC_PACKET_SAMPLES];
+        for (i, s) in samples.iter_mut().enumerate() {
+            *s = (i as i16 - 240) * 100;
+        }
+        samples[0] = i16::MIN;
+        samples[1] = i16::MAX;
+        let bytes = MicPacket::write(u32::MAX - 1, &samples);
+        assert_eq!(bytes.len(), MicPacket::LEN);
+        assert!(MicPacket::LEN < 1200 - 60, "fits a datagram on any path QUIC runs on");
+        let packet = MicPacket::parse(&bytes).unwrap();
+        assert_eq!(packet.seq, u32::MAX - 1);
+        assert_eq!(packet.samples, samples);
+        assert!(MicPacket::parse(&bytes[..bytes.len() - 1]).is_none(), "short");
+        let mut other = bytes.clone();
+        other[0] = 0;
+        assert!(MicPacket::parse(&other).is_none(), "another kind");
+        assert_eq!(MIC_SAMPLE_RATE as usize / MIC_PACKET_SAMPLES, 100, "10 ms each");
     }
 
     #[test]

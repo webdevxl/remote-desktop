@@ -798,6 +798,8 @@ struct SessionControl: View {
         Toggle("Send System Shortcuts to Remote Mac", isOn: $sendSystemShortcuts)
         Toggle("Send Trackpad Gestures to Remote Mac", isOn: $sendTrackpadGestures)
         Toggle("Share Clipboard", isOn: $shareClipboard)
+        Toggle("Share Microphone", isOn: Binding(get: { session.microphone != .off },
+                                                 set: { CoreModel.shared.setMicrophone($0, for: session.id) }))
         Divider()
         if session.mode == .control {
             Button("View Only", action: model.viewOnly)

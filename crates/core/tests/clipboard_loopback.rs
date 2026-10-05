@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lankvm_core::control::Backend;
-use lankvm_core::{ClipboardBackend, Core, CoreOptions, Event};
+use lankvm_core::{AudioBackend, ClipboardBackend, Core, CoreOptions, Event};
 use platform_mac::clipboard::Pasteboard;
 use transport::identity::DeviceIdentity;
 
@@ -40,6 +40,8 @@ impl Peer {
             rendezvous: Some(String::new()),
             force_relay: false,
             clipboard: ClipboardBackend::Named(board.to_string()),
+            // Never the user's microphone.
+            audio: AudioBackend::OFF,
         };
         let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
         Self { core, events, board: Pasteboard::named(board) }

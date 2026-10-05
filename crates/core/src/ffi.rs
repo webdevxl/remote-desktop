@@ -236,6 +236,24 @@ pub extern "C" fn lk_set_share_clipboard(on: bool) {
     }
 }
 
+/// Whether to share this Mac's microphone with the session's host: its apps then hear it as
+/// "LanKVM Microphone". Off on connecting. A `microphone` event says whether the host plays it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_set_microphone(session: u64, on: bool) {
+    if let Some(c) = core() {
+        c.set_microphone(session, on);
+    }
+}
+
+/// The app installed or removed the LanKVM Microphone driver on this Mac: viewers learn whether
+/// they can share their microphones here.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_microphone_driver_changed() {
+    if let Some(c) = core() {
+        c.microphone_driver_changed();
+    }
+}
+
 /// While controlling: whether the viewer window has the focus and forwards input. The host puts
 /// its cursor back into the video while it doesn't.
 #[unsafe(no_mangle)]

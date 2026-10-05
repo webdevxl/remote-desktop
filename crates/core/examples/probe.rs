@@ -39,6 +39,14 @@
 //!   {"system":"mission_control"}   also app_expose, show_desktop, launchpad, previous_space,
 //!       next_space
 //!
+//! The microphone (the host must have LanKVM Microphone installed, and allow control):
+//!
+//!   probe HOST --microphone [--seconds 30]
+//!
+//! sends a 440 Hz tone, not this Mac's microphone (`LANKVM_MICROPHONE=tone:HZ` picks another
+//! pitch, `LANKVM_MICROPHONE=system` the real microphone), for --seconds while watching the video:
+//! apps on the host hear it from LanKVM Microphone. Fails if the host doesn't take it.
+//!
 //! A virtual display (the host makes a display this size and streams it instead of its own):
 //!
 //!   probe HOST --virtual 6144x2560@2x [--virtual 3840x2160 ...] [--then-main] [--arrange extend|main|only] [--refresh 60]
@@ -111,6 +119,8 @@ struct Args {
     barcode_scale: Option<f64>,
     /// One JSON line per finished update goes here.
     trace: Option<String>,
+    /// Have the host play this probe's microphone (a tone, unless told otherwise).
+    microphone: bool,
 }
 
 enum Barcode {
@@ -160,6 +170,7 @@ fn parse_args() -> Result<Args, String> {
         barcode: None,
         barcode_scale: None,
         trace: None,
+        microphone: false,
     };
     let mut target = None;
     let mut arrangement = Arrangement::EXTEND;
@@ -195,12 +206,13 @@ fn parse_args() -> Result<Args, String> {
                 a.barcode_scale = Some(args.next().and_then(|s| s.parse().ok()).filter(|s: &f64| *s > 0.0).ok_or("--barcode-scale needs a number")?)
             }
             "--trace" => a.trace = Some(args.next().ok_or("--trace needs a file")?),
+            "--microphone" => a.microphone = true,
             _ if target.is_none() && !arg.starts_with('-') => target = Some(arg),
             _ => return Err(format!("unexpected argument {arg}")),
         }
     }
     a.target = target.ok_or(
-        "usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--virtual WxH[@2x] [--arrange extend|main|only] [--refresh HZ]] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]] [--barcode-log FILE | --barcode X,Y,W,H [--barcode-scale S]] [--trace FILE]",
+        "usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--virtual WxH[@2x] [--arrange extend|main|only] [--refresh HZ]] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]] [--barcode-log FILE | --barcode X,Y,W,H [--barcode-scale S]] [--trace FILE] [--microphone]",
     )?;
     if (a.script.is_some() || a.latency.is_some()) && !a.control {
         return Err("--script and --input-latency need --control".into());
@@ -231,6 +243,12 @@ fn main() -> ExitCode {
     }
     if std::env::var_os("LANKVM_PORT").is_none() {
         unsafe { std::env::set_var("LANKVM_PORT", "0") };
+    }
+    // A tone rather than this Mac's microphone, unless asked for (`system`).
+    match std::env::var("LANKVM_MICROPHONE").as_deref() {
+        Err(_) => unsafe { std::env::set_var("LANKVM_MICROPHONE", "tone") },
+        Ok("system") => unsafe { std::env::remove_var("LANKVM_MICROPHONE") },
+        Ok(_) => {}
     }
 
     // Tiles decoded before the strip's place is known are kept to read it from.
@@ -734,6 +752,15 @@ impl Probe {
         if let Err(code) = self.connect() {
             return code;
         }
+        if args.microphone {
+            match self.microphone() {
+                Ok(()) => println!("microphone on: apps on the host hear it from LanKVM Microphone"),
+                Err(why) => {
+                    println!("FAIL: microphone refused: {why}");
+                    return 1;
+                }
+            }
+        }
         if !args.virtual_displays.is_empty() {
             let size = Arc::new(Mutex::new(None));
             let (sink, watch) = (size.clone(), self.watch.clone());
@@ -937,6 +964,27 @@ impl Probe {
             }
         }
         (false, Some("no answer from the host".into()))
+    }
+
+    /// Asks the host to play this probe's microphone; Err with why it doesn't.
+    fn microphone(&mut self) -> Result<(), String> {
+        let id = self.id;
+        // The host's word as the session started tells nothing about the answer.
+        self.pending.retain(|e| !matches!(e, Event::Microphone { session, .. } if *session == id));
+        self.core.set_microphone(id, true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match self.events.recv_timeout(left) {
+                Ok(Event::Microphone { session, active: true, .. }) if session == id => return Ok(()),
+                Ok(Event::Microphone { session, reason, message, .. }) if session == id && reason != 0 => {
+                    return Err(format!("reason {reason}: {message}"));
+                }
+                Ok(Event::Microphone { .. }) => {}
+                Ok(e) => self.pending.push(e),
+                Err(_) => break,
+            }
+        }
+        Err("no answer from the host".into())
     }
 
     /// What the host said about its cursor right after granting control (it is drawn locally

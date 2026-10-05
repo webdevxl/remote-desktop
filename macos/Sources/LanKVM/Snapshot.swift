@@ -59,8 +59,18 @@ enum Snapshot {
             renderGestureHint(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
             renderDisplays(stats: sample, appearance: appearance, suffix: suffix, into: dir)
             renderInternet(info: info, stats: sample, appearance: appearance, suffix: suffix, into: dir)
+            renderMicrophone(appearance: appearance, suffix: suffix, into: dir)
         }
         NSApp.terminate(nil)
+    }
+
+    /// This Mac with LanKVM Microphone installed and a viewer sharing its microphone (the card
+    /// before installing is in thisMac-*.png).
+    private static func renderMicrophone(appearance: NSAppearance.Name, suffix: String, into dir: URL) {
+        let core = CoreModel.shared
+        core.loadSampleState(screenAllowed: true, microphone: true)
+        render(ContentView(selection: .thisMac).environmentObject(core), size: CGSize(width: 900, height: 1000),
+               appearance: appearance, to: dir.appendingPathComponent("thisMac-microphone-\(suffix).png"))
     }
 
     /// Internet access: This Mac when the router opened the port, when it needs setting up by hand

@@ -92,6 +92,10 @@ private struct ControlCommands: Commands {
             Text("Pinch, rotate and swipes go to the Mac you control. Mission Control and Spaces swipes need Accessibility for LanKVM here.")
             Toggle("Share Clipboard", isOn: $shareClipboard)
             Text("While you control a Mac, what you copy on either one can be pasted on the other.")
+            Toggle("Share Microphone", isOn: Binding(get: { session.map { $0.microphone != .off } ?? false },
+                                                     set: { on in session.map { CoreModel.shared.setMicrophone(on, for: $0.id) } }))
+                .disabled(!connected)
+            Text("Apps on the Mac in front hear this Mac’s microphone as LanKVM Microphone.")
             Divider()
             Toggle("Show Session Control", isOn: $showSessionControl)
         }
@@ -109,7 +113,8 @@ private struct HostMenu: View {
 
     var body: some View {
         ForEach(core.host.viewers) { viewer in
-            Text("\(viewer.name) is \(viewer.controlling ? "controlling" : "viewing") this Mac")
+            Text("\(viewer.name) is \(viewer.controlling ? "controlling" : "viewing") this Mac"
+                 + (viewer.microphone ? " · microphone on" : ""))
         }
         if !core.host.virtualDisplays.isEmpty {
             if !core.host.viewers.isEmpty { Divider() }

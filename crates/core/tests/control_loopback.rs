@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lankvm_core::control::Backend;
-use lankvm_core::{ClipboardBackend, Core, CoreOptions, Event};
+use lankvm_core::{AudioBackend, ClipboardBackend, Core, CoreOptions, Event};
 use platform_mac::inject::Bounds;
 use protocol::{
     Arrangement, DisplayChoice, DisplayReason, DockAxis, GestureInput, GesturePhase, InputMsg, POS_MAX, ScrollInput, SystemAction,
@@ -46,6 +46,8 @@ impl Peer {
             force_relay: false,
             // Never the user's clipboard.
             clipboard: ClipboardBackend::Off,
+            // Never the user's microphone.
+            audio: AudioBackend::OFF,
         };
         let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
         Self { core, events, pending: RefCell::new(Vec::new()) }
@@ -482,6 +484,8 @@ fn same_mac_control_is_refused_without_the_override() {
         force_relay: false,
         // Never the user's clipboard.
         clipboard: ClipboardBackend::Off,
+        // Never the user's microphone.
+        audio: AudioBackend::OFF,
     };
     let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
     let host = Peer { core, events, pending: RefCell::new(Vec::new()) };
@@ -508,6 +512,8 @@ fn start_host(dir: &Path, backend: Backend, ttl: Option<Duration>) -> Peer {
         force_relay: false,
         // Never the user's clipboard.
         clipboard: ClipboardBackend::Off,
+        // Never the user's microphone.
+        audio: AudioBackend::OFF,
     };
     let core = Core::start_with(Arc::new(move |e| drop(tx.lock().unwrap().send(e))), options).unwrap();
     Peer { core, events, pending: RefCell::new(Vec::new()) }

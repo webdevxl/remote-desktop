@@ -27,6 +27,7 @@ let package = Package(
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("CoreAudio"),
+                .linkedFramework("AudioToolbox"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("Metal"),
                 .linkedFramework("IOSurface"),

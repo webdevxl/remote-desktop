@@ -88,8 +88,9 @@ without installing it:
 ```
 
 `bundle.sh` builds the Rust core as a static library, links it into the SwiftUI app with
-SwiftPM, writes `Info.plist` and signs the bundle. Always launch the `.app`: macOS grants
-Screen Recording to the app bundle.
+SwiftPM, puts the LanKVM Microphone driver inside (see Using your microphone on the other Mac),
+writes `Info.plist` and signs the bundle. Always launch the `.app`: macOS grants Screen Recording
+and the microphone to the app bundle.
 
 **Signing.** macOS remembers privacy permissions only while the app's signature stays the same.
 `bundle.sh` signs with the first "Apple Development" or "lankvm-dev" certificate in your
@@ -185,6 +186,39 @@ copying one empties the other Mac's clipboard, so it never pastes something olde
 - LanKVM checks only whether the clipboard changed (a counter macOS keeps), a few times a second,
   and reads it only while it shares it. If macOS asks whether LanKVM may paste from other apps,
   allow it.
+
+### Using your microphone on the other Mac
+
+The Mac you sit at can lend its microphone to the Mac you view or control: apps there (a call in
+Zoom, Teams or FaceTime, a recording, dictation) choose **LanKVM Microphone** as their
+microphone and hear you.
+
+1. **Once, on the other Mac:** open **This Mac → Microphone** and click **Install…**. That installs
+   LanKVM Microphone, a small audio driver, into `/Library/Audio/Plug-Ins/HAL`: macOS asks for an
+   administrator password, and the Mac's sound restarts for a moment. (`./scripts/install-audio-driver.sh`
+   does the same from Terminal.) **Let paired Macs control this Mac** must be on there: a
+   microphone is input too.
+2. **On your Mac:** click the microphone button in the viewer's toolbar, or choose **Share
+   Microphone** (session control's **⋯** menu, or the **Control** menu). The first time, macOS
+   asks whether LanKVM may use the microphone.
+3. **On the other Mac:** pick **LanKVM Microphone** as the input in the app (or in System Settings
+   → Sound → Input, for every app).
+
+- Your Mac's current microphone goes (its default input in Sound settings), and LanKVM follows
+  when you change it, a headset plugged in say. Only the Mac whose window shares it hears it: each
+  window has its own switch, off every time it connects.
+- Several Macs can share their microphones with one Mac at once: LanKVM Microphone plays them
+  mixed. This Mac lists whose microphone is on, and so does the menu-bar icon. Turning off **Let
+  paired Macs control this Mac** stops them.
+- Audio goes as 48 kHz, 16-bit mono in 10 ms packets (about 0.8 Mbit/s), on QUIC datagrams like
+  the video: a lost packet is a 10 ms gap rather than a growing delay. The other Mac keeps 20 ms
+  of it in hand on the local network (40 ms over the internet), more for a while after the
+  network stalled, and follows the two Macs' clocks drifting apart without a sound.
+- Without the microphone permission macOS sends LanKVM silence: allow it in System Settings →
+  Privacy & Security → Microphone. LanKVM never sends LanKVM Microphone itself (a Mac whose own
+  input is set to it), which would play other Macs' audio back to them.
+- **Remove…** under This Mac → Microphone uninstalls the driver (`./scripts/install-audio-driver.sh
+  --remove` from Terminal). **Update…** shows there when this LanKVM has a newer driver.
 
 ### Working on a big screen: virtual displays
 
@@ -355,6 +389,13 @@ clipboard, so they don't share it. `LANKVM_CLIPBOARD=<name>` gives an instance a
 own instead (`off`: none), which it then shares; `crates/core/tests/clipboard_loopback.rs` runs two
 cores that way, never touching your clipboard.
 
+**The microphone on one Mac.** `LANKVM_MICROPHONE=tone` makes an instance send a 440 Hz tone
+(`tone:1000`: another pitch) instead of its microphone, and `off` none; `./scripts/second-instance.sh`
+passes it on. `crates/core/tests/microphone_loopback.rs` runs two cores with a tone and a recording
+in place of LanKVM Microphone, never touching your audio devices, and `./scripts/build-audio-driver.sh`
+checks the driver itself by loading it as macOS's audio system does, without installing it. With the
+driver installed, `probe HOST --microphone --seconds 30` sends the tone to a host for real.
+
 **Internet access on one Mac.** `LANKVM_TEST_LOOPBACK_IS_INTERNET=1` makes an instance treat
 loopback as the internet, so its connections over `127.0.0.1` go through the gate, the knock and
 the internet checks; the router is left alone, and so is the LanKVM server unless
@@ -445,6 +486,11 @@ and unlocked while it runs.
 ## Troubleshooting
 
 - **Logs:** `~/Library/Logs/lankvm.log`. Set `RUST_LOG=debug` for more detail.
+- **"… needs LanKVM Microphone first":** install it on the Mac you view (This Mac → Microphone).
+  If This Mac says *Not loaded*, click **Restart Audio…** or restart that Mac.
+  `system_profiler SPAudioDataType | grep -A3 "LanKVM Microphone"` shows whether macOS has it.
+- **The other Mac hears silence:** on your Mac, allow LanKVM under Privacy & Security →
+  Microphone, and check the input level of your microphone in Sound settings.
 - **"hasn't allowed Screen Recording":** recent macOS versions never prompt for this and don't
   list the app automatically. In System Settings → Privacy & Security → Screen & System Audio
   Recording, drag LanKVM into the list (or click + and choose it), switch it on, and relaunch
@@ -493,10 +539,12 @@ and unlocked while it runs.
 |---|---|
 | `crates/protocol` | Wire messages, video packet header |
 | `crates/transport` | QUIC endpoint, LAN congestion control, identity, pairing, packetizer/reassembler, the gate that keeps the port silent to the internet (`gate.rs`, `knock.rs`, `cid.rs`), the LanKVM server's protocol and relay on the socket (`rendezvous.rs`, with an in-process server for tests in `test_server.rs`) |
-| `crates/platform-mac` | ScreenCaptureKit capture, finding the tiles that changed (`tiler.rs`), VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), the clipboard (`clipboard.rs`), virtual displays (`virtual_display.rs`), router port mapping (`portmap.rs`) |
-| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), the shared clipboard (`clipboard.rs`), virtual displays for viewers (`displays.rs`), internet access keys, addresses and port mapping (`internet.rs`), registration with and introductions through the LanKVM server (`rendezvous.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
+| `crates/platform-mac` | ScreenCaptureKit capture, finding the tiles that changed (`tiler.rs`), VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), the clipboard (`clipboard.rs`), microphone capture and playback (`audio.rs`), virtual displays (`virtual_display.rs`), router port mapping (`portmap.rs`) |
+| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), the shared clipboard (`clipboard.rs`), the shared microphone (`microphone.rs`), virtual displays for viewers (`displays.rs`), internet access keys, addresses and port mapping (`internet.rs`), registration with and introductions through the LanKVM server (`rendezvous.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
 | `macos/` | SwiftUI app (SwiftPM). `Sources/CLanKVM/include/lankvm.h` is the C interface |
+| `macos/AudioDriver` | LanKVM Microphone, the Audio Server plug-in (C) that gives a Mac the microphone other Macs share, and its test |
 | `scripts/bundle.sh` | Builds and signs `LanKVM.app` |
+| `scripts/build-audio-driver.sh`, `scripts/install-audio-driver.sh` | Build and check LanKVM Microphone; install or remove it from Terminal |
 | `scripts/make-icon.swift` | Regenerates `macos/Resources/AppIcon.icns` |
 | `scripts/e2e-control.sh`, `scripts/e2e/`, `scripts/input-lab.swift` | One-Mac remote-control tests |
 | `scripts/viewer-bench.sh`, `scripts/viewer-report.py`, `macos/Sources/LanKVM/BenchScope.swift` | Source-to-glass bench of the viewer window |
@@ -505,7 +553,7 @@ The remote screen never goes through SwiftUI. The viewer window hosts a `CAMetal
 Rust core renders each decoded frame into it from its own thread as soon as it arrives.
 
 Tests: `cargo test --workspace`. This includes a real hardware HEVC encode→decode round trip, a
-QUIC loopback session, remote control and the shared clipboard end to end over QUIC, and
+QUIC loopback session, remote control, the shared clipboard and the shared microphone end to end over QUIC, and
 connecting over the (loopback) internet. To review the UI without granting any permissions, render every screen
 to PNG (light and dark):
 

@@ -12,7 +12,7 @@ use platform_mac::decoder::{DecodedFrame, Decoder};
 use platform_mac::{CVPixelBuffer, clock, system};
 use protocol::{
     Arrangement, ClientMsg, Codec, ControlState, CursorState, DEFAULT_PORT, DisplayChoice, DisplayReason, DisplayState, FULL_FRAME_TILE,
-    HostMsg, InputMsg, MAX_TILES, PROTOCOL_VERSION, STREAM_INPUT, TileRect, VideoFrame,
+    HostMsg, InputMsg, MAX_TILES, MicrophoneReason, MicrophoneState, PROTOCOL_VERSION, STREAM_INPUT, TileRect, VideoFrame,
 };
 use quinn::{Connection, ConnectionError, RecvStream, SendStream};
 use tokio::sync::{mpsc, watch};
@@ -28,6 +28,7 @@ use transport::video::{Reassembler, tile_of};
 
 use crate::Trust;
 use crate::clipboard::{Clipboard, Note, SessionClipboard};
+use crate::microphone::{MicGuard, Microphone};
 use crate::rendezvous::{Elsewhere, RelaySession, Rendezvous};
 use crate::stats::{FrameTiming, Stats, StatsView};
 use crate::view::{TileImage, ViewHandle, ViewSlot};
@@ -158,6 +159,8 @@ pub enum SessionEvent {
     /// A clipboard of `bytes` was too big to share, so the other Mac's was emptied: this Mac's
     /// (`sent`), or the host's (this Mac's was emptied).
     ClipboardTooLarge { bytes: u64, sent: bool },
+    /// Whether the host plays this Mac's microphone now, or why not (see `Event::Microphone`).
+    Microphone(MicrophoneState),
 }
 
 /// Input written per batch at most; anything more waits for the next write.
@@ -189,6 +192,8 @@ pub struct Shared {
     pending_display: Mutex<Option<PendingDisplay>>,
     /// The host's latest [`HostMsg::VideoIdle`], for the video task.
     video_idle: Mutex<Option<(u32, u64)>>,
+    /// What the host last said about this Mac's microphone.
+    microphone: watch::Sender<Option<MicrophoneState>>,
 }
 
 /// A `Display` event to send once a frame of `size` is decoded.
@@ -226,6 +231,8 @@ pub struct Session {
     task: tokio::task::JoinHandle<()>,
     view: Mutex<Option<ViewHandle>>,
     clipboard: Option<Arc<Clipboard>>,
+    /// Whether the user wants the host to have this Mac's microphone.
+    microphone: Arc<watch::Sender<bool>>,
 }
 
 impl Session {
@@ -238,6 +245,7 @@ impl Session {
         max_size: (u32, u32),
         max_fps: u32,
         clipboard: Option<(Arc<Clipboard>, watch::Receiver<bool>)>,
+        microphone: Option<Arc<Microphone>>,
         events: SessionEvents,
     ) -> Self {
         let shared = Arc::new(Shared::default());
@@ -246,8 +254,10 @@ impl Session {
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let hub = clipboard.as_ref().map(|(hub, _)| hub.clone());
+        let wants_microphone = Arc::new(watch::channel(false).0);
         let task = rt.spawn({
             let (shared, conn, ctl_tx) = (shared.clone(), conn.clone(), ctl_tx.clone());
+            let wants_microphone = wants_microphone.clone();
             async move {
                 let ctx = RunCtx {
                     trust,
@@ -261,6 +271,7 @@ impl Session {
                     ctl: (ctl_tx, ctl_rx),
                     input_rx,
                     clipboard,
+                    microphone: (microphone, wants_microphone),
                 };
                 let result = run(network, &target, ctx).await;
                 let error = result.err().map(|e| format!("{e:#}"));
@@ -284,7 +295,12 @@ impl Session {
                 }
             });
         }
-        Self { shared, conn, pin_tx, ctl_tx, input_tx, task, view: Mutex::new(None), clipboard: hub }
+        Self { shared, conn, pin_tx, ctl_tx, input_tx, task, view: Mutex::new(None), clipboard: hub, microphone: wants_microphone }
+    }
+
+    /// Whether to share this Mac's microphone with the host (see `Event::Microphone`).
+    pub fn set_microphone(&self, on: bool) {
+        self.microphone.send_replace(on);
     }
 
     /// Asks the host for control (true) or to only view it (false); `take_over` takes control
@@ -408,6 +424,8 @@ struct RunCtx {
     input_rx: mpsc::UnboundedReceiver<(InputMsg, u64)>,
     /// This Mac's clipboard, and whether its user lets it be shared.
     clipboard: Option<(Arc<Clipboard>, watch::Receiver<bool>)>,
+    /// This Mac's microphone, and whether the user wants the host to have it.
+    microphone: (Option<Arc<Microphone>>, Arc<watch::Sender<bool>>),
 }
 
 async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
@@ -550,7 +568,7 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
         }
         other => Some(other),
     };
-    let RunCtx { trust, shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, clipboard, .. } = ctx;
+    let RunCtx { trust, shared, events, ctl: (ctl_tx, mut ctl_rx), input_rx, clipboard, microphone, .. } = ctx;
     tracing::info!(?info, "connected");
     let same_machine = info.same_machine;
     // Where it was reached, to try first next time (and show under Paired Devices). A paired
@@ -603,6 +621,13 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
         let controlling = shared.controlling_changed.subscribe();
         tokio::spawn(share_clipboard(conn.clone(), hub, share, controlling, same_machine, internet, ctl_tx.clone(), events.clone()))
     });
+    let microphone = tokio::spawn(share_microphone(
+        conn.clone(),
+        microphone,
+        shared.microphone.subscribe(),
+        ctl_tx.clone(),
+        events.clone(),
+    ));
     let pinger = tokio::spawn({
         let ctl_tx = ctl_tx.clone();
         async move {
@@ -627,8 +652,86 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     if let Some(clipboard) = clipboard {
         clipboard.abort();
     }
+    microphone.abort();
     shared.set_controlling(false);
     result
+}
+
+/// Sends this Mac's microphone to the host while the user wants that (`wants`) and the host plays
+/// it (`host`), and tells the UI whether it does. A refusal, from the host or this Mac's
+/// microphone, turns it off: asking again is the user's call.
+async fn share_microphone(
+    conn: Connection,
+    (hub, wants): (Option<Arc<Microphone>>, Arc<watch::Sender<bool>>),
+    mut host: watch::Receiver<Option<MicrophoneState>>,
+    ctl: mpsc::UnboundedSender<ClientMsg>,
+    events: SessionEvents,
+) {
+    let mut wanted = wants.subscribe();
+    // What the host was last asked for.
+    let mut asked = false;
+    let mut sending: Option<MicGuard> = None;
+    // What the UI was last told.
+    let mut shown: Option<MicrophoneState> = None;
+    let mut show = |state: MicrophoneState| {
+        if shown.as_ref() != Some(&state) {
+            shown = Some(state.clone());
+            events(SessionEvent::Microphone(state));
+        }
+    };
+    loop {
+        let want = *wanted.borrow_and_update();
+        let said = host.borrow_and_update().clone();
+        if want != asked {
+            asked = want;
+            if ctl.send(ClientMsg::Microphone { on: want }).is_err() {
+                return;
+            }
+        }
+        match said {
+            // The host turned it down, or stopped it: off until the user asks again (and the host
+            // is told so, should it have changed its mind meanwhile).
+            Some(state) if !state.active && state.reason != MicrophoneReason::NONE => {
+                sending = None;
+                if want {
+                    wants.send_replace(false);
+                }
+                show(state);
+            }
+            Some(state) if state.active && want => {
+                if sending.is_none() {
+                    let opened = match &hub {
+                        Some(hub) => {
+                            let (hub, conn) = (hub.clone(), conn.clone());
+                            tokio::task::spawn_blocking(move || hub.join(conn)).await.unwrap_or_else(|e| {
+                                Err((MicrophoneReason::CAPTURE_FAILED, format!("Couldn't open this Mac's microphone: {e}")))
+                            })
+                        }
+                        None => Err((MicrophoneReason::NO_INPUT, "This copy of LanKVM shares no microphone.".to_string())),
+                    };
+                    match opened {
+                        Ok(guard) => sending = Some(guard),
+                        Err((reason, message)) => {
+                            tracing::info!("microphone: {message}");
+                            wants.send_replace(false);
+                            show(MicrophoneState { active: false, reason, message });
+                            continue;
+                        }
+                    }
+                }
+                show(state);
+            }
+            // Asked and not answered yet, stopping, or nothing said yet.
+            _ => {
+                sending = None;
+                show(MicrophoneState { active: false, reason: MicrophoneReason::NONE, message: String::new() });
+            }
+        }
+        tokio::select! {
+            changed = wanted.changed() => if changed.is_err() { return },
+            changed = host.changed() => if changed.is_err() { return },
+        }
+    }
 }
 
 /// Shares the clipboard with the host while this Mac controls it and its user lets it (`share`),
@@ -1101,6 +1204,9 @@ fn handle_host_msg(msg: HostMsg, shared: &Shared, events: &SessionEvents, host: 
         HostMsg::InputAck { seq, received_us, injected_us } => shared.stats.lock().unwrap().on_input_ack(seq, received_us, injected_us),
         HostMsg::Display(state) => on_display(state, shared, events),
         HostMsg::VideoIdle { update, mask } => *shared.video_idle.lock().unwrap() = Some((update, mask)),
+        HostMsg::Microphone(state) => {
+            shared.microphone.send_replace(Some(state));
+        }
         HostMsg::InternetAccess { key, addresses, rendezvous_server, rendezvous_id } => {
             let Ok(key) = AccessKey::try_from(key.as_slice()) else {
                 tracing::warn!(len = key.len(), "ignoring an internet access key of the wrong size");

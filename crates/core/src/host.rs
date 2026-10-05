@@ -17,8 +17,8 @@ use platform_mac::tiler::{TileCopy, Tiler, tiles_touched};
 use platform_mac::{CVPixelBuffer, clock, permissions, system, virtual_display};
 use protocol::{
     Arrangement, ClientMsg, Codec, ControlReason, ControlState, CursorState, DisplayChoice, DisplayReason, DisplayState, HostMsg,
-    FULL_FRAME_TILE, MAX_TILES, PROTOCOL_VERSION, STREAM_CLIPBOARD, STREAM_INPUT, TILE_MAX_WIDTH, TileRect, VideoFrame,
-    VirtualDisplaySpec, tile_layout,
+    FULL_FRAME_TILE, MAX_TILES, MicPacket, MicrophoneReason, MicrophoneState, PROTOCOL_VERSION, STREAM_CLIPBOARD, STREAM_INPUT,
+    TILE_MAX_WIDTH, TileRect, VideoFrame, VirtualDisplaySpec, tile_layout,
 };
 use quinn::{Connection, ConnectionError, Incoming, RecvStream, SendStream};
 use tokio::sync::mpsc;
@@ -34,6 +34,7 @@ use crate::clipboard::{Clipboard, Note, SessionClipboard, stream_kind};
 use crate::control::{Backend, HostSettings, InputCmdSender, InputConfig, InputFailure, InputShared, InputThread, RateLimit};
 use crate::displays::{Acquired, DisplayNotice, Displays, VirtualDisplayView};
 use crate::internet::{HostInternet, InternetView};
+use crate::microphone::{PacketBudget, Speaker};
 use crate::rate::{self, RateControl, Sample};
 use crate::{Event, EventSink, Trust};
 
@@ -110,6 +111,8 @@ pub struct Viewer {
     pub controlling: Arc<AtomicBool>,
     /// The display it watches.
     pub watching: Arc<AtomicU32>,
+    /// Whether its microphone plays into this Mac's LanKVM Microphone now.
+    pub microphone: Arc<AtomicBool>,
     /// Reaches the viewer's session, e.g. to stop its control from the host UI.
     pub(crate) session: mpsc::UnboundedSender<SessionEvt>,
 }
@@ -171,6 +174,8 @@ pub struct HostCtx {
     pub(crate) handshakes: Mutex<HashMap<(bool, IpAddr), usize>>,
     /// This Mac's clipboard, shared with the viewer controlling it if that viewer wants to.
     pub(crate) clipboard: Option<Arc<Clipboard>>,
+    /// This Mac's LanKVM Microphone: plays the microphones viewers share.
+    pub(crate) speaker: Arc<Speaker>,
 }
 
 /// Host status as the UI sees it.
@@ -188,6 +193,9 @@ pub struct HostStatusView {
     pub virtual_displays: Vec<VirtualDisplayView>,
     /// Whether paired Macs can reach this one over the internet.
     pub internet: InternetView,
+    /// Whether the LanKVM Microphone driver is installed and loaded here, so viewers can share
+    /// their microphones with this Mac's apps.
+    pub microphone_ready: bool,
 }
 
 #[derive(Serialize)]
@@ -206,6 +214,8 @@ pub struct ViewerView {
     /// Its traffic goes through a LanKVM server's relay (`address` then stands for the relay
     /// session, in 240.0.0.0/4).
     pub relayed: bool,
+    /// Its microphone plays into this Mac's LanKVM Microphone now.
+    pub microphone: bool,
 }
 
 #[derive(Serialize)]
@@ -229,6 +239,7 @@ impl HostCtx {
         let allow_control = self.settings.lock().unwrap().allow_control;
         let virtual_displays = self.displays.summary();
         let internet = self.internet.view();
+        let microphone_ready = self.speaker.ready();
         let status = self.status.lock().unwrap();
         HostStatusView {
             viewers: status
@@ -248,6 +259,7 @@ impl HostCtx {
                         virtual_display: virtual_displays.iter().any(|d| d.display_id == display_id),
                         internet: v.internet,
                         relayed: self.internet.is_relayed(addr),
+                        microphone: v.microphone.load(Ordering::Acquire),
                     }
                 })
                 .collect(),
@@ -261,6 +273,7 @@ impl HostCtx {
             control_permission,
             virtual_displays,
             internet,
+            microphone_ready,
         }
     }
 
@@ -281,6 +294,15 @@ impl HostCtx {
             // Virtual displays come with control: they move this Mac's windows around.
             self.displays.remove(None, format!("Remote control was turned off on {}, so its virtual display was removed.", system::device_name()));
         }
+        for v in self.status.lock().unwrap().viewers.iter() {
+            let _ = v.session.send(SessionEvt::Availability);
+        }
+        self.changed();
+    }
+
+    /// The LanKVM Microphone driver came or went: viewers learn whether they can share their
+    /// microphones here now.
+    pub fn microphone_changed(&self) {
         for v in self.status.lock().unwrap().viewers.iter() {
             let _ = v.session.send(SessionEvt::Availability);
         }
@@ -635,8 +657,12 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         }
     }));
 
+    // The viewer's microphone, while this Mac plays it (see `SessionMic`): straight to the speaker.
+    let _microphone_in = AbortOnDrop(tokio::spawn(receive_microphone(conn.clone(), ctx.speaker.clone(), session_id)));
+
     let controlling = Arc::new(AtomicBool::new(false));
     let watching = Arc::new(AtomicU32::new(showing.display_id));
+    let microphone = Arc::new(AtomicBool::new(false));
     let _registration = Registration::new(
         Viewer {
             id: session_id,
@@ -646,6 +672,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
             internet,
             controlling: controlling.clone(),
             watching: watching.clone(),
+            microphone: microphone.clone(),
             session: evt_tx.clone(),
         },
         ctx.clone(),
@@ -690,10 +717,13 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         })
     });
     let mut viewer_shares_clipboard = false;
+    let mut mic = SessionMic { ctx: ctx.clone(), session_id, internet, out: out.clone(), flag: microphone, active: false, announced: None };
     let mut screen = Screen::new(streamer, showing, out.clone(), client_fp, same_mac, watching);
     screen.seq_seen = adopted_seq;
     // What it shows, and whether it may ask for a virtual display.
     screen.announce(0, DisplayReason::NONE, String::new());
+    // Whether it could share its microphone.
+    mic.announce();
     // How to reach this Mac over the internet, now or once that is turned on (after Display:
     // the viewer reads that first).
     let (rendezvous_server, rendezvous_id) = ctx.internet.rendezvous_announced();
@@ -717,6 +747,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
             evt = client_rx.recv() => evt,
             _ = permission_check.tick() => {
                 control.check_permission();
+                mic.check().await;
                 if let Some(clipboard) = &mut clipboard {
                     clipboard.set(viewer_shares_clipboard && control.active());
                 }
@@ -737,7 +768,11 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
         };
         let Some(evt) = evt else { break };
         if let SessionEvt::Client(
-            ClientMsg::SetControl { .. } | ClientMsg::Focus { .. } | ClientMsg::SetDisplay { .. } | ClientMsg::ShareClipboard { .. },
+            ClientMsg::SetControl { .. }
+            | ClientMsg::Focus { .. }
+            | ClientMsg::SetDisplay { .. }
+            | ClientMsg::ShareClipboard { .. }
+            | ClientMsg::Microphone { .. },
         ) = evt
             && !requests.allow(Instant::now(), MAX_CONTROL_REQUESTS_PER_SEC)
         {
@@ -773,6 +808,7 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
                 }
             }
             SessionEvt::Client(ClientMsg::ShareClipboard { on }) => viewer_shares_clipboard = on,
+            SessionEvt::Client(ClientMsg::Microphone { on }) => mic.set(on).await,
             SessionEvt::Client(ClientMsg::SetDisplay { request, display }) => screen.request(request, display),
             SessionEvt::Client(other) => bail!("unexpected message {other:?}"),
             SessionEvt::Closed(None) => break,
@@ -793,7 +829,10 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
                     return Err(e);
                 }
             }
-            SessionEvt::Availability => screen.availability_changed(),
+            SessionEvt::Availability => {
+                screen.availability_changed();
+                mic.availability_changed();
+            }
             SessionEvt::CaptureStopped(generation) => screen.capture_stopped(generation),
         }
         // Control may have started or ended, or the viewer changed its mind.
@@ -805,6 +844,143 @@ async fn serve(incoming: Incoming, ctx: Arc<HostCtx>, handshake: Handshake, inte
 }
 
 const PERMISSION_CHECK: Duration = Duration::from_secs(1);
+
+/// Plays the viewer's microphone packets, while its session has the speaker play them.
+async fn receive_microphone(conn: Connection, speaker: Arc<Speaker>, session_id: u64) {
+    let mut budget = PacketBudget::new(Instant::now());
+    while let Ok(datagram) = conn.read_datagram().await {
+        if !budget.take(Instant::now()) {
+            continue;
+        }
+        if let Some(packet) = MicPacket::parse(&datagram) {
+            speaker.push(session_id, &packet);
+        }
+    }
+}
+
+/// A viewer's microphone: played into this Mac's LanKVM Microphone while the viewer asks, the
+/// driver is here and paired Macs may control this Mac (a microphone is input too).
+struct SessionMic {
+    ctx: Arc<HostCtx>,
+    session_id: u64,
+    internet: bool,
+    out: mpsc::Sender<HostMsg>,
+    /// Whether it plays, for This Mac's list of viewers.
+    flag: Arc<AtomicBool>,
+    active: bool,
+    /// What the viewer was last told.
+    announced: Option<MicrophoneState>,
+}
+
+impl SessionMic {
+    /// Why the viewer couldn't share its microphone now (NONE: it could).
+    fn availability(&self) -> (MicrophoneReason, String) {
+        let host = system::device_name();
+        if !self.ctx.settings.lock().unwrap().allow_control {
+            return (MicrophoneReason::TURNED_OFF, format!("{host} lets paired Macs only view it, so its apps can't use this Mac's microphone."));
+        }
+        if !self.ctx.speaker.ready() {
+            return (
+                MicrophoneReason::NOT_INSTALLED,
+                format!("{host} needs LanKVM Microphone first. On that Mac, open LanKVM, then This Mac → Microphone → Install."),
+            );
+        }
+        (MicrophoneReason::NONE, String::new())
+    }
+
+    fn tell(&mut self, active: bool, reason: MicrophoneReason, message: String) {
+        let state = MicrophoneState { active, reason, message };
+        self.announced = Some(state.clone());
+        // Dropped only if the viewer stopped reading, which ends the session anyway.
+        let _ = self.out.try_send(HostMsg::Microphone(state));
+    }
+
+    /// Says whether the viewer could share its microphone, if that changed.
+    fn announce(&mut self) {
+        if self.active {
+            return;
+        }
+        let (reason, message) = self.availability();
+        if self.announced.as_ref().is_none_or(|told| told.active || told.reason != reason || told.message != message) {
+            self.tell(false, reason, message);
+        }
+    }
+
+    async fn set(&mut self, on: bool) {
+        if on == self.active {
+            let (reason, message) = if on { (MicrophoneReason::NONE, String::new()) } else { self.availability() };
+            self.tell(on, reason, message);
+            return;
+        }
+        if !on {
+            self.stop();
+            let (reason, message) = self.availability();
+            self.tell(false, reason, message);
+            return;
+        }
+        let (reason, message) = self.availability();
+        if reason != MicrophoneReason::NONE {
+            self.tell(false, reason, message);
+            return;
+        }
+        let (speaker, session_id, internet) = (self.ctx.speaker.clone(), self.session_id, self.internet);
+        match tokio::task::spawn_blocking(move || speaker.open(session_id, internet)).await {
+            Ok(Ok(())) => {
+                self.active = true;
+                self.flag.store(true, Ordering::Release);
+                self.ctx.changed();
+                tracing::info!(session = self.session_id, "playing the viewer's microphone");
+                self.tell(true, MicrophoneReason::NONE, String::new());
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("play the viewer's microphone: {e:#}");
+                let host = system::device_name();
+                self.tell(false, MicrophoneReason::FAILED, format!("{host} couldn't play this Mac's microphone. Try again in a moment."));
+            }
+            Err(e) => tracing::warn!("play the viewer's microphone: {e}"),
+        }
+    }
+
+    fn stop(&mut self) {
+        if self.active {
+            self.active = false;
+            self.ctx.speaker.close(self.session_id);
+            self.flag.store(false, Ordering::Release);
+            self.ctx.changed();
+            tracing::info!(session = self.session_id, "stopped playing the viewer's microphone");
+        }
+    }
+
+    /// A setting changed, or the driver came or went.
+    fn availability_changed(&mut self) {
+        if self.active {
+            let (reason, message) = self.availability();
+            if reason == MicrophoneReason::TURNED_OFF {
+                self.stop();
+                self.tell(false, reason, message);
+            }
+        } else {
+            self.announce();
+        }
+    }
+
+    /// Now and then: the speaker still plays (coreaudiod may have restarted).
+    async fn check(&mut self) {
+        if self.active {
+            let speaker = self.ctx.speaker.clone();
+            let _ = tokio::task::spawn_blocking(move || speaker.check()).await;
+        }
+    }
+}
+
+impl Drop for SessionMic {
+    fn drop(&mut self) {
+        if self.active {
+            self.ctx.speaker.close(self.session_id);
+            self.flag.store(false, Ordering::Release);
+        }
+    }
+}
 
 /// Holds a place among the handshakes in progress (see [`MAX_HANDSHAKES`]).
 struct Handshake {

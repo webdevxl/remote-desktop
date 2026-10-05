@@ -73,6 +73,17 @@ void lk_set_focus(uint64_t session, bool forwarding);
 // Whether this Mac shares its clipboard with the Macs it controls, for every session (on until
 // told otherwise). A `clipboardTooLarge` event says when one was too big to share.
 void lk_set_share_clipboard(bool on);
+// Whether to share this Mac's microphone with the session's host, whose apps then hear it as
+// "LanKVM Microphone" (off on connecting). `microphone` events say whether the host plays it, or
+// why it doesn't or wouldn't (`reason`, and in words `message`); a refusal turns it off.
+void lk_set_microphone(uint64_t session, bool on);
+#define LK_MIC_NONE 0
+#define LK_MIC_NOT_INSTALLED 1    // the host doesn't have the LanKVM Microphone driver
+#define LK_MIC_TURNED_OFF 2       // the host lets paired Macs only view it
+#define LK_MIC_FAILED 3           // trying again may work
+#define LK_MIC_CAPTURE_FAILED 100 // this Mac's microphone couldn't be opened
+#define LK_MIC_LOOPBACK 101       // this Mac's microphone is LanKVM Microphone itself
+#define LK_MIC_NO_INPUT 102       // this Mac has no microphone
 void lk_input_mouse_move(uint64_t session, double x, double y);
 void lk_input_mouse_button(uint64_t session, uint8_t button, bool down, uint8_t clicks, double x, double y);
 
@@ -148,6 +159,9 @@ void lk_set_public_address(const char *address);
 void lk_set_rendezvous_server(const char *address);
 // Whether macOS lets LanKVM post input (Privacy & Security → Accessibility).
 bool lk_control_permission(void);
+// After installing or removing the LanKVM Microphone driver here: viewers learn whether they can
+// share their microphones with this Mac (the host status's microphoneReady says it too).
+void lk_microphone_driver_changed(void);
 // Removes a virtual display made for a viewer (0: all of them); its viewers go back to this Mac's
 // own screen. Returns at once; a `hostChanged` event follows.
 void lk_remove_virtual_display(uint32_t display_id);

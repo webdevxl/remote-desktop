@@ -1,6 +1,7 @@
 import Accessibility
 import AppKit
 import ApplicationServices
+import AVFoundation
 import CLanKVM
 import Combine
 import Foundation
@@ -18,6 +19,13 @@ final class CoreModel: ObservableObject {
     @Published private(set) var recents: [RecentHost] = []
     /// Authoritative Screen Recording state (nil while checking).
     @Published private(set) var canShareScreen: Bool?
+    /// Installing, updating or removing the LanKVM Microphone driver (waiting for the password or
+    /// for this Mac's audio to load it).
+    @Published private(set) var microphoneDriverBusy = false
+    /// Why that last failed, until the next try.
+    @Published private(set) var microphoneDriverError: String?
+    /// Whether the driver is installed here (loaded is `host.microphoneReady`).
+    @Published private(set) var microphoneDriver = MicrophoneDriver.State()
 
     private var sessions: [UInt64: SessionModel] = [:]
 
@@ -44,10 +52,11 @@ final class CoreModel: ObservableObject {
 
     /// Sample state for UI snapshots (`--snapshot`), without starting the network core.
     /// `displays`: two Macs added displays here, one of them still connected.
-    func loadSampleState(screenAllowed: Bool, displays: Bool = false, internet: SampleInternet = .off) {
+    /// `microphone`: LanKVM Microphone is installed, and Studio shares its microphone.
+    func loadSampleState(screenAllowed: Bool, displays: Bool = false, internet: SampleInternet = .off, microphone: Bool = false) {
         thisMac = ThisMac(name: "Alex's MacBook Pro", addresses: ["192.168.1.23", "10.0.0.7"], port: 47800, deviceId: "724e:b7c8:8a63:ada8")
         var viewers = [Viewer(id: 1, name: "Studio", address: "192.168.1.31", deviceId: "9f12:0ab3:77c1:e402", controlling: screenAllowed,
-                              displayId: displays ? 5 : 1, virtualDisplay: displays)]
+                              displayId: displays ? 5 : 1, virtualDisplay: displays, microphone: microphone)]
         var pairedViewers = [PairedDevice(fingerprint: "aa", deviceId: "9f12:0ab3:77c1:e402", name: "Studio")]
         if internet == .open || internet == .server {
             // Through the server, the core reports the address it made up for the relay.
@@ -65,8 +74,10 @@ final class CoreModel: ObservableObject {
                 VirtualDisplay(displayId: 5, owner: "Studio", width: 6144, height: 2560, hidpi: true, arrangement: .only, inUse: true),
                 VirtualDisplay(displayId: 6, owner: "Mac mini", width: 3840, height: 2160, hidpi: true, arrangement: .extend, inUse: false),
             ] : [],
-            internet: Self.sampleInternet(internet)
+            internet: Self.sampleInternet(internet),
+            microphoneReady: microphone
         )
+        microphoneDriver = MicrophoneDriver.State(installed: microphone, outdated: false, bundled: true)
         paired = PairedDevices(
             viewers: pairedViewers,
             hosts: [
@@ -165,7 +176,8 @@ final class CoreModel: ObservableObject {
             }
         case .trustChanged:
             refreshPaired()
-        case .pinNeeded, .connected, .ended, .control, .cursorShape, .cursor, .display, .streamError, .clipboardTooLarge:
+        case .pinNeeded, .connected, .ended, .control, .cursorShape, .cursor, .display, .streamError, .clipboardTooLarge,
+             .microphone:
             guard let id = event.session, let session = sessions[id] else { return }
             // Each kind of a session's event has its own case: a kind missing here must not end
             // the session.
@@ -189,6 +201,7 @@ final class CoreModel: ObservableObject {
                 session.control = .off
                 session.mode = .view
                 session.display = .idle
+                session.microphone = .off
             case .control:
                 let request = event.request ?? 0
                 // The core already drops answers to replaced requests; this is the UI's own guard.
@@ -238,6 +251,9 @@ final class CoreModel: ObservableObject {
                 session.showToast(event.sent == true
                     ? "This Mac’s clipboard (\(size)) is too big to share with “\(session.hostName)”"
                     : "The clipboard on “\(session.hostName)” (\(size)) is too big to share")
+            case .microphone:
+                microphoneChanged(session, active: event.active == true, reason: event.reason ?? MicrophoneReason.none,
+                                  message: event.message ?? "")
             case .hostChanged, .trustChanged:
                 break
             }
@@ -245,6 +261,8 @@ final class CoreModel: ObservableObject {
     }
 
     func refreshHost() {
+        let driver = MicrophoneDriver.state
+        if driver != microphoneDriver { microphoneDriver = driver }
         if let status = decode(HostStatus.self, lk_host_status()), status != host {
             host = status
             // ⌃⌥⌘. takes control back and removes the displays made for other Macs, but only claims
@@ -331,6 +349,142 @@ final class CoreModel: ObservableObject {
     }
 
     private static func modeKey(_ hostId: String) -> String { "mode.\(hostId)" }
+
+    // MARK: Microphone
+
+    /// Shares this Mac's microphone with a session's host (or stops): apps there hear it as
+    /// "LanKVM Microphone". Asks for the Microphone permission first. Never remembered: each
+    /// connection starts with it off.
+    func setMicrophone(_ on: Bool, for id: UInt64) {
+        guard let session = sessions[id] else { return }
+        guard on else {
+            if session.microphone != .off { session.showToast("Microphone off") }
+            session.microphone = .off
+            lk_set_microphone(id, false)
+            return
+        }
+        guard session.microphone == .off else { return }
+        if let why = session.microphoneUnavailable {
+            session.showToast(why)
+            return
+        }
+        session.microphone = .starting
+        MicrophonePermission.request { [weak self] granted in
+            guard let session = self?.sessions[id], session.microphone == .starting else { return }
+            if granted {
+                lk_set_microphone(id, true)
+            } else {
+                session.microphone = .off
+                session.showToast("LanKVM may not use this Mac’s microphone · allow it in Privacy & Security → Microphone")
+                MicrophonePermission.openSettings()
+            }
+        }
+    }
+
+    /// What the core says about a session's microphone: the host plays it, or why not.
+    private func microphoneChanged(_ session: SessionModel, active: Bool, reason: Int, message: String) {
+        guard case .connected = session.phase else { return }
+        if active {
+            if session.microphone != .on {
+                session.showToast("Microphone on · apps on \(session.hostName) can use LanKVM Microphone")
+            }
+            session.microphone = .on
+            session.microphoneUnavailable = nil
+            return
+        }
+        let wanted = session.microphone != .off
+        session.microphone = .off
+        session.microphoneUnavailable = MicrophoneReason.isAvailability(reason) && !message.isEmpty ? message : nil
+        if wanted, reason != MicrophoneReason.none, !message.isEmpty {
+            session.showToast(message)
+        }
+    }
+
+    /// Installs the LanKVM Microphone driver that comes with this app (or updates it), so Macs viewing
+    /// this one can share their microphones here. Asks for an administrator password; this Mac's
+    /// audio restarts for a moment.
+    func installMicrophoneDriver() {
+        guard let bundled = MicrophoneDriver.bundled else {
+            microphoneDriverError = "This build of LanKVM doesn’t include LanKVM Microphone (scripts/bundle.sh adds it)."
+            return
+        }
+        let target = MicrophoneDriver.installed.path
+        changeMicrophoneDriver(
+            "/bin/rm -rf \(Self.shellQuoted(target)) && /usr/bin/ditto \(Self.shellQuoted(bundled.path)) \(Self.shellQuoted(target))"
+                + " && /usr/sbin/chown -R root:wheel \(Self.shellQuoted(target)) && /usr/bin/killall coreaudiod",
+            prompt: "LanKVM wants to install LanKVM Microphone, so Macs that view this one can share their microphones here.")
+    }
+
+    /// Removes the LanKVM Microphone driver. Its microphone goes away for the apps using it.
+    func removeMicrophoneDriver() {
+        changeMicrophoneDriver("/bin/rm -rf \(Self.shellQuoted(MicrophoneDriver.installed.path)) && /usr/bin/killall coreaudiod",
+                               prompt: "LanKVM wants to remove LanKVM Microphone.")
+    }
+
+    /// Restarts this Mac's audio, which loads (or unloads) the driver.
+    func restartAudio() {
+        changeMicrophoneDriver("/usr/bin/killall coreaudiod", prompt: "LanKVM wants to restart this Mac’s audio to load LanKVM Microphone.")
+    }
+
+    /// Runs `command` as an administrator (macOS asks for the password), then waits for this Mac's
+    /// audio to come back and tells the core, which tells the viewers.
+    private func changeMicrophoneDriver(_ command: String, prompt: String) {
+        guard !microphoneDriverBusy else { return }
+        microphoneDriverBusy = true
+        microphoneDriverError = nil
+        let wasReady = host.microphoneReady
+        let script = "do shell script \(Self.appleScriptQuoted(command)) with prompt \(Self.appleScriptQuoted(prompt)) with administrator privileges"
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        task.arguments = ["-e", script]
+        let errors = Pipe()
+        task.standardError = errors
+        task.terminationHandler = { task in
+            let output = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let status = task.terminationStatus
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { CoreModel.shared.microphoneDriverChanged(status: status, output: output, wasReady: wasReady) }
+            }
+        }
+        do {
+            try task.run()
+        } catch {
+            microphoneDriverBusy = false
+            microphoneDriverError = "Couldn’t ask for the administrator password: \(error.localizedDescription)"
+        }
+    }
+
+    private func microphoneDriverChanged(status: Int32, output: String, wasReady: Bool) {
+        if status != 0 {
+            microphoneDriverBusy = false
+            // -128: the user cancelled the password prompt.
+            if !output.contains("-128") {
+                microphoneDriverError = "That didn’t work: \(output.trimmingCharacters(in: .whitespacesAndNewlines))"
+            }
+            return
+        }
+        // coreaudiod takes a moment to come back and load (or drop) the driver.
+        Task { @MainActor in
+            for _ in 0..<20 {
+                try? await Task.sleep(for: .milliseconds(500))
+                lk_microphone_driver_changed()
+                refreshHost()
+                if host.microphoneReady != wasReady || (host.microphoneReady && MicrophoneDriver.isInstalled) { break }
+            }
+            microphoneDriverBusy = false
+            if MicrophoneDriver.isInstalled && !host.microphoneReady {
+                microphoneDriverError = "LanKVM Microphone is installed, but this Mac’s audio hasn’t loaded it. Restart Audio, or restart the Mac."
+            }
+        }
+    }
+
+    private static func shellQuoted(_ text: String) -> String {
+        "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func appleScriptQuoted(_ text: String) -> String {
+        "\"" + text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
 
     // MARK: Displays
 
@@ -586,6 +740,67 @@ enum SharedClipboard {
     }
 }
 
+/// macOS's Microphone permission, which LanKVM needs to share this Mac's microphone.
+@MainActor
+enum MicrophonePermission {
+    /// Asks the first time (macOS shows its prompt), then answers from the setting.
+    static func request(_ done: @escaping @MainActor (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            done(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async { MainActor.assumeIsolated { done(granted) } }
+            }
+        default:
+            done(false)
+        }
+    }
+
+    static func openSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+    }
+}
+
+/// The LanKVM Microphone driver (macos/AudioDriver): comes inside LanKVM.app, and works once it is
+/// in /Library/Audio/Plug-Ins/HAL and this Mac's audio (coreaudiod) has loaded it.
+enum MicrophoneDriver {
+    static let installed = URL(fileURLWithPath: "/Library/Audio/Plug-Ins/HAL/LanKVMMicrophone.driver")
+
+    /// The copy inside this app, if it has one.
+    static var bundled: URL? {
+        Bundle.main.url(forResource: "LanKVMMicrophone", withExtension: "driver")
+    }
+
+    static var isInstalled: Bool {
+        FileManager.default.fileExists(atPath: installed.path)
+    }
+
+    struct State: Equatable {
+        var installed = false
+        /// Older than the one inside this app.
+        var outdated = false
+        /// This app has one to install.
+        var bundled = false
+    }
+
+    static var state: State {
+        State(installed: isInstalled, outdated: isOutdated, bundled: bundled != nil)
+    }
+
+    /// The installed driver is older than the one inside this app.
+    static var isOutdated: Bool {
+        guard isInstalled, let bundled, let theirs = version(installed), let ours = version(bundled) else { return false }
+        return theirs < ours
+    }
+
+    /// CFBundleVersion, read from the file rather than through Bundle, which caches it.
+    private static func version(_ driver: URL) -> Int? {
+        let plist = NSDictionary(contentsOf: driver.appendingPathComponent("Contents/Info.plist"))
+        return (plist?["CFBundleVersion"] as? String).flatMap { Int($0) }
+    }
+}
+
 /// State of one viewer window.
 @MainActor
 final class SessionModel: ObservableObject, Identifiable {
@@ -626,6 +841,15 @@ final class SessionModel: ObservableObject, Identifiable {
             if case .switching = self { return true }
             return false
         }
+    }
+
+    /// This Mac's microphone, as the session's host plays it.
+    enum MicrophoneStatus: Equatable {
+        case off
+        /// Asked for the permission, or the host; waiting.
+        case starting
+        /// Apps on the host hear it as LanKVM Microphone.
+        case on
     }
 
     /// A display request waiting for its answer.
@@ -672,6 +896,10 @@ final class SessionModel: ObservableObject, Identifiable {
     private(set) lazy var sessionControl = SessionControlModel(session: self)
     /// The user closed the hint about Accessibility for trackpad gestures: not again in this window.
     @Published var gestureHintDismissed = false
+    /// Whether the host plays this Mac's microphone (Share Microphone).
+    @Published var microphone = MicrophoneStatus.off
+    /// Why the host can't take this Mac's microphone now, in its words (nil: it can).
+    @Published var microphoneUnavailable: String?
     /// Whether the session ever showed the remote screen (for wording when it ends).
     var wasConnected = false
 

@@ -21,6 +21,8 @@ struct HostStatus: Decodable, Equatable {
     var virtualDisplays: [VirtualDisplay] = []
     /// Whether paired Macs can reach this one over the internet.
     var internet = InternetStatus()
+    /// The LanKVM Microphone driver is installed and loaded: viewers can share their microphones.
+    var microphoneReady = false
 
     /// Who controls this Mac right now, if anyone.
     var controller: Viewer? { viewers.first(where: \.controlling) }
@@ -28,7 +30,7 @@ struct HostStatus: Decodable, Equatable {
 
 extension HostStatus {
     private enum CodingKeys: String, CodingKey {
-        case viewers, pairing, screenCaptureAllowed, allowControl, controlPermission, virtualDisplays, internet
+        case viewers, pairing, screenCaptureAllowed, allowControl, controlPermission, virtualDisplays, internet, microphoneReady
     }
 
     /// Newer fields are optional: a status without them (or with one this app can't read) still
@@ -42,6 +44,7 @@ extension HostStatus {
         controlPermission = try c.decode(Bool.self, forKey: .controlPermission)
         virtualDisplays = c.lenient([VirtualDisplay].self, .virtualDisplays) ?? []
         internet = c.lenient(InternetStatus.self, .internet) ?? InternetStatus()
+        microphoneReady = c.lenient(Bool.self, .microphoneReady) ?? false
     }
 }
 
@@ -213,11 +216,13 @@ struct Viewer: Decodable, Identifiable, Equatable {
     var internet: Bool = false
     /// Its traffic goes through the LanKVM server: the routers wouldn't let a direct path through.
     var relayed: Bool = false
+    /// Its microphone plays into this Mac's LanKVM Microphone now.
+    var microphone: Bool = false
 }
 
 extension Viewer {
     private enum CodingKeys: String, CodingKey {
-        case id, name, address, deviceId, controlling, displayId, virtualDisplay, internet, relayed
+        case id, name, address, deviceId, controlling, displayId, virtualDisplay, internet, relayed, microphone
     }
 
     init(from decoder: Decoder) throws {
@@ -231,6 +236,7 @@ extension Viewer {
         virtualDisplay = c.lenient(Bool.self, .virtualDisplay) ?? false
         internet = c.lenient(Bool.self, .internet) ?? false
         relayed = c.lenient(Bool.self, .relayed) ?? false
+        microphone = c.lenient(Bool.self, .microphone) ?? false
     }
 }
 
@@ -457,20 +463,22 @@ struct SessionStats: Decodable, Equatable {
 struct CoreEvent: Decodable {
     enum Kind: String, Decodable {
         case hostChanged, trustChanged, pinNeeded, connected, ended, control, cursorShape, cursor, display, streamError
-        case clipboardTooLarge
+        case clipboardTooLarge, microphone
     }
     var type: Kind
     var session: UInt64?
     /// connected, display
     var info: SessionInfo?
     var error: String?
-    // control, display
+    // control, display, microphone
     var request: UInt32?
     var active: Bool?
     /// control: a `ControlReason` code (see crates/protocol), why control isn't active. display: a
-    /// `DisplayReason` code, why the session doesn't show what it asked for.
+    /// `DisplayReason` code, why the session doesn't show what it asked for. microphone: a
+    /// `MicrophoneReason` code, why the host doesn't play this Mac's microphone (or wouldn't).
     var reason: Int?
-    /// control, display: the reason in words, or news. streamError: why the video can't be shown.
+    /// control, display, microphone: the reason in words, or news. streamError: why the video
+    /// can't be shown.
     var message: String?
     var injectedTag: Int64?
     var hostPid: Int64?
@@ -501,6 +509,29 @@ enum ControlReason {
     static let badInput = 9
     static let displayGone = 10
     static let testTimeout = 11
+}
+
+/// Why a session's host doesn't play this Mac's microphone (`MicrophoneReason` in crates/protocol,
+/// LK_MIC_* in lankvm.h).
+enum MicrophoneReason {
+    static let none = 0
+    /// The host doesn't have the LanKVM Microphone driver.
+    static let notInstalled = 1
+    /// The host lets paired Macs only view it.
+    static let turnedOff = 2
+    /// Playing it failed on the host; trying again may work.
+    static let failed = 3
+    // This Mac's own reasons:
+    static let captureFailed = 100
+    /// This Mac's microphone is LanKVM Microphone itself.
+    static let loopback = 101
+    static let noInput = 102
+
+    /// Whether it's about the host (so it holds until the host says otherwise), rather than this
+    /// Mac's microphone or a one-off failure.
+    static func isAvailability(_ reason: Int) -> Bool {
+        reason == notInstalled || reason == turnedOff
+    }
 }
 
 /// Why a session doesn't show the display it asked for, or can't ask for a virtual display

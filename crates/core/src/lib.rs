@@ -9,6 +9,7 @@ mod displays;
 pub mod ffi;
 mod host;
 mod internet;
+mod microphone;
 pub mod rate;
 mod render;
 mod rendezvous;
@@ -35,10 +36,12 @@ use transport::rendezvous::{DEFAULT_SERVER, RendezvousIdentity};
 
 pub use crate::client::{FrameProbe, ProbeFrame};
 pub use crate::clipboard::ClipboardBackend;
+pub use crate::microphone::{AudioBackend, MicSink, MicSource, Recording};
 pub use crate::stats::FrameTiming;
 use crate::client::{Session, SessionEvent, SessionInfo};
 use crate::clipboard::Clipboard;
 use crate::internet::{HostInternet, InternetHosts};
+use crate::microphone::{Microphone, Speaker};
 use crate::rendezvous::Rendezvous;
 
 /// Notifications for the UI. Delivered on arbitrary threads.
@@ -81,6 +84,11 @@ pub enum Event {
     /// A clipboard of `bytes` was too big to share with the session's host, so the other Mac's
     /// clipboard was emptied: this Mac's (`sent`), or the host's (this Mac's was emptied).
     ClipboardTooLarge { session: u64, bytes: u64, sent: bool },
+    /// Whether the session's host plays this Mac's microphone now. When it doesn't, `reason` (a
+    /// `MicrophoneReason` code) and `message` say why it doesn't, or wouldn't if asked (0: it
+    /// could). Sent as the session starts, on every answer to `lk_set_microphone`, and when it
+    /// changes; a refusal also turns the session's microphone off.
+    Microphone { session: u64, active: bool, reason: u16, message: String },
 }
 
 /// Serializes bytes as standard base64 (what Swift's `JSONDecoder` expects for `Data`).
@@ -142,6 +150,9 @@ pub struct Core {
     clipboard: Option<Arc<Clipboard>>,
     /// Whether this Mac shares its clipboard with the Macs it controls (the user's choice).
     share_clipboard: tokio::sync::watch::Sender<bool>,
+    /// This Mac's microphone, for the hosts its sessions share it with (None if the core shares
+    /// none).
+    microphone: Option<Arc<Microphone>>,
     _activity: Activity,
 }
 
@@ -185,6 +196,9 @@ pub struct CoreOptions {
     /// The clipboard shared with the Macs this one controls or is controlled by
     /// (`LANKVM_CLIPBOARD`). Tests use pasteboards of their own, never the user's.
     pub clipboard: ClipboardBackend,
+    /// The microphone this Mac shares with the Macs it views, and where theirs play
+    /// (`LANKVM_MICROPHONE`). Tests use a tone and a recording, never the user's microphone.
+    pub audio: AudioBackend,
 }
 
 impl CoreOptions {
@@ -208,6 +222,7 @@ impl CoreOptions {
             rendezvous: std::env::var("LANKVM_RENDEZVOUS").ok().or_else(|| testing_internet().then(String::new)),
             force_relay: std::env::var("LANKVM_TEST_FORCE_RELAY").is_ok_and(|v| v == "1"),
             clipboard: ClipboardBackend::from_env(),
+            audio: AudioBackend::from_env(),
         }
     }
 }
@@ -232,6 +247,7 @@ impl Core {
             rendezvous: rendezvous_override,
             force_relay,
             clipboard,
+            audio,
         } = options;
         // Video decode runs synchronously on these (3-6 ms a frame); enough workers keep the
         // connection drivers and input writer from waiting behind it.
@@ -301,6 +317,9 @@ impl Core {
             tracing::warn!(?clipboard, "the shared clipboard isn't this Mac's (LANKVM_CLIPBOARD)");
         }
         let clipboard = Clipboard::start(&clipboard);
+        if !audio.is_system() {
+            tracing::warn!(?audio, "the shared microphones aren't this Mac's (LANKVM_MICROPHONE)");
+        }
         let host = Arc::new_cyclic(|weak| host::HostCtx {
             displays: displays::Displays::new(weak.clone(), identity.fingerprint, Box::new(displays::RealScreens::default())),
             console_active: std::sync::atomic::AtomicBool::new(true),
@@ -323,6 +342,7 @@ impl Core {
             pending: Default::default(),
             handshakes: Default::default(),
             clipboard: clipboard.clone(),
+            speaker: Speaker::new(audio.sink),
         });
         if guard_pid.is_some() || control_ttl.is_some() {
             tracing::warn!(?guard_pid, ?control_ttl, "test limits on remote control");
@@ -358,6 +378,7 @@ impl Core {
             next_session: AtomicU64::new(1),
             clipboard,
             share_clipboard: tokio::sync::watch::channel(true).0,
+            microphone: Microphone::new(audio.source),
             _activity: activity,
         }))
     }
@@ -466,6 +487,9 @@ impl Core {
                 SessionEvent::StreamError { message, width, height } => Event::StreamError { session: id, message, width, height },
                 SessionEvent::TrustChanged => Event::TrustChanged,
                 SessionEvent::ClipboardTooLarge { bytes, sent } => Event::ClipboardTooLarge { session: id, bytes, sent },
+                SessionEvent::Microphone(state) => {
+                    Event::Microphone { session: id, active: state.active, reason: state.reason.0, message: state.message }
+                }
             };
             (core.events)(event);
         });
@@ -478,6 +502,7 @@ impl Core {
             max_size,
             max_fps,
             self.clipboard.clone().map(|clipboard| (clipboard, self.share_clipboard.subscribe())),
+            self.microphone.clone(),
             on_event,
         );
         self.sessions.lock().unwrap().insert(id, Arc::new(session));
@@ -512,6 +537,20 @@ impl Core {
         if self.share_clipboard.send_replace(on) != on {
             tracing::info!(on, "share the clipboard with the Macs this one controls");
         }
+    }
+
+    /// Whether to share this Mac's microphone with the session's host, whose apps then hear it as
+    /// "LanKVM Microphone". [`Event::Microphone`] says whether the host plays it. Off on connecting.
+    pub fn set_microphone(&self, id: u64, on: bool) {
+        if let Some(s) = self.session(id) {
+            s.set_microphone(on);
+        }
+    }
+
+    /// The LanKVM Microphone driver was installed or removed here (the app does that): viewers
+    /// learn whether they can share their microphones now.
+    pub fn microphone_driver_changed(&self) {
+        self.host.microphone_changed();
     }
 
     /// While controlling: whether the session's window has the focus.
