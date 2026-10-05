@@ -32,11 +32,23 @@ struct ConnectView: View {
                 .padding(.vertical, 8)
             }
 
-            if !core.recents.isEmpty {
+            if !core.paired.hosts.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    SectionLabel(title: "Your Macs")
+                    Card {
+                        ForEach(Array(core.paired.hosts.enumerated()), id: \.element.id) { index, device in
+                            if index > 0 { CardDivider() }
+                            MacRow(device: device)
+                        }
+                    }
+                }
+            }
+
+            if !recents.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     SectionLabel(title: "Recent")
                     Card {
-                        ForEach(Array(core.recents.enumerated()), id: \.element.id) { index, recent in
+                        ForEach(Array(recents.enumerated()), id: \.element.id) { index, recent in
                             if index > 0 { CardDivider() }
                             RecentRow(recent: recent) { open(recent.address, label: recent.name) }
                         }
@@ -47,6 +59,12 @@ struct ConnectView: View {
             TipCard()
         }
         .onAppear { fieldFocused = true }
+    }
+
+    /// Recent Macs, but those listed under Your Macs.
+    private var recents: [RecentHost] {
+        let paired = Set(core.paired.hosts.map(\.fingerprint))
+        return core.recents.filter { recent in recent.fingerprint.map { !paired.contains($0) } ?? true }
     }
 
     private var trimmed: String {
@@ -70,13 +88,12 @@ private struct RecentRow: View {
     let action: () -> Void
     @State private var hovering = false
 
-    /// A paired Mac connected to from Paired Devices is "lankvm:" and its fingerprint: no address
-    /// worth reading.
+    /// A paired Mac connected to by name is "lankvm:" and its fingerprint: no address worth reading.
     private var paired: Bool { recent.address.hasPrefix("lankvm:") }
 
     var body: some View {
         Button(action: action) {
-            CardRow(icon: "desktopcomputer", tint: .lkAccent, title: recent.name, detail: paired ? "Over the internet" : recent.address,
+            CardRow(icon: "desktopcomputer", tint: .lkAccent, title: recent.name, detail: paired ? "By name" : recent.address,
                     monospacedDetail: !paired) {
                 Image(systemName: "arrow.right")
                     .font(.system(size: 12, weight: .semibold))

@@ -289,19 +289,42 @@ struct PairingRequest: Decodable, Identifiable, Equatable {
 struct PairedDevice: Decodable, Identifiable, Equatable {
     var fingerprint: String
     var deviceId: String
+    /// The name it gave itself.
     var name: String
+    /// A Mac this one controls: the name the user calls it by instead (`lk_set_host_alias`).
+    var alias: String?
+    /// A Mac this one controls: where it was last reached on the local network, or else where it
+    /// said it is there ("192.168.1.31:47800"). Nil when unknown.
+    var localAddress: String?
     /// A Mac this one controls: where it was last reached, or told this Mac to reach it, over the
     /// internet ("203.0.113.7:47800"). Nil when unknown.
     var internetAddress: String?
     /// A Mac this one controls that it can try to reach over the internet: it told this Mac its
-    /// LanKVM server, or an address. Connect with `lk_connect("lankvm:" + fingerprint)`.
+    /// LanKVM server, or an address.
     var reachable = false
+    /// A Mac this one controls: how `lk_connect("lankvm:" + fingerprint)` reaches it.
+    var connection = ConnectionType.auto
     var id: String { fingerprint }
+
+    /// What this Mac calls it.
+    var displayName: String { alias ?? name }
+
+    /// The target that connects to it by name, the way `connection` says.
+    var target: String { "lankvm:\(fingerprint)" }
+
+    /// Whether connecting to it `type` has an address to try.
+    func canConnect(_ type: ConnectionType) -> Bool {
+        switch type {
+        case .auto: localAddress != nil || reachable
+        case .local: localAddress != nil
+        case .internet: reachable
+        }
+    }
 }
 
 extension PairedDevice {
     private enum CodingKeys: String, CodingKey {
-        case fingerprint, deviceId, name, internetAddress, reachable
+        case fingerprint, deviceId, name, alias, localAddress, internetAddress, reachable, connection
     }
 
     init(from decoder: Decoder) throws {
@@ -309,9 +332,43 @@ extension PairedDevice {
         fingerprint = try c.decode(String.self, forKey: .fingerprint)
         deviceId = try c.decode(String.self, forKey: .deviceId)
         name = try c.decode(String.self, forKey: .name)
+        alias = c.lenient(String.self, .alias).flatMap { $0.isEmpty ? nil : $0 }
+        localAddress = c.lenient(String.self, .localAddress).flatMap { $0.isEmpty ? nil : $0 }
         internetAddress = c.lenient(String.self, .internetAddress).flatMap { $0.isEmpty ? nil : $0 }
         reachable = c.lenient(Bool.self, .reachable) ?? false
+        connection = c.lenient(String.self, .connection).flatMap(ConnectionType.init) ?? .auto
     }
+}
+
+/// How to connect to a Mac this one controls (`Via` in crates/core address_book.rs). A typed
+/// address goes where it says.
+enum ConnectionType: String, CaseIterable, Identifiable {
+    /// Every way at once; the local network wins when it answers too.
+    case auto
+    /// Only at its address on the local network.
+    case local
+    /// Only over the internet: its addresses there and its LanKVM server.
+    case internet
+
+    var id: Self { self }
+
+    /// In the segmented control.
+    var shortTitle: String {
+        switch self {
+        case .auto: "Auto"
+        case .local: "Local"
+        case .internet: "Internet"
+        }
+    }
+}
+
+/// An address as people read it: without LanKVM's usual port, and an IPv6 one without brackets
+/// then ("192.168.1.31:47800" is "192.168.1.31").
+func shownAddress(_ address: String) -> String {
+    guard address.hasSuffix(":47800") else { return address }
+    let host = address.dropLast(":47800".count)
+    if host.hasPrefix("["), host.hasSuffix("]") { return String(host.dropFirst().dropLast()) }
+    return host.contains(":") ? address : String(host)
 }
 
 struct PairedDevices: Decodable, Equatable {
@@ -322,6 +379,8 @@ struct PairedDevices: Decodable, Equatable {
 struct RecentHost: Decodable, Identifiable, Equatable {
     var address: String
     var name: String
+    /// The Mac it reached, when known: a paired Mac is listed under Your Macs instead.
+    var fingerprint: String?
     var id: String { address }
 }
 

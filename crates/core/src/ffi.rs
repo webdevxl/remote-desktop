@@ -98,8 +98,8 @@ pub extern "C" fn lk_recent_hosts() -> *mut c_char {
     core().map_or(std::ptr::null_mut(), |c| json(&c.recent_hosts()))
 }
 
-/// Connects to `target` (IP, `ip:port` or hostname; `lankvm:<fingerprint>` for a paired host over
-/// the internet). `max_width`/`max_height` are the viewer's screen size in pixels and `max_fps`
+/// Connects to `target` (IP, `ip:port` or hostname; `lankvm:<fingerprint>` for a paired host by
+/// name, the way `lk_set_host_connection` says). `max_width`/`max_height` are the viewer's screen size in pixels and `max_fps`
 /// its refresh rate. Returns a session id (0 if the core isn't running).
 ///
 /// # Safety
@@ -182,6 +182,33 @@ pub unsafe extern "C" fn lk_forget_device(kind: *const c_char, fingerprint: *con
     let (kind, fingerprint) = unsafe { (arg(kind), arg(fingerprint)) };
     if let Some(c) = core() {
         c.forget_device(&kind, &fingerprint);
+    }
+}
+
+/// Calls paired host `fingerprint` (hex) `alias` everywhere on this Mac; "" (or null) goes back to
+/// the name it gave itself.
+///
+/// # Safety
+/// `fingerprint` must be a valid NUL-terminated string, `alias` null or one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lk_set_host_alias(fingerprint: *const c_char, alias: *const c_char) {
+    let (fingerprint, alias) = unsafe { (arg(fingerprint), arg(alias)) };
+    if let Some(c) = core() {
+        c.set_host_alias(&fingerprint, &alias);
+    }
+}
+
+/// How `lankvm:<fingerprint>` connects to paired host `fingerprint` (hex): "auto" (every way at
+/// once), "local" (on the local network only) or "internet" (over the internet only). Anything
+/// else is ignored.
+///
+/// # Safety
+/// Both arguments must be valid NUL-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lk_set_host_connection(fingerprint: *const c_char, via: *const c_char) {
+    let (fingerprint, via) = unsafe { (arg(fingerprint), arg(via)) };
+    if let (Some(c), Some(via)) = (core(), crate::Via::parse(&via)) {
+        c.set_host_connection(&fingerprint, via);
     }
 }
 

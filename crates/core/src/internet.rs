@@ -422,7 +422,7 @@ fn announced(public_address: &str, map: Option<MapState>, port: u16) -> Vec<Stri
 /// `address` with `port` added when it names none: "home.example.com" becomes
 /// "home.example.com:47800" and "2001:db8::7" becomes "[2001:db8::7]:47800". IP addresses come
 /// out in their usual form.
-fn with_port(address: &str, port: u16) -> String {
+pub(crate) fn with_port(address: &str, port: u16) -> String {
     let address = address.trim();
     if let Ok(addr) = address.parse::<SocketAddr>() {
         return addr.to_string();
@@ -457,6 +457,16 @@ fn is_lan_address(address: &str) -> bool {
         Ok(IpAddr::V6(v6)) => (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80,
         Err(_) => false,
     }
+}
+
+/// Whether `address` leads to a local network, not the internet: an IP there ([`is_lan_address`])
+/// or on this Mac (loopback), or a Bonjour name ("studio.local").
+pub(crate) fn is_local_address(address: &str) -> bool {
+    let address = address.trim();
+    let host = with_port(address, DEFAULT_PORT).rsplit_once(':').map(|(host, _)| host.trim_matches(['[', ']']).to_ascii_lowercase());
+    is_lan_address(address)
+        || host.as_deref().and_then(|h| h.parse::<IpAddr>().ok()).is_some_and(|ip| ip.to_canonical().is_loopback())
+        || host.is_some_and(|h| h.trim_end_matches('.').ends_with(".local"))
 }
 
 /// The addresses a host announced, fit to keep: trimmed, without empty, overlong or repeated
@@ -951,6 +961,16 @@ mod tests {
         let none = trusted(&TempDir::new("candidates-none").0, &[]);
         assert!(hosts.candidates("203.0.113.7", resolved, &none).is_empty());
         assert!(!hosts.any_key(&none));
+    }
+
+    #[test]
+    fn local_addresses_are_told_from_internet_ones() {
+        for local in ["192.168.1.31", "192.168.1.31:47801", "10.0.0.4", "[fd00::5]:47800", "fe80::1", "127.0.0.1:47800", "Studio.local", "studio.local:47801"] {
+            assert!(is_local_address(local), "{local}");
+        }
+        for internet in ["203.0.113.7", "203.0.113.7:47800", "home.example.com", "[2001:db8::7]:47800", "lankvm:abcd", ""] {
+            assert!(!is_local_address(internet), "{internet}");
+        }
     }
 
     #[test]

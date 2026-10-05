@@ -148,6 +148,10 @@ void lk_shutdown(void);
 void lk_kick_viewer(uint64_t viewer);
 void lk_deny_pairing(uint64_t request);
 void lk_forget_device(const char *kind, const char *fingerprint);
+// Macs this one controls (fingerprint in hex). The name this Mac calls one by ("" or NULL: its
+// own), and how "lankvm:<fingerprint>" connects to it: "auto", "local" or "internet".
+void lk_set_host_alias(const char *fingerprint, const char *alias);
+void lk_set_host_connection(const char *fingerprint, const char *via);
 void lk_stop_control(uint64_t viewer);
 void lk_stop_all_control(void);
 void lk_set_allow_control(bool allow);

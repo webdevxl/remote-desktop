@@ -81,19 +81,25 @@ final class CoreModel: ObservableObject {
         paired = PairedDevices(
             viewers: pairedViewers,
             hosts: [
-                PairedDevice(fingerprint: "bb", deviceId: "41de:93a0:c2f7:118b", name: "Mac mini",
-                             internetAddress: internet == .off ? nil : "198.51.100.17:47800", reachable: internet == .server),
-                // Through the server, a Mac is reachable without an address.
-                PairedDevice(fingerprint: "cc", deviceId: "07b9:5c2e:a1d4:6f30", name: "Studio", reachable: internet == .server),
+                // Renamed, and reachable both ways.
+                PairedDevice(fingerprint: "bb", deviceId: "41de:93a0:c2f7:118b", name: "Mac mini", alias: "Office",
+                             localAddress: "192.168.1.40:47800", internetAddress: internet == .off ? nil : "198.51.100.17:47800",
+                             reachable: internet != .off),
+                // Through the server, a Mac is reachable without an address. Off the server, only
+                // on the local network.
+                PairedDevice(fingerprint: "cc", deviceId: "07b9:5c2e:a1d4:6f30", name: "Studio", localAddress: "192.168.1.31:47800",
+                             reachable: internet == .server, connection: internet == .server ? .internet : .local),
             ]
         )
         recents = [
-            RecentHost(address: "192.168.1.40", name: "Mac mini"),
-            RecentHost(address: "192.168.1.31", name: "Studio"),
+            // Paired Macs are listed apart: only one that never paired shows here.
+            RecentHost(address: "192.168.1.40", name: "Office", fingerprint: "bb"),
+            RecentHost(address: "192.168.1.31", name: "Studio", fingerprint: "cc"),
+            RecentHost(address: "192.168.1.52", name: "MacBook Air"),
         ]
         if internet == .server {
-            // Connected to from Paired Devices, through the server.
-            recents.insert(RecentHost(address: "lankvm:" + String(repeating: "07b95c2ea1d46f30", count: 4), name: "Studio"), at: 0)
+            // Connected to by name, through the server.
+            recents.insert(RecentHost(address: "lankvm:cc", name: "Studio", fingerprint: "cc"), at: 0)
         }
         canShareScreen = screenAllowed
     }
@@ -299,6 +305,11 @@ final class CoreModel: ObservableObject {
     }
 
     // MARK: Viewer sessions
+
+    /// Starts a session with a Mac this one controls, the way its connection type says.
+    func connect(to device: PairedDevice) -> UInt64 {
+        connect(to: device.target, label: device.displayName)
+    }
 
     /// Starts a session and returns its id, to open a viewer window for. `label`: what the window
     /// calls the Mac until it answers (the target itself if nil).
@@ -688,6 +699,18 @@ final class CoreModel: ObservableObject {
 
     func forget(_ device: PairedDevice, canControlThisMac: Bool) {
         lk_forget_device(canControlThisMac ? "viewer" : "host", device.fingerprint)
+    }
+
+    /// Calls a Mac this one controls `alias` everywhere here ("" for the name it gave itself).
+    func setAlias(_ alias: String, for device: PairedDevice) {
+        lk_set_host_alias(device.fingerprint, alias)
+        refreshPaired()
+    }
+
+    /// How connecting to a Mac this one controls by name reaches it, from the next connection on.
+    func setConnection(_ type: ConnectionType, for device: PairedDevice) {
+        lk_set_host_connection(device.fingerprint, type.rawValue)
+        refreshPaired()
     }
 
     // MARK: Screen Recording permission

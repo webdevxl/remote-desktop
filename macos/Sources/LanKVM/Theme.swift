@@ -161,6 +161,7 @@ struct PrimaryButtonStyle: ButtonStyle {
 /// Quiet bordered button for secondary actions.
 struct SecondaryButtonStyle: ButtonStyle {
     var destructive = false
+    @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -173,6 +174,7 @@ struct SecondaryButtonStyle: ButtonStyle {
                 in: RoundedRectangle(cornerRadius: 7, style: .continuous)
             )
             .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(Color.lkBorder))
+            .opacity(isEnabled ? 1 : 0.45)
     }
 }
 

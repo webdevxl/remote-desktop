@@ -111,8 +111,39 @@ certificate (it asks for your login password once):
    **Connect**, type it and press Return. Each remote Mac opens in its own window.
 3. First time only: the viewed Mac shows a 6-digit code. Type it on the viewing Mac. Both Macs
    remember each other after that. **Paired Devices** lists them, with a **Forget** button.
-4. The gauge button in the viewer toolbar toggles the latency overlay. Use full screen (⌃⌘F)
+4. From then on the Mac is under **Your Macs** in **Connect**: click **Connect** next to it (see
+   below).
+5. The gauge button in the viewer toolbar toggles the latency overlay. Use full screen (⌃⌘F)
    for exact 1:1 pixels.
+
+### Your Macs: names, addresses and how to connect
+
+**Connect** lists every Mac you paired with under **Your Macs**, with its two addresses:
+
+- **Local**: where this Mac last reached it on the local network (or else where it said it is
+  there). *Not known yet* until this Mac has reached it there: type its address once.
+- **Internet**: where it was last reached, or said to reach it, over the internet. *Through the
+  LanKVM server* when only the server knows; *Not set up* while its internet access is off (see
+  Connecting over the internet).
+
+The switch next to each picks how **Connect** reaches that Mac, and is remembered per Mac:
+
+- **Auto** (the default) tries every way at once, the local network and the internet, and keeps
+  the local network when both answer.
+- **Local** connects only on the local network, at its local address.
+- **Internet** connects only over the internet: at its internet address, and through the LanKVM
+  server. It stays there even when the Mac turns out to be on your network, so it is also the
+  way to try the internet path from home.
+
+**Connect** is greyed out while the chosen way has no address; hover over it to see what's
+missing. An address typed at the top always goes where it says, whatever the switch.
+
+Give a Mac a name of your own with the pencil next to its name (or right-click the row, or
+**Rename** in **Paired Devices**): e.g. *Office* for a Mac that calls itself *Mac mini*. LanKVM
+on this Mac then calls it that everywhere, the viewer window and its messages included. Leave
+the name empty to go back to its own. Names, addresses and the choice stay on this Mac, in
+`address-book.json` in its data directory, and go when you forget the Mac. A Mac in **Your Macs**
+isn't repeated under **Recent**.
 
 ### Controlling the other Mac
 
@@ -275,8 +306,8 @@ Off by default, and only for Macs that have paired. Nothing to set up on either 
    touch with it, which also keeps its router open for it. The card says *Reachable from
    anywhere through the LanKVM server* once it is.
 3. Connect from the other Mac once more on the local network while internet access is on there,
-   so it learns the way. From then on, click **Connect** next to the Mac in **Paired Devices**,
-   from anywhere.
+   so it learns the way. From then on, click **Connect** next to the Mac under **Your Macs**
+   (with **Auto** or **Internet**), from anywhere.
 
 The server only introduces the two Macs. Each sends a few packets straight at the other's public
 address, which opens both routers, and the session then runs directly from Mac to Mac. Where
@@ -286,7 +317,7 @@ instead: still encrypted end to end, so the server can't read them, and the view
 *Internet · relayed*. A direct path has the lower latency.
 
 Two Macs on one network connect there, even when one is told the other's public address or
-goes through the server: the host says where it is on its network every time a viewer connects,
+goes through the server (unless you chose **Internet** for that Mac): the host says where it is on its network every time a viewer connects,
 and the viewer tries that too, at the same time, and prefers it when it is on the viewer's own
 network. Routers rarely send traffic for their own public address back inside, so without that
 the session would go out to the LanKVM server and back. A session that went through the relay anyway (the first time, before
@@ -540,7 +571,7 @@ and unlocked while it runs.
 | `crates/protocol` | Wire messages, video packet header |
 | `crates/transport` | QUIC endpoint, LAN congestion control, identity, pairing, packetizer/reassembler, the gate that keeps the port silent to the internet (`gate.rs`, `knock.rs`, `cid.rs`), the LanKVM server's protocol and relay on the socket (`rendezvous.rs`, with an in-process server for tests in `test_server.rs`) |
 | `crates/platform-mac` | ScreenCaptureKit capture, finding the tiles that changed (`tiler.rs`), VideoToolbox encode/decode, zero-copy GPU import, input injection (`inject.rs`, `keys.rs`), cursor shapes (`cursor.rs`), the clipboard (`clipboard.rs`), microphone capture and playback (`audio.rs`), virtual displays (`virtual_display.rs`), router port mapping (`portmap.rs`) |
-| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), the shared clipboard (`clipboard.rs`), the shared microphone (`microphone.rs`), virtual displays for viewers (`displays.rs`), internet access keys, addresses and port mapping (`internet.rs`), registration with and introductions through the LanKVM server (`rendezvous.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
+| `crates/core` | Host service and its tiled encode pipeline (`host.rs`), viewer sessions (`client.rs`), remote control (`control.rs`), the shared clipboard (`clipboard.rs`), the shared microphone (`microphone.rs`), virtual displays for viewers (`displays.rs`), the names, local addresses and connection types of the Macs this one controls (`address_book.rs`), internet access keys, addresses and port mapping (`internet.rs`), registration with and introductions through the LanKVM server (`rendezvous.rs`), Metal render thread (`view.rs`, `render.rs`), C ABI (`ffi.rs`) for the app |
 | `macos/` | SwiftUI app (SwiftPM). `Sources/CLanKVM/include/lankvm.h` is the C interface |
 | `macos/AudioDriver` | LanKVM Microphone, the Audio Server plug-in (C) that gives a Mac the microphone other Macs share, and its test |
 | `scripts/bundle.sh` | Builds and signs `LanKVM.app` |

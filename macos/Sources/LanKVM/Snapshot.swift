@@ -94,10 +94,15 @@ enum Snapshot {
             render(ContentView(selection: .paired).environmentObject(core), size: CGSize(width: 900, height: 620),
                    appearance: appearance, to: dir.appendingPathComponent("paired-\(name)-\(suffix).png"))
         }
-        // A Mac connected to through the server is a recent without an address to show.
+        // Your Macs through the server, one of them over the internet only.
         core.loadSampleState(screenAllowed: true, internet: .server)
         render(ContentView(selection: .connect).environmentObject(core), size: CGSize(width: 900, height: 620),
                appearance: appearance, to: dir.appendingPathComponent("connect-server-\(suffix).png"))
+        // Renaming one of them (a popover under its name).
+        if let office = core.paired.hosts.first {
+            render(ZStack { Color.lkBackground; RenameMacForm(device: office) {} }.environmentObject(core),
+                   size: CGSize(width: 280, height: 170), appearance: appearance, to: dir.appendingPathComponent("rename-\(suffix).png"))
+        }
 
         var remote = info
         remote.address = "198.51.100.17:47800"

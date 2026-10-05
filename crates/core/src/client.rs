@@ -27,6 +27,7 @@ use serde::Serialize;
 use transport::video::{Reassembler, tile_of};
 
 use crate::Trust;
+use crate::address_book::Via;
 use crate::clipboard::{Clipboard, Note, SessionClipboard};
 use crate::microphone::{MicGuard, Microphone};
 use crate::rendezvous::{Elsewhere, RelaySession, Rendezvous};
@@ -96,6 +97,9 @@ pub struct SessionInfo {
     /// Its traffic goes through a LanKVM server's relay: the routers wouldn't let a direct path
     /// through.
     pub relayed: bool,
+    /// The host's fingerprint, for recent hosts.
+    #[serde(skip)]
+    pub(crate) host_fingerprint: Fingerprint,
 }
 
 /// The host display a session shows, as the UI sees it.
@@ -435,9 +439,11 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     // How messages name the host: by its name when connecting to it as a paired Mac, looked up
     // first, as this Mac may forget it meanwhile.
     let name = paired.and_then(|host| host_name(&ctx.trust, &host));
+    // How the user wants it reached by name. A typed address goes where it says.
+    let via = paired.map_or(Via::Auto, |host| ctx.trust.address_book.lock().unwrap().via(&host));
     let (conn, addr, internet, relay) = match paired {
         Some(host) => {
-            let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, None).await?;
+            let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, None, via).await?;
             let addr = conn.remote_address();
             (conn, addr, internet, relay)
         }
@@ -449,7 +455,8 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
             // forward a port.
             let known = internet.then(|| ctx.trust.internet_hosts.lock().unwrap().known_at(target, addr, &ctx.trust.hosts.lock().unwrap())).flatten();
             if let Some(host) = known {
-                let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, Some(target)).await?;
+                let Reached { conn, internet, relay } =
+                    connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, Some(target), Via::Auto).await?;
                 let addr = conn.remote_address();
                 (conn, addr, internet, relay)
             } else if internet && ctx.trust.internet_hosts.lock().unwrap().any_server(&ctx.trust.hosts.lock().unwrap()) {
@@ -508,8 +515,10 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
                 if !trusts_host {
                     ctx.trust.hosts.lock().unwrap().add(host_fp, &device_name)?;
                 }
+                // The name the user calls it by, if they gave it one.
+                let alias = ctx.trust.address_book.lock().unwrap().alias(&host_fp);
                 break SessionInfo {
-                    host_name: device_name,
+                    host_name: alias.unwrap_or(device_name),
                     host_id: transport::identity::short_hex(&host_fp),
                     same_machine: crate::is_this_mac(addr.ip()),
                     address: addr.to_string(),
@@ -523,6 +532,7 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
                     display_unavailable: String::new(),
                     internet,
                     relayed: network.gate.is_relayed(addr),
+                    host_fingerprint: host_fp,
                 };
             }
             // Never over the internet: a host there only asks if something is off (it forgot
@@ -576,14 +586,16 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     // its server.
     // Not one the session went through the server's relay for: that address never answered.
     let remembered = internet && !info.relayed && paired.is_none() && trust.internet_hosts.lock().unwrap().remember_used(&host_fp, target);
+    // And where it is on the local network, to connect there by name (and show in Connect).
+    let found_locally = !internet && trust.address_book.lock().unwrap().set_local(&host_fp, &addr.to_string());
     *shared.info.lock().unwrap() = Some(info.clone());
     events(SessionEvent::Connected(info));
-    if remembered {
+    if remembered || found_locally {
         events(SessionEvent::TrustChanged);
     }
     // Through the LanKVM server's relay, though the host may be on this Mac's network after all:
-    // it says where it is there as the session starts.
-    let shortcut = relay.is_some().then(|| {
+    // it says where it is there as the session starts. Not when the user asked for the internet.
+    let shortcut = (relay.is_some() && via != Via::Internet).then(|| {
         tokio::spawn(take_the_shortcut(network.clone(), conn.clone(), trust.clone(), host_fp, shared.clone(), events.clone()))
     });
     let host = PairedHost { trust, fingerprint: host_fp };
@@ -804,6 +816,9 @@ async fn take_the_shortcut(network: Network, conn: Connection, trust: Arc<Trust>
     let Some((path, addr)) = found else { return };
     tracing::info!(%addr, "the session left the relay: straight to the host on the local network");
     shared.set_route(false, addr.to_string(), &events);
+    if trust.address_book.lock().unwrap().set_local(&host, &addr.to_string()) {
+        events(SessionEvent::TrustChanged);
+    }
     conn.closed().await;
     tokio::time::sleep(SHORTCUT_LINGER).await;
     drop(path);
@@ -815,7 +830,7 @@ async fn find_the_shortcut(network: &Network, conn: &Connection, trust: &Trust, 
     let mut tried: Vec<SocketAddr> = Vec::new();
     for _ in 0..SHORTCUT_CHECKS {
         tokio::time::sleep(SHORTCUT_EVERY).await;
-        let lan = trust.internet_hosts.lock().unwrap().way_to(&host).map(|way| way.lan).unwrap_or_default();
+        let lan = local_addresses(trust, &host);
         let fresh: Vec<SocketAddr> = lan
             .iter()
             .filter_map(|a| a.parse::<SocketAddr>().ok())
@@ -925,14 +940,22 @@ struct Reached {
     relay: Option<RelaySession>,
 }
 
-/// Connects to paired host `host` over the internet, as Paired Devices does: at every address it
-/// announced or was reached at, through its LanKVM server, and at its addresses on its own local
-/// network (in case this Mac is there too), all at once. The first to reach that host wins, and
-/// the others are given up (a relay session one of them started ends), except that a connection
-/// over the internet that comes first waits up to [`LAN_GRACE`] for one at an address on this
-/// Mac's network, still being tried, which wins if it comes in time. `typed`: an address the user
-/// typed for it, tried too.
-async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trust: &Trust, host: Fingerprint, typed: Option<&str>) -> Result<Reached> {
+/// Connects to paired host `host` by name, the way `via` says. Automatically: at its address on
+/// the local network (where this Mac last reached it there, and where it says it is), at every
+/// address on the internet it announced or was reached at, and through its LanKVM server, all at
+/// once. The first to reach that host wins, and the others are given up (a relay session one of
+/// them started ends), except that a connection over the internet that comes first waits up to
+/// [`LAN_GRACE`] for one at an address on this Mac's network, still being tried, which wins if it
+/// comes in time. `Via::Local` and `Via::Internet` try only the ways on that network. `typed`: an
+/// address the user typed for it, tried too.
+async fn connect_to_paired(
+    network: &Network,
+    rendezvous: &Arc<Rendezvous>,
+    trust: &Trust,
+    host: Fingerprint,
+    typed: Option<&str>,
+    via: Via,
+) -> Result<Reached> {
     if !trust.hosts.lock().unwrap().contains(&host) {
         bail!("This Mac isn't paired with that Mac any more. Connect to it on the same network and enter its code to pair again.");
     }
@@ -941,35 +964,54 @@ async fn connect_to_paired(network: &Network, rendezvous: &Arc<Rendezvous>, trus
     let who = name.clone().unwrap_or_else(|| "That Mac".to_string());
     let within = name.unwrap_or_else(|| "that Mac".to_string());
     let way = trust.internet_hosts.lock().unwrap().way_to(&host);
-    let Some(way) = way.filter(|w| w.rendezvous.is_some() || !w.addresses.is_empty() || !w.lan.is_empty()) else {
-        bail!(
-            "{who} hasn't told this Mac how to reach it over the internet. Turn on internet access on {within} (This Mac in \
-             LanKVM), connect to it once on the same network, then try again."
-        );
+    // Its addresses on its own network: the way to it when both are at home.
+    let local = if via == Via::Internet { Vec::new() } else { local_addresses(trust, &host) };
+    let (key, mut addresses, server) = match way {
+        Some(way) if via != Via::Local => (Some(way.key), way.addresses, way.rendezvous),
+        Some(way) => (Some(way.key), Vec::new(), None),
+        None => (None, Vec::new(), None),
     };
-    let key = way.key;
-    let mut addresses = way.addresses;
     if let Some(typed) = typed
+        && via != Via::Local
+        && key.is_some()
         && !addresses.iter().any(|a| crate::internet::same_address(a, typed))
     {
         addresses.insert(0, typed.trim().to_string());
     }
+    if local.is_empty() && addresses.is_empty() && server.is_none() {
+        match via {
+            Via::Local => bail!(
+                "This Mac doesn't know where {within} is on the local network yet. Type its address in Connect once (This Mac in \
+                 LanKVM on {within} shows it), then try again."
+            ),
+            Via::Internet => bail!(
+                "{who} hasn't told this Mac how to reach it over the internet. Turn on internet access on {within} (This Mac in \
+                 LanKVM), connect to it once on the same network, then try again."
+            ),
+            Via::Auto => bail!(
+                "This Mac doesn't know where {within} is yet. Type its address in Connect once, on the same network (This Mac in \
+                 LanKVM on {within} shows it). To reach it from anywhere, also turn on internet access there."
+            ),
+        }
+    }
     let mut attempts = tokio::task::JoinSet::new();
-    // Its addresses on its own network that are on this Mac's network too: the way to it when both
-    // are at home, tried along with the others but waited for (see LAN_GRACE).
+    // Its addresses on its own network that are on this Mac's network too are tried along with
+    // the others but waited for (see LAN_GRACE).
     let mut nearby = 0;
     if !rendezvous.force_relay() {
-        let lan = way.lan.into_iter().map(|address| {
+        let local = local.into_iter().map(|address| {
             let near = address.parse::<SocketAddr>().is_ok_and(|a| crate::on_this_network(a.ip()));
             nearby += usize::from(near);
             (Attempt::Lan { near }, address)
         });
-        for (kind, address) in addresses.into_iter().map(|address| (Attempt::Direct, address)).chain(lan) {
+        for (kind, address) in addresses.into_iter().map(|address| (Attempt::Direct, address)).chain(local) {
             let (network, within) = (network.clone(), within.clone());
-            attempts.spawn(async move { (kind, connect_at(&network, &within, &address, key).await) });
+            // The internet only: an address that leads to the local network here isn't a way.
+            let lan_ok = via != Via::Internet;
+            attempts.spawn(async move { (kind, connect_at(&network, &within, &address, key, lan_ok).await) });
         }
     }
-    if let Some((server, id)) = way.rendezvous {
+    if let (Some((server, id)), Some(key)) = (server, key) {
         let (network, rendezvous, who) = (network.clone(), rendezvous.clone(), who.clone());
         attempts.spawn(async move {
             let introduced = rendezvous.connect(&who, &server, id, key, None).await;
@@ -1051,10 +1093,23 @@ fn log_reached(within: &str, reached: &Reached, kind: Attempt) {
 enum Attempt {
     /// Through its LanKVM server.
     Server,
-    /// At an address it announced or was reached at.
+    /// At an address on the internet it announced or was reached at.
     Direct,
     /// At its address on its own local network; `near` when that is on this Mac's network too.
     Lan { near: bool },
+}
+
+/// Where paired host `host` is on its own local network: where this Mac last reached it there,
+/// then the addresses it says it has there.
+fn local_addresses(trust: &Trust, host: &Fingerprint) -> Vec<String> {
+    let mut local: Vec<String> = trust.address_book.lock().unwrap().local(host).into_iter().collect();
+    let announced = trust.internet_hosts.lock().unwrap().way_to(host).map(|way| way.lan).unwrap_or_default();
+    for address in announced {
+        if !local.iter().any(|a| crate::internet::same_address(a, &address)) {
+            local.push(address);
+        }
+    }
+    local
 }
 
 impl Attempt {
@@ -1126,10 +1181,14 @@ async fn connect_by_ip(network: &Network, rendezvous: &Arc<Rendezvous>, trust: &
 }
 
 /// Connects to paired host `name` (as named within a sentence) at `address`, one it announced or
-/// was reached at.
-async fn connect_at(network: &Network, name: &str, address: &str, key: AccessKey) -> Result<Reached> {
+/// was reached at. An address on the internet takes a knock with `key`, so none goes there without
+/// one; `lan_ok`: one that leads to the local network here is a way too.
+async fn connect_at(network: &Network, name: &str, address: &str, key: Option<AccessKey>, lan_ok: bool) -> Result<Reached> {
     let addr = resolve(address).await?;
     if !network.gate.is_internet(addr) {
+        if !lan_ok {
+            bail!("{address} leads to the local network here, not over the internet.");
+        }
         // A name that leads to the local network here (the host's own name, at home).
         let conn = tokio::time::timeout(CONNECT_TIMEOUT, network.endpoint.connect(addr, "lankvm")?)
             .await
@@ -1137,6 +1196,8 @@ async fn connect_at(network: &Network, name: &str, address: &str, key: AccessKey
             .context("connect")?;
         return Ok(Reached { conn, internet: false, relay: None });
     }
+    // Never a connection without a knock: the gate there would drop it anyway.
+    let Some(key) = key else { bail!("{address} isn't on the local network here.") };
     let connecting = network.endpoint.connect_with(network.internet_client_config(key), addr, "lankvm").context("connect")?;
     let conn = tokio::time::timeout(CONNECT_TIMEOUT_INTERNET, connecting)
         .await
@@ -1164,8 +1225,11 @@ fn turned_away(e: anyhow::Error, conn: &Connection, internet: bool, who: &str) -
     }
 }
 
-/// The name this Mac paired with `host` under.
+/// The name this Mac calls `host` by: the user's for it, or the one it paired under.
 fn host_name(trust: &Trust, host: &Fingerprint) -> Option<String> {
+    if let Some(alias) = trust.address_book.lock().unwrap().alias(host) {
+        return Some(alias);
+    }
     let hosts = trust.hosts.lock().unwrap();
     hosts.entries().iter().find(|(fp, _)| fp == host).map(|(_, name)| name.clone()).filter(|name| !name.is_empty())
 }

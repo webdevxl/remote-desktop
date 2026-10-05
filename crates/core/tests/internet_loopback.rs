@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use lankvm_core::control::Backend;
-use lankvm_core::{AudioBackend, ClipboardBackend, Core, CoreOptions, Event};
+use lankvm_core::{AudioBackend, ClipboardBackend, Core, CoreOptions, Event, Via};
 use protocol::InputMsg;
 use serde_json::{Value, json};
 use transport::identity::DeviceIdentity;
@@ -99,9 +99,14 @@ impl Peer {
 
     /// [`Self::connect`], also saying whether the session goes through a LanKVM server's relay.
     fn connect_relayed(&self, target: &str, timeout: Duration) -> Result<(u64, bool, bool), String> {
+        self.connect_named(target, timeout).map(|(id, internet, relayed, _)| (id, internet, relayed))
+    }
+
+    /// [`Self::connect_relayed`], also with the name the session gives the host.
+    fn connect_named(&self, target: &str, timeout: Duration) -> Result<(u64, bool, bool, String), String> {
         let id = self.core.connect(target, (1920, 1080), 60);
         self.wait("connected or ended", timeout, |e| match e {
-            Event::Connected { session, info } if session == id => Ok(Ok((id, info.internet, info.relayed))),
+            Event::Connected { session, info } if session == id => Ok(Ok((id, info.internet, info.relayed, info.host_name))),
             Event::Ended { session, error } if session == id => Ok(Err(error.unwrap_or_default())),
             e => Err(e),
         })
@@ -110,13 +115,6 @@ impl Peer {
     fn ended(&self, id: u64) {
         self.wait("session ended", WAIT, |e| match e {
             Event::Ended { session, .. } if session == id => Ok(()),
-            e => Err(e),
-        });
-    }
-
-    fn trust_changed(&self) {
-        self.wait("trust changed", WAIT, |e| match e {
-            Event::TrustChanged => Ok(()),
             e => Err(e),
         });
     }
@@ -142,10 +140,19 @@ fn trust(dir: &Path, file: &str, entries: &[(&str, &str)]) {
     std::fs::write(dir.join(file), text).unwrap();
 }
 
-/// What the viewer in `dir` stored about reaching `host` over the internet.
+/// What the viewer in `dir` stored about reaching `host` over the internet (null: nothing yet).
 fn internet_host(dir: &Path, host: &str) -> Value {
-    let json: Value = serde_json::from_slice(&std::fs::read(dir.join("internet-hosts.json")).unwrap()).unwrap();
-    json[host].clone()
+    stored(dir, "internet-hosts.json")[host].clone()
+}
+
+/// The JSON file `file` in `dir` (null when there's none).
+fn stored(dir: &Path, file: &str) -> Value {
+    std::fs::read(dir.join(file)).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or(Value::Null)
+}
+
+/// What the viewer in `dir` keeps in its address book about `host` (null: nothing).
+fn address_book(dir: &Path, host: &str) -> Value {
+    stored(dir, "address-book.json")[host].clone()
 }
 
 /// Polls `check` until it holds.
@@ -195,7 +202,7 @@ fn setup_with(name: &str, internet_access: bool, rendezvous: &str) -> Setup {
     let (id, internet) = viewer.connect(&host.target(), WAIT).expect("connect on the local network");
     assert!(!internet);
     // The key comes right after the session starts, and it's new to the viewer.
-    viewer.trust_changed();
+    wait_until("the viewer to store its key", || !internet_host(&viewer_dir, &host_fp)["key"].is_null());
     let stored = internet_host(&viewer_dir, &host_fp);
     assert_eq!(stored["key"].as_str().map(str::len), Some(64), "{stored}");
     assert_eq!(stored["announced"], serde_json::json!([]), "internet access is still off");
@@ -369,6 +376,12 @@ impl Server {
 /// the host's addresses forgotten. With `force_relay`, the viewer goes through the relay alone.
 /// Also the host's ID at the server.
 fn introduced(name: &str, server: &Server, force_relay: bool) -> (Setup, RendezvousId) {
+    introduced_with(name, server, force_relay, false)
+}
+
+/// [`introduced`]; with `keep_local`, the viewer still knows where it reached the host on the local
+/// network (on loopback, which stands in for the internet now).
+fn introduced_with(name: &str, server: &Server, force_relay: bool, keep_local: bool) -> (Setup, RendezvousId) {
     let Setup { root, host, viewer, viewer_dir, host_fp, viewer_fp } = setup_with(name, true, &server.addr());
     wait_until("the host to register", || host.status()["internet"]["server"]["state"] == "registered");
     let (session, _) = viewer.connect(&host.target(), WAIT).expect("connect over the internet");
@@ -387,6 +400,10 @@ fn introduced(name: &str, server: &Server, force_relay: bool) -> (Setup, Rendezv
     // Its address on the local network too: this Mac is on it, so that would be the way in.
     stored[&host_fp]["lan"] = json!([]);
     std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    // And where the first session reached it there.
+    if !keep_local {
+        std::fs::remove_file(viewer_dir.join("address-book.json")).unwrap();
+    }
     let viewer = Peer::start_with(&viewer_dir, Backend::Hid, "", force_relay);
     viewer.core.set_loopback_is_internet(true);
     (Setup { root, host, viewer, viewer_dir, host_fp, viewer_fp }, id)
@@ -587,6 +604,9 @@ fn a_host_answers_only_the_challenges_it_asked_for() {
 #[test]
 fn a_mac_with_no_way_to_a_paired_host_says_so() {
     let s = setup("no-way", false);
+    // Over the internet only: automatically, the address where the first session reached it would
+    // be tried too.
+    s.viewer.core.set_host_connection(&s.host_fp, Via::Internet);
     let started = Instant::now();
     let error = s.viewer.connect(&format!("lankvm:{}", s.host_fp), WAIT).expect_err("no way");
     assert!(error.starts_with("host hasn't told this Mac how to reach it over the internet."), "{error}");
@@ -598,4 +618,97 @@ fn a_mac_with_no_way_to_a_paired_host_says_so() {
     assert!(error.starts_with("This Mac isn't paired with that Mac any more."), "{error}");
     let error = s.viewer.connect("lankvm:nonsense", WAIT).expect_err("not a fingerprint");
     assert_eq!(error, "lankvm:nonsense doesn't name a paired Mac.");
+}
+
+#[test]
+fn a_paired_mac_is_reached_by_name_on_the_local_network() {
+    let s = setup("by-name", false);
+    // Back on the local network (internet access is off on the host: nothing asks the router).
+    s.host.core.set_loopback_is_internet(false);
+    s.viewer.core.set_loopback_is_internet(false);
+    let target = s.host.target();
+    let paired = serde_json::to_value(s.viewer.core.paired_devices()).unwrap();
+    let host = &paired["hosts"][0];
+    assert_eq!(host["localAddress"], target.as_str(), "where the first session reached it: {paired}");
+    assert_eq!(host["connection"], "auto");
+    assert!(host.get("alias").is_none() && host.get("internetAddress").is_none(), "{paired}");
+    assert!(paired["viewers"].as_array().unwrap().is_empty());
+    // Recent hosts say which Mac each one reached.
+    assert_eq!(s.viewer.core.recent_hosts()[0].fingerprint.as_deref(), Some(s.host_fp.as_str()));
+
+    s.viewer.core.set_host_alias(&s.host_fp, " Office ");
+    let paired = serde_json::to_value(s.viewer.core.paired_devices()).unwrap();
+    assert_eq!((&paired["hosts"][0]["alias"], &paired["hosts"][0]["name"]), (&json!("Office"), &json!("host")));
+
+    // Automatically (the host never said how to reach it over the internet) and on the local
+    // network only, the session calls it by its alias.
+    for via in [Via::Auto, Via::Local] {
+        s.viewer.core.set_host_connection(&s.host_fp, via);
+        let (id, internet, _, name) = s.viewer.connect_named(&s.paired_target(), WAIT).unwrap_or_else(|e| panic!("{via:?}: {e}"));
+        assert!(!internet, "{via:?}");
+        assert_eq!(name, "Office");
+        s.viewer.core.disconnect(id);
+        wait_until("the viewer to leave", || s.host.status()["viewers"].as_array().unwrap().is_empty());
+    }
+    assert_eq!(address_book(&s.viewer_dir, &s.host_fp), json!({"alias": "Office", "local": target, "connection": "local"}));
+
+    // Over the internet only: the host never said how to reach it there.
+    s.viewer.core.set_host_connection(&s.host_fp, Via::Internet);
+    let started = Instant::now();
+    let error = s.viewer.connect(&s.paired_target(), WAIT).expect_err("no way over the internet");
+    assert!(error.starts_with("Office hasn't told this Mac how to reach it over the internet."), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2), "fails at once, without trying");
+
+    // Forgotten: its entry goes too.
+    s.viewer.core.forget_device("host", &s.host_fp);
+    assert!(address_book(&s.viewer_dir, &s.host_fp).is_null());
+}
+
+#[test]
+fn a_paired_mac_this_mac_never_reached_has_no_way_by_name() {
+    let root = std::env::temp_dir().join(format!("lankvm-internet-never-reached-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let _cleanup = TempDir(root.clone());
+    let (_, host_fp) = device(&root, "host");
+    let (viewer_dir, _) = device(&root, "viewer");
+    trust(&viewer_dir, "trusted-hosts.txt", &[(&host_fp, "host")]);
+    let viewer = Peer::start(&viewer_dir, Backend::Hid);
+    let target = format!("lankvm:{host_fp}");
+
+    let started = Instant::now();
+    let error = viewer.connect(&target, WAIT).expect_err("no way");
+    assert!(error.starts_with("This Mac doesn't know where host is yet."), "{error}");
+    viewer.core.set_host_connection(&host_fp, Via::Local);
+    let error = viewer.connect(&target, WAIT).expect_err("no way on the local network");
+    assert!(error.starts_with("This Mac doesn't know where host is on the local network yet."), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2), "fails at once, without trying");
+    let paired = serde_json::to_value(viewer.core.paired_devices()).unwrap();
+    assert!(paired["hosts"][0].get("localAddress").is_none(), "{paired}");
+    assert_eq!(paired["hosts"][0]["connection"], "local");
+
+    // Not a Mac it is paired with: nothing to keep.
+    viewer.core.set_host_alias(&"ab".repeat(32), "Stranger");
+    viewer.core.set_host_connection(&"ab".repeat(32), Via::Internet);
+    assert!(address_book(&viewer_dir, &"ab".repeat(32)).is_null());
+}
+
+#[test]
+fn over_the_internet_only_the_local_address_isnt_tried() {
+    let server = Server::start();
+    let (s, _) = introduced_with("internet-only", &server, false, true);
+    // The server sends each Mac toward an address that never answers: from there, only its relay
+    // gets through. The address where the viewer first reached the host (loopback, the internet
+    // now) would answer at once, but it is one on the local network.
+    server.server.set_lie_about_endpoints(true);
+    s.viewer.core.set_host_connection(&s.host_fp, Via::Internet);
+    let (id, internet, relayed) = s.viewer.connect_relayed(&s.paired_target(), NO_ANSWER_WAIT).expect("connect over the internet");
+    assert!(internet && relayed);
+    s.viewer.core.disconnect(id);
+    wait_until("the viewer to leave", || s.host.status()["viewers"].as_array().unwrap().is_empty());
+
+    // Automatically, it goes straight there.
+    s.viewer.core.set_host_connection(&s.host_fp, Via::Auto);
+    let (id, internet, relayed) = s.viewer.connect_relayed(&s.paired_target(), NO_ANSWER_WAIT).expect("connect automatically");
+    assert!(internet && !relayed);
+    s.viewer.core.disconnect(id);
 }

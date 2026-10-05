@@ -2,6 +2,7 @@
 //!
 //! The SwiftUI app drives it through the C ABI in [`ffi`] and receives [`Event`]s as JSON.
 
+mod address_book;
 mod client;
 mod clipboard;
 pub mod control;
@@ -34,10 +35,12 @@ use transport::identity::{DeviceIdentity, Fingerprint, short_hex};
 use transport::pairing::TrustStore;
 use transport::rendezvous::{DEFAULT_SERVER, RendezvousIdentity};
 
+pub use crate::address_book::Via;
 pub use crate::client::{FrameProbe, ProbeFrame};
 pub use crate::clipboard::ClipboardBackend;
 pub use crate::microphone::{AudioBackend, MicSink, MicSource, Recording};
 pub use crate::stats::FrameTiming;
+use crate::address_book::AddressBook;
 use crate::client::{Session, SessionEvent, SessionInfo};
 use crate::clipboard::Clipboard;
 use crate::internet::{HostInternet, InternetHosts};
@@ -115,6 +118,9 @@ pub struct Trust {
     pub hosts: Mutex<TrustStore>,
     /// How to reach those Macs over the internet: the keys they gave this one.
     pub(crate) internet_hosts: Mutex<InternetHosts>,
+    /// The names the user calls those Macs by, where they are on the local network, and how to
+    /// connect to them.
+    pub(crate) address_book: Mutex<AddressBook>,
 }
 
 #[derive(Serialize, Clone)]
@@ -131,6 +137,9 @@ pub struct ThisMac {
 pub struct RecentHost {
     pub address: String,
     pub name: String,
+    /// The Mac it reached (hex), when known: Connect lists paired Macs apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 pub struct Core {
@@ -276,7 +285,10 @@ impl Core {
             viewers: Mutex::new(TrustStore::load(&dir.join("trusted-viewers.txt"))),
             hosts: Mutex::new(TrustStore::load(&dir.join("trusted-hosts.txt"))),
             internet_hosts: Mutex::new(InternetHosts::load(&dir.join("internet-hosts.json"))),
+            address_book: Mutex::new(AddressBook::load(&dir.join("address-book.json"))),
         });
+        let recents = Recents::load(&dir.join("recent-hosts.txt"));
+        adopt_local_addresses(&recents, &trust);
         // The first keyboard event a process creates must be made on the main thread (it loads
         // the keyboard layout); lk_start runs there. Elsewhere (tests) it would do no good.
         if platform_mac::system::is_main_thread() {
@@ -373,7 +385,7 @@ impl Core {
             rendezvous,
             events,
             this_mac,
-            recents: Mutex::new(Recents::load(&dir.join("recent-hosts.txt"))),
+            recents: Mutex::new(recents),
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
             clipboard,
@@ -417,27 +429,74 @@ impl Core {
     }
 
     pub fn paired_devices(&self) -> PairedDevices {
-        let list = |store: &Mutex<TrustStore>, internet: Option<&InternetHosts>| {
-            store
-                .lock()
-                .unwrap()
-                .entries()
-                .iter()
-                .map(|(fp, name)| PairedDevice {
-                    fingerprint: hex(fp),
-                    device_id: short_hex(fp),
-                    name: name.clone(),
-                    internet_address: internet.and_then(|i| i.address(fp)),
-                    reachable: internet.is_some_and(|i| i.reachable(fp)),
-                })
-                .collect()
+        let device = |fp: &Fingerprint, name: &String| PairedDevice {
+            fingerprint: hex(fp),
+            device_id: short_hex(fp),
+            name: name.clone(),
+            alias: None,
+            local_address: None,
+            internet_address: None,
+            reachable: false,
+            connection: None,
         };
+        let viewers = self.trust.viewers.lock().unwrap().entries().iter().map(|(fp, name)| device(fp, name)).collect();
+        let hosts = self.trust.hosts.lock().unwrap().entries().to_vec();
         let internet = self.trust.internet_hosts.lock().unwrap();
-        PairedDevices { viewers: list(&self.trust.viewers, None), hosts: list(&self.trust.hosts, Some(&internet)) }
+        let book = self.trust.address_book.lock().unwrap();
+        let hosts = hosts
+            .iter()
+            .map(|(fp, name)| {
+                // Where it was reached on the local network, or else where it says it is there
+                // (on this Mac's network first).
+                let announced = internet.way_to(fp).map(|way| way.lan).unwrap_or_default();
+                let nearby = || announced.iter().find(|a| a.parse::<SocketAddr>().is_ok_and(|a| on_this_network(a.ip())));
+                PairedDevice {
+                    alias: book.alias(fp),
+                    local_address: book.local(fp).or_else(|| nearby().or(announced.first()).cloned()),
+                    internet_address: internet.address(fp),
+                    reachable: internet.reachable(fp),
+                    connection: Some(book.via(fp)),
+                    ..device(fp, name)
+                }
+            })
+            .collect();
+        PairedDevices { viewers, hosts }
     }
 
+    /// Newest first. Each says which Mac it reached, when that is known.
     pub fn recent_hosts(&self) -> Vec<RecentHost> {
-        self.recents.lock().unwrap().entries.clone()
+        let hosts = self.trust.hosts.lock().unwrap();
+        let mut entries = self.recents.lock().unwrap().entries.clone();
+        for recent in &mut entries {
+            if recent.fingerprint.is_none() {
+                recent.fingerprint = recent_host(recent, &hosts).map(|fp| hex(&fp));
+            }
+        }
+        entries
+    }
+
+    /// Calls paired host `fingerprint_hex` `alias` everywhere on this Mac ("" for the name it gave
+    /// itself).
+    pub fn set_host_alias(&self, fingerprint_hex: &str, alias: &str) {
+        let Some(fp) = self.paired_host(fingerprint_hex) else { return };
+        if self.trust.address_book.lock().unwrap().set_alias(&fp, alias) {
+            (self.events)(Event::TrustChanged);
+        }
+    }
+
+    /// How to connect to paired host `fingerprint_hex` by name (`lankvm:<fingerprint>`): see
+    /// [`Via`]. Applies from the next connection.
+    pub fn set_host_connection(&self, fingerprint_hex: &str, via: Via) {
+        let Some(fp) = self.paired_host(fingerprint_hex) else { return };
+        if self.trust.address_book.lock().unwrap().set_via(&fp, via) {
+            tracing::info!(host = %short_hex(&fp), ?via, "connection type");
+            (self.events)(Event::TrustChanged);
+        }
+    }
+
+    /// The paired host `fingerprint_hex` names, if this Mac is paired with it.
+    fn paired_host(&self, fingerprint_hex: &str) -> Option<Fingerprint> {
+        from_hex(fingerprint_hex.trim()).filter(|fp| self.trust.hosts.lock().unwrap().contains(fp))
     }
 
     /// Opens a viewer session; progress arrives as events tagged with the returned id. `target` is
@@ -454,7 +513,7 @@ impl Core {
             let event = match event {
                 SessionEvent::PinNeeded => Event::PinNeeded { session: id },
                 SessionEvent::Connected(info) => {
-                    core.recents.lock().unwrap().add(&typed, &info.host_name);
+                    core.recents.lock().unwrap().add(&typed, &info.host_name, &info.host_fingerprint);
                     Event::Connected { session: id, info }
                 }
                 SessionEvent::Ended { error } => {
@@ -681,6 +740,7 @@ impl Core {
         }
         if kind == "host" {
             self.trust.internet_hosts.lock().unwrap().remove(&fp);
+            self.trust.address_book.lock().unwrap().remove(&fp);
         } else {
             // Its knocks go unanswered from now on.
             self.host.internet.sync_keys();
@@ -706,14 +766,24 @@ impl Core {
 pub struct PairedDevice {
     pub fingerprint: String,
     pub device_id: String,
+    /// The name it gave itself.
     pub name: String,
+    /// A host: the name the user calls it by instead, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// A host's address on the local network: where this Mac last reached it there, or else where
+    /// it said it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_address: Option<String>,
     /// A host's address over the internet: where this Mac last reached it, or else where it
     /// said to reach it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub internet_address: Option<String>,
-    /// A host this Mac knows a way to try over the internet (its LanKVM server, or an address):
-    /// connect with `lankvm:<fingerprint>`.
+    /// A host this Mac knows a way to try over the internet (its LanKVM server, or an address).
     pub reachable: bool,
+    /// A host: how `lankvm:<fingerprint>` connects to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<Via>,
 }
 
 #[derive(Serialize)]
@@ -722,7 +792,8 @@ pub struct PairedDevices {
     pub hosts: Vec<PairedDevice>,
 }
 
-/// Recently connected hosts, newest first, as `<address>\t<name>` lines.
+/// Recently connected hosts, newest first, as `<address>\t<name>\t<fingerprint>` lines (lines from
+/// before LanKVM kept the fingerprint have none).
 struct Recents {
     path: PathBuf,
     entries: Vec<RecentHost>,
@@ -736,20 +807,59 @@ impl Recents {
             .unwrap_or_default()
             .lines()
             .filter_map(|l| {
-                let (address, name) = l.split_once('\t')?;
-                Some(RecentHost { address: address.to_string(), name: name.to_string() })
+                let mut fields = l.split('\t');
+                let (address, name) = (fields.next()?, fields.next()?);
+                let fingerprint = fields.next().filter(|fp| from_hex::<32>(fp).is_some()).map(str::to_string);
+                Some(RecentHost { address: address.to_string(), name: name.to_string(), fingerprint })
             })
             .collect();
         Self { path: path.to_path_buf(), entries }
     }
 
-    fn add(&mut self, address: &str, name: &str) {
+    fn add(&mut self, address: &str, name: &str, host: &Fingerprint) {
         self.entries.retain(|r| r.address != address);
-        self.entries.insert(0, RecentHost { address: address.to_string(), name: name.replace(['\t', '\n'], " ") });
+        let name = name.replace(['\t', '\n'], " ");
+        self.entries.insert(0, RecentHost { address: address.to_string(), name, fingerprint: Some(hex(host)) });
         self.entries.truncate(Self::MAX);
-        let text: String = self.entries.iter().map(|r| format!("{}\t{}\n", r.address, r.name)).collect();
+        let text: String = self
+            .entries
+            .iter()
+            .map(|r| match &r.fingerprint {
+                Some(fp) => format!("{}\t{}\t{fp}\n", r.address, r.name),
+                None => format!("{}\t{}\n", r.address, r.name),
+            })
+            .collect();
         if let Err(e) = std::fs::write(&self.path, text) {
             tracing::warn!("save recent hosts: {e}");
+        }
+    }
+}
+
+/// The paired host `recent` reached: the one it says, or that its `lankvm:` target names, or (a
+/// line from before LanKVM kept that) the only paired host with its name.
+fn recent_host(recent: &RecentHost, hosts: &TrustStore) -> Option<Fingerprint> {
+    let named = recent.fingerprint.as_deref().or(recent.address.strip_prefix("lankvm:"));
+    if let Some(fp) = named {
+        return from_hex(fp.trim()).filter(|fp| hosts.contains(fp));
+    }
+    let mut same_name = hosts.entries().iter().filter(|(_, name)| *name == recent.name);
+    match (same_name.next(), same_name.next()) {
+        (Some((fp, _)), None) => Some(*fp),
+        _ => None,
+    }
+}
+
+/// Macs paired before LanKVM kept where they are on the local network: the address last typed for
+/// each, when it is one on a local network (and recent hosts can tell which Mac it reached).
+fn adopt_local_addresses(recents: &Recents, trust: &Trust) {
+    let hosts = trust.hosts.lock().unwrap();
+    let mut book = trust.address_book.lock().unwrap();
+    for recent in recents.entries.iter().filter(|r| r.fingerprint.is_none()) {
+        let Some(fp) = recent_host(recent, &hosts) else { continue };
+        if book.local(&fp).is_none() && internet::is_local_address(&recent.address) {
+            let address = internet::with_port(&recent.address, DEFAULT_PORT);
+            tracing::info!(host = %short_hex(&fp), %address, "kept from recent hosts: its address on the local network");
+            book.set_local(&fp, &address);
         }
     }
 }
@@ -918,12 +1028,98 @@ mod tests {
         let path = std::env::temp_dir().join(format!("lankvm-recents-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut r = Recents::load(&path);
-        r.add("192.168.1.2", "Studio");
-        r.add("192.168.1.3", "Mini");
-        r.add("192.168.1.2", "Studio");
+        r.add("192.168.1.2", "Studio", &[1; 32]);
+        r.add("192.168.1.3", "Mini", &[2; 32]);
+        r.add("192.168.1.2", "Studio", &[1; 32]);
         let r = Recents::load(&path);
         let addrs: Vec<_> = r.entries.iter().map(|e| e.address.as_str()).collect();
         assert_eq!(addrs, ["192.168.1.2", "192.168.1.3"]);
+        assert_eq!(r.entries[1].fingerprint, Some(hex(&[2; 32])));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A data directory of its own, gone at the end.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("lankvm-lib-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn trust(&self, hosts: &[(u8, &str)]) -> Trust {
+            let mut store = TrustStore::load(&self.0.join("trusted-hosts.txt"));
+            for &(n, name) in hosts {
+                store.add([n; 32], name).unwrap();
+            }
+            Trust {
+                fingerprint: [0; 32],
+                viewers: Mutex::new(TrustStore::load(&self.0.join("trusted-viewers.txt"))),
+                hosts: Mutex::new(store),
+                internet_hosts: Mutex::new(InternetHosts::load(&self.0.join("internet-hosts.json"))),
+                address_book: Mutex::new(AddressBook::load(&self.0.join("address-book.json"))),
+            }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn recent_lines_from_before_fingerprints_still_load() {
+        let dir = TempDir::new("old-recents");
+        let path = dir.0.join("recent-hosts.txt");
+        std::fs::write(&path, format!("192.168.1.2\tStudio\n192.168.1.3\tMini\t{}\n10.0.0.4\tOld\tnot-hex\n", hex(&[2; 32]))).unwrap();
+        let r = Recents::load(&path);
+        let found: Vec<_> = r.entries.iter().map(|e| (e.address.as_str(), e.name.as_str(), e.fingerprint.clone())).collect();
+        assert_eq!(
+            found,
+            [("192.168.1.2", "Studio", None), ("192.168.1.3", "Mini", Some(hex(&[2; 32]))), ("10.0.0.4", "Old", None)]
+        );
+    }
+
+    #[test]
+    fn recent_hosts_say_which_paired_mac_they_reached() {
+        let dir = TempDir::new("recent-host");
+        let trust = dir.trust(&[(1, "Studio"), (2, "MacBook Pro"), (3, "MacBook Pro")]);
+        let hosts = trust.hosts.lock().unwrap();
+        let recent = |address: &str, name: &str, fingerprint: Option<[u8; 32]>| RecentHost {
+            address: address.into(),
+            name: name.into(),
+            fingerprint: fingerprint.map(|fp| hex(&fp)),
+        };
+        assert_eq!(recent_host(&recent("192.168.1.9", "Anything", Some([2; 32])), &hosts), Some([2; 32]), "as it says");
+        assert_eq!(recent_host(&recent(&format!("lankvm:{}", hex(&[3; 32])), "", None), &hosts), Some([3; 32]));
+        assert_eq!(recent_host(&recent("192.168.1.9", "Studio", None), &hosts), Some([1; 32]), "the only Studio");
+        assert_eq!(recent_host(&recent("192.168.1.9", "MacBook Pro", None), &hosts), None, "two of them");
+        assert_eq!(recent_host(&recent("192.168.1.9", "Studio", Some([9; 32])), &hosts), None, "forgotten");
+    }
+
+    #[test]
+    fn macs_paired_before_keep_their_local_address_from_recent_hosts() {
+        let dir = TempDir::new("adopt");
+        let trust = dir.trust(&[(1, "Studio"), (2, "Mini"), (3, "Laptop"), (4, "Pro"), (5, "Pro")]);
+        trust.address_book.lock().unwrap().set_local(&[2; 32], "192.168.1.77:47800");
+        let path = dir.0.join("recent-hosts.txt");
+        let lines = [
+            format!("lankvm:{}\tStudio", hex(&[1; 32])),
+            "192.168.1.31\tStudio".to_string(),
+            "studio.local\tStudio".to_string(),
+            "192.168.1.40\tMini".to_string(),
+            "203.0.113.7\tLaptop".to_string(),
+            "192.168.1.50\tPro".to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        adopt_local_addresses(&Recents::load(&path), &trust);
+        let book = trust.address_book.lock().unwrap();
+        assert_eq!(book.local(&[1; 32]).as_deref(), Some("192.168.1.31:47800"), "the newest address on a local network");
+        assert_eq!(book.local(&[2; 32]).as_deref(), Some("192.168.1.77:47800"), "already known");
+        assert_eq!(book.local(&[3; 32]), None, "a public address isn't a local one");
+        assert_eq!((book.local(&[4; 32]), book.local(&[5; 32])), (None, None), "which Pro?");
     }
 }
