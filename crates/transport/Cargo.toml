@@ -15,6 +15,7 @@ quinn-proto = { version = "0.11", default-features = false }
 rustls.workspace = true
 rcgen.workspace = true
 serde.workspace = true
+postcard.workspace = true
 ring = "0.17"
 socket2 = "0.6"
 spake2 = "0.4"
@@ -23,3 +24,4 @@ quinn-udp = { version = "0.5", features = ["fast-apple-datapath"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true

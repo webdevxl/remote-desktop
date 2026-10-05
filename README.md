@@ -3,7 +3,8 @@
 Low-latency remote desktop for Macs on the same local network, built as a software network KVM.
 Every Mac runs the same app. Others on the LAN can view it, and it can connect to them by IP.
 Paired Macs can also connect over the internet, if the Mac they connect to turns that on, with
-no router setup: a small LanKVM server introduces them to each other.
+no router setup: a small LanKVM server introduces them to each other, or, with no server at all,
+the BitTorrent DHT (the network torrent apps find each other through).
 
 **Status:** prototype. You enter an IP, enter a PIN once, and see the other Mac's screen. Each
 viewer window has two modes: **View** only looks; **Control** uses the other Mac's keyboard and
@@ -324,10 +325,71 @@ the session would go out to the LanKVM server and back. A session that went thro
 the viewer knew that address) moves onto the local network a moment later, without starting over.
 
 The **LanKVM server** field under internet access on This Mac picks another server (`host:port`),
-or none when left empty: then paired Macs reach the Mac only directly, as below. It has to be on
-the internet (paired Macs don't use one on a local network), and changing it ends the sessions
-relayed through the old one. The server is the `lankvm-rendezvous` service in the hivex-crm
-repository.
+or none when left empty: then paired Macs reach the Mac through the BitTorrent DHT (below), or
+directly through its router. It has to be on the internet (paired Macs don't use one on a local
+network), and changing it ends the sessions relayed through the old one. The server is the
+`lankvm-rendezvous` service in the hivex-crm repository.
+
+**With no server at all: the BitTorrent DHT.** Torrent apps find each other with no tracker
+through the "Mainline" DHT: millions of computers running torrent apps, each keeping a little of
+a shared table. LanKVM uses it the same way, so two paired Macs meet with no LanKVM server
+(**Find this Mac through the BitTorrent DHT** under internet access on This Mac, on by default;
+the same switch decides whether this Mac looks there as a viewer). A viewer looks there for a
+Mac that had internet access on when they last connected on the local network, as it does for
+the LanKVM server:
+
+1. The Mac to reach leaves a note on the DHT for each paired Mac: where it is (its public address
+   as DHT nodes see it, its IPv6 address, its address on its own network) and which DHT nodes it
+   watches for requests. The note is signed and encrypted with a key only the two Macs have (made
+   from the access key), so the nodes storing it learn nothing, and nobody else can write one the
+   other Mac accepts. Its place on the DHT changes every day.
+2. The other Mac finds the note (one lookup, usually a second or two), leaves a request with its
+   own addresses at the nodes the note names, and sends a few packets toward the host. Where the
+   host can be reached without punching (its router forwards the port, an IPv6 firewall lets it
+   in, or both Macs are on one network), it connects right away, in about a second.
+3. The host checks those nodes every 2 seconds. When the request comes, it sends a few packets
+   straight at the viewer, which opens its router for the viewer's packets, and answers in its
+   note. The viewer connects the moment the host's packets arrive (they also say where the host
+   is), or when the answer appears: usually 3–6 seconds in all (measured from a home connection
+   on the public DHT), up to about 9 just after the host restarted, against well under a second
+   through the LanKVM server, which is why both are tried at once when a server is set.
+
+From then on the session is the same as through the server's introduction: straight from Mac to
+Mac, the same latency, knock and TLS included. What the DHT can't do is relay: where neither
+router lets a direct path through (one that gives every destination its own outside port, or
+carrier-grade NAT), only the LanKVM server's relay gets through over IPv4. Over IPv6 there is no
+address translation to get around, only the firewalls in front of each Mac, which the same packets
+open, so two Macs with IPv6 (most home connections, many phone networks) connect directly even
+there. This Mac's card shows where DHT nodes see it, and warns when its router changes ports.
+
+LanKVM joins the DHT through a few well-known nodes (`dht.libtorrent.org`,
+`dht.transmissionbt.com`, BitTorrent's own) the first time, then through the nodes it met last
+time (`dht-nodes.txt` in its data directory). It never answers DHT queries (it joins read-only, as
+BEP 43 allows), so its port still looks closed to strangers; while internet access is on, the host
+sends a few small packets every 2 seconds per paired Mac.
+
+**From the terminal.** `cargo run --release -p transport --example dht -- check` joins the DHT,
+says where DHT nodes see this Mac and whether its router lets punching through, and checks that a
+second client finds what it stores there. Two Macs with nothing but the terminal, the DHT and no
+server (build once with `cargo build --release -p lankvm-core --examples`):
+
+```bash
+target/release/examples/probe host --no-server
+```
+
+on the Mac to reach (a headless host: it prints its fingerprint, the code to pair with, and how
+it does on the DHT; `--no-video` if the terminal hasn't got Screen Recording permission), then on
+the other Mac, once on the same network to pair (the address the host printed):
+
+```bash
+target/release/examples/probe 192.168.1.20:47800
+```
+
+and from anywhere after that, through the DHT and no other way:
+
+```bash
+target/release/examples/probe lankvm:<fingerprint> --only-dht
+```
 
 **A direct path through the router (optional).** LanKVM also asks the router to forward its UDP
 port (macOS speaks UPnP, NAT-PMP and PCP for it). When the router does, the card shows the
@@ -479,6 +541,20 @@ and unlocked while it runs.
   alter a session (TLS 1.3 end to end, with the certificates pinned) or pose as either Mac. The
   worst it can do is refuse its service, or introduce a Mac to the wrong address, where the
   session fails like any wrong address would.
+- **The BitTorrent DHT** stores a host's notes and its viewers' requests, a few hundred bytes each,
+  sealed (ChaCha20-Poly1305) and signed (Ed25519) with keys derived from the pair's access key.
+  The nodes storing them see the public addresses of the Macs that store and fetch them, and when,
+  but not what they say or which Macs they belong to; the keys, and so the notes' places on the
+  DHT, change every day. A note or request that doesn't open with the pair's key is ignored, as is
+  a request older than 10 minutes or seen before. The worst a node can do is keep a note back,
+  or serve an older one, and the connection fails or waits like through a server that refuses.
+  Notes are kept only on nodes whose ID follows from their IPv4 address (BEP 42), so sitting
+  where a pair's notes go takes control of many addresses, not just of IDs. The host only sends a few packets toward the addresses
+  in a genuine request, and they carry a value only the pair can make, so the viewer connects
+  only where the host really is; everything after that is the knock and TLS as above. Where DHT
+  nodes see the host is only ever told to its viewers inside its sealed notes: strangers say
+  it, so viewers don't keep it as an address to knock at. LanKVM never sends to an address a
+  DHT node names on a local network (loopback, private, link-local).
 - **Forget** revokes a viewer's key at once and ends its sessions. Turning internet access off
   stops all knocks and ends every session that came over the internet.
 - Pairing only happens on the local network: a host never shows a code for a connection from

@@ -82,7 +82,7 @@ enum Snapshot {
                                        into dir: URL) {
         let core = CoreModel.shared
         for (name, internet) in [("open", CoreModel.SampleInternet.open), ("setup", .setup), ("doublenat", .doubleNat), ("manual", .manual),
-                                 ("server", .server), ("noserver", .noServer)] {
+                                 ("server", .server), ("noserver", .noServer), ("dht", .dht), ("dht-symmetric", .dhtSymmetric)] {
             core.loadSampleState(screenAllowed: true, internet: internet)
             // The server's lines make the card longer: still down to the Macs connected now.
             let height: CGFloat = internet == .server || internet == .noServer ? 1250 : 1100

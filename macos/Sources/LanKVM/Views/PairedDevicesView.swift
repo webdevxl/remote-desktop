@@ -102,7 +102,7 @@ private struct HostRow: View {
                 if device.canConnect(device.connection) {
                     Button("Connect") { openWindow(id: "viewer", value: core.connect(to: device)) }
                         .buttonStyle(SecondaryButtonStyle())
-                        .help(connectHelp(device))
+                        .help(connectHelp(device, dht: core.host.internet.dht.enabled))
                 }
                 Button("Forget") { core.forget(device, canControlThisMac: false) }
                     .buttonStyle(SecondaryButtonStyle(destructive: true))

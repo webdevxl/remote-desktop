@@ -28,6 +28,12 @@
 //! they are dropped. Punches between Macs are dropped. Without a server, all of this costs one
 //! flag check per receive and a look at the destination address per send.
 //!
+//! The BitTorrent DHT client (see [`crate::dht`]) runs on the socket too, so the public address DHT
+//! nodes report is the one QUIC uses. While it runs, datagrams that look like its messages (a
+//! bencoded dictionary, never a QUIC packet) go to it through a channel of their own
+//! ([`Gate::take_dht_receiver`]), and punches whose nonce a viewer waits for tell it where the
+//! host punched from ([`Gate::watch_punches`]): its answer, arriving before any through the DHT.
+//!
 //! A relayed connection can move straight to its peer later, when the peer turns out to be
 //! reachable after all (both Macs on one network behind a router that doesn't hairpin): see
 //! [`DirectPath`]. quinn still knows the peer by the relay session's address; its packets go from
@@ -48,7 +54,8 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::sync::mpsc;
 
-use crate::cid::CidKey;
+use crate::cid::{CID_LEN, CidKey};
+use crate::dht::krpc;
 use crate::identity::{Fingerprint, short_hex};
 use crate::knock::{AccessKey, Budget, KNOCK_LEN, KnockKeys, ReplayCache, Seen, now_unix};
 use crate::net::is_local_network;
@@ -67,6 +74,10 @@ const RELAY_IDLE: Duration = Duration::from_secs(120);
 /// Control messages waiting for the core. More are dropped: anyone can send datagrams that claim
 /// to come from the server, so this mustn't grow without bound.
 const CONTROL_QUEUE: usize = 256;
+/// DHT messages waiting for the DHT client; more are dropped, as above.
+const DHT_QUEUE: usize = 512;
+/// Punches a viewer hasn't looked at yet; more are dropped.
+const PUNCH_QUEUE: usize = 16;
 /// Relay sessions' addresses: 240.0.0.0/4, reserved, so no real peer has one.
 const RELAY_NET: u32 = 0xf000_0000;
 const RELAY_MASK: u32 = 0xf000_0000;
@@ -105,6 +116,35 @@ pub struct Gate {
     /// Whether the endpoint's socket is IPv6 (dual-stack), so quinn knows IPv4 addresses
     /// IPv4-mapped.
     socket_v6: AtomicBool,
+    /// Where DHT messages go while the DHT client runs, and whether it does: all a received
+    /// datagram costs when it doesn't.
+    dht: Mutex<Option<mpsc::Sender<(SocketAddr, Vec<u8>)>>>,
+    any_dht: AtomicBool,
+    /// Punch nonces viewers wait for, and where each tells about the punches.
+    punch_watches: Mutex<HashMap<rendezvous::Nonce, mpsc::Sender<SocketAddr>>>,
+    any_punch_watch: AtomicBool,
+}
+
+/// Tells about punches with one nonce until dropped (see [`Gate::watch_punches`]).
+pub struct PunchWatch {
+    gate: Arc<Gate>,
+    nonce: rendezvous::Nonce,
+    punches: mpsc::Receiver<SocketAddr>,
+}
+
+impl PunchWatch {
+    /// Where the next punch came from (in canonical form).
+    pub async fn next(&mut self) -> Option<SocketAddr> {
+        self.punches.recv().await
+    }
+}
+
+impl Drop for PunchWatch {
+    fn drop(&mut self) {
+        let mut watches = self.gate.punch_watches.lock().unwrap();
+        watches.remove(&self.nonce);
+        self.gate.any_punch_watch.store(!watches.is_empty(), Relaxed);
+    }
 }
 
 /// A rendezvous request whose token checked out (see [`Gate::check_token`]).
@@ -152,6 +192,10 @@ impl Gate {
             token_budget: Mutex::new(Budget::new(Instant::now())),
             epoch: Instant::now(),
             socket_v6: AtomicBool::new(false),
+            dht: Mutex::new(None),
+            any_dht: AtomicBool::new(false),
+            punch_watches: Mutex::default(),
+            any_punch_watch: AtomicBool::new(false),
         })
     }
 
@@ -218,6 +262,35 @@ impl Gate {
         receiver
     }
 
+    /// DHT messages as they arrive, each with where it came from (in canonical form), still
+    /// encoded (see [`krpc::decode`]): from now on, datagrams that look like DHT messages go here
+    /// and never to quinn. Each call makes a new channel and the previous receiver gets nothing
+    /// more; while the receiver lags by [`DHT_QUEUE`] messages, they are dropped.
+    pub fn take_dht_receiver(&self) -> mpsc::Receiver<(SocketAddr, Vec<u8>)> {
+        let (sender, receiver) = mpsc::channel(DHT_QUEUE);
+        *self.dht.lock().unwrap() = Some(sender);
+        self.any_dht.store(true, Relaxed);
+        receiver
+    }
+
+    /// Stops passing DHT messages on (the DHT client is gone); they go to quinn again, which
+    /// drops them.
+    pub fn stop_dht(&self) {
+        self.any_dht.store(false, Relaxed);
+        *self.dht.lock().unwrap() = None;
+    }
+
+    /// Tells, until the returned watch is dropped, where each punch carrying `nonce` comes from:
+    /// a viewer that asked a host to punch toward it learns the host did, and from where. Punches
+    /// never reach quinn either way.
+    pub fn watch_punches(self: &Arc<Self>, nonce: rendezvous::Nonce) -> PunchWatch {
+        let (tx, punches) = mpsc::channel(PUNCH_QUEUE);
+        let mut watches = self.punch_watches.lock().unwrap();
+        watches.insert(nonce, tx);
+        self.any_punch_watch.store(true, Relaxed);
+        PunchWatch { gate: self.clone(), nonce, punches }
+    }
+
     /// Starts relay session `sid` through `server` and returns the address that stands for the
     /// peer at its other end: connect to it, or accept from it, as from any address on the
     /// internet. It is in the form quinn uses on the endpoint's socket (IPv4-mapped on a
@@ -277,11 +350,42 @@ impl Gate {
 
     /// Decides on one receive, after unwrapping it in place if it is relayed. False drops it.
     fn accept_received(&self, buf: &mut [u8], meta: &mut RecvMeta) -> bool {
+        if (self.any_dht.load(Relaxed) || self.any_punch_watch.load(Relaxed)) && self.take_aside(&buf[..meta.len], meta) {
+            return false;
+        }
         // Without a server there is nothing but QUIC to expect.
         if self.any_server.load(Relaxed) && !self.demux(buf, meta) {
             return false;
         }
         self.allow_received(&buf[..meta.len], meta.stride, meta.addr)
+    }
+
+    /// Takes DHT messages and watched punches out of quinn's way, passing each on. True if it
+    /// took the receive.
+    fn take_aside(&self, data: &[u8], meta: &RecvMeta) -> bool {
+        // A batch of datagrams (Linux GRO; never on macOS) only ever holds QUIC packets.
+        if segment_len(meta) != data.len() {
+            return false;
+        }
+        let from = canonical(meta.addr);
+        if rendezvous::is_punch(data) && self.any_punch_watch.load(Relaxed) {
+            let nonce: rendezvous::Nonce = data[rendezvous::PUNCH_MAGIC.len()..].try_into().expect("punch length");
+            if let Some(watch) = self.punch_watches.lock().unwrap().get(&nonce) {
+                let _ = watch.try_send(from);
+                return true;
+            }
+            return false;
+        }
+        // Looks like a bencoded dictionary, and isn't a short header for one of this endpoint's
+        // connections that happens to start the same way (1 in 2^40 for a real one).
+        if self.any_dht.load(Relaxed) && krpc::looks_like_krpc(data) && !self.cid_key.is_ours(&data[1..1 + CID_LEN]) {
+            if let Some(dht) = &*self.dht.lock().unwrap() {
+                // When full, it is lost like any datagram.
+                let _ = dht.try_send((from, data.to_vec()));
+            }
+            return true;
+        }
+        false
     }
 
     /// Takes what comes from a rendezvous server out of quinn's way, and drops punches. False if
@@ -1357,6 +1461,45 @@ mod tests {
         let (data, stride, _) = receive_batch(&gate, &batch, 30, server()).unwrap();
         assert_eq!((data, stride), ([&packet(1)[..], &packet(2)[..10]].concat(), 21));
         assert_eq!(receive_batch(&gate, &[message.clone(), message].concat(), 21, server()), None);
+    }
+
+    #[tokio::test]
+    async fn watched_punches_say_where_they_came_from() {
+        let gate = Gate::new();
+        let mut watch = gate.watch_punches([2; 16]);
+        let lan: SocketAddr = "192.168.1.20:4000".parse().unwrap();
+        assert_eq!(receive(&gate, &punch(&[2; 16]), internet()), None);
+        assert_eq!(receive(&gate, &punch(&[2; 16]), lan), None, "from the local network too");
+        assert_eq!(watch.next().await, Some(internet()));
+        assert_eq!(watch.next().await, Some(lan));
+        // Punches nobody waits for are left as they were.
+        assert!(receive(&gate, &punch(&[3; 16]), internet()).is_some());
+        drop(watch);
+        assert!(receive(&gate, &punch(&[2; 16]), internet()).is_some());
+        assert!(!gate.any_punch_watch.load(Relaxed));
+    }
+
+    #[tokio::test]
+    async fn dht_messages_go_to_the_dht_and_never_to_quinn() {
+        let gate = Gate::new();
+        let message = crate::dht::krpc::error(b"abcd", 201, "generic error");
+        // Without a DHT it reads as a short header, which quinn drops (no connection ID of ours).
+        assert!(receive(&gate, &message, internet()).is_some());
+        let mut dht = gate.take_dht_receiver();
+        assert_eq!(receive(&gate, &message, internet()), None);
+        assert_eq!(dht.recv().await, Some((internet(), message.clone())));
+        // A short header for one of this endpoint's connections that happens to read like one
+        // still goes to quinn.
+        let mut short = vec![b'd'];
+        short.extend_from_slice(&our_cid(&gate));
+        short.extend_from_slice(b"1:aXXXXXXXXXXe");
+        let mut fake = short.clone();
+        fake[1..9].copy_from_slice(b"1:ad2:id");
+        assert!(crate::dht::krpc::looks_like_krpc(&fake));
+        assert!(receive(&gate, &short, internet()).is_some());
+        gate.stop_dht();
+        assert!(receive(&gate, &message, internet()).is_some());
+        assert!(dht.try_recv().is_err());
     }
 
     #[test]

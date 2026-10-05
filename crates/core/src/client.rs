@@ -30,6 +30,7 @@ use crate::Trust;
 use crate::address_book::Via;
 use crate::clipboard::{Clipboard, Note, SessionClipboard};
 use crate::microphone::{MicGuard, Microphone};
+use crate::dht::{DhtRendezvous, NotListed};
 use crate::rendezvous::{Elsewhere, RelaySession, Rendezvous};
 use crate::stats::{FrameTiming, Stats, StatsView};
 use crate::view::{TileImage, ViewHandle, ViewSlot};
@@ -245,6 +246,7 @@ impl Session {
         network: Network,
         trust: Arc<Trust>,
         rendezvous: Arc<Rendezvous>,
+        dht: Arc<DhtRendezvous>,
         target: String,
         max_size: (u32, u32),
         max_fps: u32,
@@ -266,6 +268,7 @@ impl Session {
                 let ctx = RunCtx {
                     trust,
                     rendezvous,
+                    dht,
                     max_size,
                     max_fps,
                     shared,
@@ -417,6 +420,7 @@ async fn resolve(target: &str) -> Result<SocketAddr> {
 struct RunCtx {
     trust: Arc<Trust>,
     rendezvous: Arc<Rendezvous>,
+    dht: Arc<DhtRendezvous>,
     max_size: (u32, u32),
     /// The viewer screen's refresh rate: no point streaming faster.
     max_fps: u32,
@@ -443,8 +447,8 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
     let via = paired.map_or(Via::Auto, |host| ctx.trust.address_book.lock().unwrap().via(&host));
     let (conn, addr, internet, relay) = match paired {
         Some(host) => {
-            let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, None, via).await?;
-            let addr = conn.remote_address();
+            let Reached { conn, internet, relay } = connect_to_paired(&network, &ctx.rendezvous, &ctx.dht, &ctx.trust, host, None, via).await?;
+            let addr = crate::canonical(conn.remote_address());
             (conn, addr, internet, relay)
         }
         None => {
@@ -456,13 +460,13 @@ async fn run(network: Network, target: &str, mut ctx: RunCtx) -> Result<()> {
             let known = internet.then(|| ctx.trust.internet_hosts.lock().unwrap().known_at(target, addr, &ctx.trust.hosts.lock().unwrap())).flatten();
             if let Some(host) = known {
                 let Reached { conn, internet, relay } =
-                    connect_to_paired(&network, &ctx.rendezvous, &ctx.trust, host, Some(target), Via::Auto).await?;
-                let addr = conn.remote_address();
+                    connect_to_paired(&network, &ctx.rendezvous, &ctx.dht, &ctx.trust, host, Some(target), Via::Auto).await?;
+                let addr = crate::canonical(conn.remote_address());
                 (conn, addr, internet, relay)
             } else if internet && ctx.trust.internet_hosts.lock().unwrap().any_server(&ctx.trust.hosts.lock().unwrap()) {
                 // An IP this Mac doesn't know: its paired Macs' LanKVM servers can say whose it is.
                 let Reached { conn, internet, relay } = connect_by_ip(&network, &ctx.rendezvous, &ctx.trust, target, addr).await?;
-                let addr = conn.remote_address();
+                let addr = crate::canonical(conn.remote_address());
                 (conn, addr, internet, relay)
             } else {
                 let conn = if internet {
@@ -942,8 +946,8 @@ struct Reached {
 
 /// Connects to paired host `host` by name, the way `via` says. Automatically: at its address on
 /// the local network (where this Mac last reached it there, and where it says it is), at every
-/// address on the internet it announced or was reached at, and through its LanKVM server, all at
-/// once. The first to reach that host wins, and the others are given up (a relay session one of
+/// address on the internet it announced or was reached at, through its LanKVM server, and through
+/// the BitTorrent DHT (no server at all), all at once. The first to reach that host wins, and the others are given up (a relay session one of
 /// them started ends), except that a connection over the internet that comes first waits up to
 /// [`LAN_GRACE`] for one at an address on this Mac's network, still being tried, which wins if it
 /// comes in time. `Via::Local` and `Via::Internet` try only the ways on that network. `typed`: an
@@ -951,6 +955,7 @@ struct Reached {
 async fn connect_to_paired(
     network: &Network,
     rendezvous: &Arc<Rendezvous>,
+    dht: &Arc<DhtRendezvous>,
     trust: &Trust,
     host: Fingerprint,
     typed: Option<&str>,
@@ -964,21 +969,30 @@ async fn connect_to_paired(
     let who = name.clone().unwrap_or_else(|| "That Mac".to_string());
     let within = name.unwrap_or_else(|| "that Mac".to_string());
     let way = trust.internet_hosts.lock().unwrap().way_to(&host);
+    // Tests (`probe --only-dht`): the DHT and nothing else.
+    let only_dht = dht.only();
     // Its addresses on its own network: the way to it when both are at home.
-    let local = if via == Via::Internet { Vec::new() } else { local_addresses(trust, &host) };
+    let local = if via == Via::Internet || only_dht { Vec::new() } else { local_addresses(trust, &host) };
     let (key, mut addresses, server) = match way {
+        Some(way) if only_dht => (Some(way.key), Vec::new(), None),
         Some(way) if via != Via::Local => (Some(way.key), way.addresses, way.rendezvous),
         Some(way) => (Some(way.key), Vec::new(), None),
         None => (None, Vec::new(), None),
     };
     if let Some(typed) = typed
         && via != Via::Local
+        && !only_dht
         && key.is_some()
         && !addresses.iter().any(|a| crate::internet::same_address(a, typed))
     {
         addresses.insert(0, typed.trim().to_string());
     }
-    if local.is_empty() && addresses.is_empty() && server.is_none() {
+    // A host that had internet access on when it last connected (it said where it is on the
+    // internet, or on its network, or named its server) may be on the DHT; one that never did
+    // isn't looked for there.
+    let had_internet = trust.internet_hosts.lock().unwrap().reachable(&host, true);
+    let through_dht = (only_dht || (via != Via::Local && had_internet)) && key.is_some() && dht.available() && !rendezvous.force_relay();
+    if local.is_empty() && addresses.is_empty() && server.is_none() && !through_dht {
         match via {
             Via::Local => bail!(
                 "This Mac doesn't know where {within} is on the local network yet. Type its address in Connect once (This Mac in \
@@ -1022,9 +1036,19 @@ async fn connect_to_paired(
             (Attempt::Server, reached)
         });
     }
+    if through_dht && let Some(key) = key {
+        let (network, dht, within) = (network.clone(), dht.clone(), within.clone());
+        // The internet only: an address that leads to the local network here isn't a way.
+        let lan_ok = via != Via::Internet;
+        attempts.spawn(async move {
+            let reached =
+                dht.connect(&within, key, host, lan_ok).await.map(|conn| Reached { internet: network.gate.is_internet(conn.remote_address()), conn, relay: None });
+            (Attempt::Dht, reached)
+        });
+    }
     // Dropping the set (on an answer) gives up on the other attempts. A connection over the
     // internet that comes first is kept while the nearby ones may still win.
-    let (mut through_server, mut direct, mut on_lan) = (None, None, None);
+    let (mut through_server, mut through_dht, mut not_on_dht, mut direct, mut on_lan) = (None, None, None, None, None);
     let mut first: Option<(Reached, Attempt, Instant)> = None;
     loop {
         let next = match &first {
@@ -1062,6 +1086,8 @@ async fn connect_to_paired(
         tracing::info!(attempt = kind.name(), "couldn't reach {within} this way: {error:#}");
         match kind {
             Attempt::Server => &mut through_server,
+            Attempt::Dht if error.is::<NotListed>() => &mut not_on_dht,
+            Attempt::Dht => &mut through_dht,
             Attempt::Direct => &mut direct,
             Attempt::Lan { .. } => &mut on_lan,
         }
@@ -1077,9 +1103,16 @@ async fn connect_to_paired(
         log_reached(&within, &reached, kind);
         return Ok(reached);
     }
-    // What the server said is the surer news (the host isn't online, or doesn't answer); then
-    // what the address tried first came to. Its local network is likely not this Mac's: last.
-    Err(through_server.or(direct).or(on_lan).unwrap_or_else(|| anyhow!("Couldn't connect to {within}.")))
+    // What the server said is the surer news (the host isn't online, or doesn't answer), then
+    // what came of the host's note on the DHT; then what the address tried first came to. Its
+    // local network is likely not this Mac's. No note on the DHT (or no DHT at all) is news only
+    // when nothing else was tried: the host may never use it.
+    Err(through_server
+        .or(through_dht)
+        .or(direct)
+        .or(on_lan)
+        .or(not_on_dht)
+        .unwrap_or_else(|| anyhow!("Couldn't connect to {within}.")))
 }
 
 /// Says in the log which way a paired host was reached.
@@ -1093,6 +1126,8 @@ fn log_reached(within: &str, reached: &Reached, kind: Attempt) {
 enum Attempt {
     /// Through its LanKVM server.
     Server,
+    /// Through the BitTorrent DHT.
+    Dht,
     /// At an address on the internet it announced or was reached at.
     Direct,
     /// At its address on its own local network; `near` when that is on this Mac's network too.
@@ -1116,6 +1151,7 @@ impl Attempt {
     fn name(self) -> &'static str {
         match self {
             Attempt::Server => "server",
+            Attempt::Dht => "BitTorrent DHT",
             Attempt::Direct => "direct",
             Attempt::Lan { .. } => "local network",
         }

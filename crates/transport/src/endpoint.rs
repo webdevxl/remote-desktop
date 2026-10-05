@@ -145,9 +145,21 @@ impl Network {
     }
 }
 
+/// The DHT client's datagrams leave from the endpoint's socket, so DHT nodes see (and report)
+/// the address QUIC uses.
+impl crate::dht::Wire for Network {
+    fn send<'a>(&'a self, to: SocketAddr, datagram: &'a [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(self.send_raw(to, datagram))
+    }
+}
+
 fn bind_socket(bind: SocketAddr) -> Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))?;
+    // An IPv6 socket takes IPv4 too (IPv4-mapped), whatever the system's default.
+    if bind.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
     // Best effort: the kernel clamps to kern.ipc.maxsockbuf.
     let _ = socket.set_recv_buffer_size(SOCKET_BUFFER);
     let _ = socket.set_send_buffer_size(SOCKET_BUFFER);

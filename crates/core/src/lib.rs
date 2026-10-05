@@ -6,6 +6,7 @@ mod address_book;
 mod client;
 mod clipboard;
 pub mod control;
+mod dht;
 mod displays;
 pub mod ffi;
 mod host;
@@ -19,7 +20,7 @@ mod view;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,6 +44,7 @@ pub use crate::stats::FrameTiming;
 use crate::address_book::AddressBook;
 use crate::client::{Session, SessionEvent, SessionInfo};
 use crate::clipboard::Clipboard;
+use crate::dht::DhtRendezvous;
 use crate::internet::{HostInternet, InternetHosts};
 use crate::microphone::{Microphone, Speaker};
 use crate::rendezvous::Rendezvous;
@@ -149,6 +151,8 @@ pub struct Core {
     host: Arc<host::HostCtx>,
     /// Introductions through LanKVM servers, as host and as viewer.
     rendezvous: Arc<Rendezvous>,
+    /// Introductions through the BitTorrent DHT, as host and as viewer: no server at all.
+    dht: Arc<DhtRendezvous>,
     events: EventSink,
     this_mac: ThisMac,
     recents: Mutex<Recents>,
@@ -202,6 +206,10 @@ pub struct CoreOptions {
     /// Tests: connecting to a paired Mac by fingerprint goes straight to its LanKVM server's
     /// relay, without trying its addresses or punching (`LANKVM_TEST_FORCE_RELAY=1`).
     pub force_relay: bool,
+    /// The nodes this Mac joins the BitTorrent DHT through, instead of the public ones
+    /// (`LANKVM_DHT_BOOTSTRAP`, comma-separated); empty turns the DHT off for the run. None: the
+    /// public ones. Tests set it, always: none may reach the real DHT.
+    pub dht_bootstrap: Option<Vec<String>>,
     /// The clipboard shared with the Macs this one controls or is controlled by
     /// (`LANKVM_CLIPBOARD`). Tests use pasteboards of their own, never the user's.
     pub clipboard: ClipboardBackend,
@@ -230,6 +238,11 @@ impl CoreOptions {
             // LanKVM server unless told to.
             rendezvous: std::env::var("LANKVM_RENDEZVOUS").ok().or_else(|| testing_internet().then(String::new)),
             force_relay: std::env::var("LANKVM_TEST_FORCE_RELAY").is_ok_and(|v| v == "1"),
+            // Nor does it join the real BitTorrent DHT.
+            dht_bootstrap: std::env::var("LANKVM_DHT_BOOTSTRAP")
+                .ok()
+                .map(|list| list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+                .or_else(|| testing_internet().then(Vec::new)),
             clipboard: ClipboardBackend::from_env(),
             audio: AudioBackend::from_env(),
         }
@@ -255,6 +268,7 @@ impl Core {
             loopback_is_internet,
             rendezvous: rendezvous_override,
             force_relay,
+            dht_bootstrap,
             clipboard,
             audio,
         } = options;
@@ -264,8 +278,7 @@ impl Core {
         let identity = DeviceIdentity::load_or_create(&dir)?;
         let network = {
             let _guard = rt.enter();
-            Network::bind(SocketAddr::from(([0, 0, 0, 0], port)), &identity)
-                .with_context(|| format!("Can't listen on UDP port {port}. Is LanKVM already running?"))?
+            bind_network(port, &identity).with_context(|| format!("Can't listen on UDP port {port}. Is LanKVM already running?"))?
         };
         if loopback_is_internet {
             tracing::warn!("loopback counts as the internet (LANKVM_TEST_LOOPBACK_IS_INTERNET)");
@@ -312,6 +325,15 @@ impl Core {
             loopback_is_internet || testing_internet(),
             rendezvous_override.as_deref().map(str::trim) == Some(DEFAULT_SERVER),
         );
+        // The public DHT unless told otherwise; never while loopback stands in for the internet
+        // (a test), unless a test names its own nodes.
+        let dht_bootstrap = match dht_bootstrap {
+            Some(nodes) if nodes.is_empty() => None,
+            Some(nodes) => Some(nodes),
+            None if loopback_is_internet || testing_internet() => None,
+            None => Some(transport::dht::DEFAULT_BOOTSTRAP.iter().map(|s| s.to_string()).collect()),
+        };
+        let dht = DhtRendezvous::start(network.clone(), rt.handle().clone(), events.clone(), &dir, dht_bootstrap, settings.dht);
         let internet = HostInternet::new(
             internet::load_or_create_secret(&dir)?,
             network.gate.clone(),
@@ -321,6 +343,7 @@ impl Core {
             settings.internet_access,
             settings.public_address.clone(),
             rendezvous.clone(),
+            dht.clone(),
         );
         if backend != control::Backend::Hid {
             tracing::warn!(?backend, "injected input is redirected (LANKVM_INJECT)");
@@ -370,6 +393,10 @@ impl Core {
             });
         }
         // Before the first connection: the gate starts with internet access off.
+        {
+            let internet = Arc::downgrade(&internet);
+            dht.set_addresses(move || internet.upgrade().map(|i| i.dht_addresses()).unwrap_or_default());
+        }
         internet.sync_keys();
         internet.apply_mapping();
         rendezvous.set_host_server(&rendezvous_server);
@@ -383,6 +410,7 @@ impl Core {
             trust,
             host,
             rendezvous,
+            dht,
             events,
             this_mac,
             recents: Mutex::new(recents),
@@ -410,6 +438,8 @@ impl Core {
         // a minute or so.
         let rendezvous = self.rendezvous.clone();
         self.rt.block_on(async move { rendezvous.shutdown().await });
+        // And remember the DHT nodes that answered, for the next start.
+        self.dht.shutdown();
         // Tell every peer (viewers of this Mac included) the connection is over, rather than
         // leaving them to time out, and give that a moment to go out.
         self.network.endpoint.close(0u32.into(), b"LanKVM quit");
@@ -454,7 +484,7 @@ impl Core {
                     alias: book.alias(fp),
                     local_address: book.local(fp).or_else(|| nearby().or(announced.first()).cloned()),
                     internet_address: internet.address(fp),
-                    reachable: internet.reachable(fp),
+                    reachable: internet.reachable(fp, self.dht.available()),
                     connection: Some(book.via(fp)),
                     ..device(fp, name)
                 }
@@ -557,6 +587,7 @@ impl Core {
             self.network.clone(),
             self.trust.clone(),
             self.rendezvous.clone(),
+            self.dht.clone(),
             target,
             max_size,
             max_fps,
@@ -710,6 +741,28 @@ impl Core {
 
     /// The LanKVM server ("host:port") this Mac registers with while internet access is on, so
     /// paired Macs reach it with no router setup; "" for none. Saved; takes effect at once.
+    /// Whether this Mac uses the BitTorrent DHT to meet paired Macs with no server, as host and
+    /// as viewer.
+    pub fn set_dht(&self, on: bool) {
+        self.host.set_dht(on);
+        // Whether paired Macs count as reachable over the internet depends on it.
+        (self.events)(Event::TrustChanged);
+    }
+
+    /// Tests: as a viewer, connects through the DHT only once the host punched or answered,
+    /// never straight to the addresses in its note (on loopback those always work).
+    #[doc(hidden)]
+    pub fn set_dht_wait_for_answer(&self, on: bool) {
+        self.dht.set_wait_for_answer(on);
+    }
+
+    /// Tests: as a viewer, reaches paired hosts through the BitTorrent DHT and no other way (not
+    /// on the local network, at addresses they announced, or through a LanKVM server).
+    #[doc(hidden)]
+    pub fn set_dht_only(&self, on: bool) {
+        self.dht.set_only(on);
+    }
+
     pub fn set_rendezvous_server(&self, address: &str) {
         self.host.set_rendezvous_server(address);
     }
@@ -922,6 +975,60 @@ fn init_logging() {
         Some(file) => builder.with_writer(std::io::stderr.and(Mutex::new(file))).try_init(),
         None => builder.try_init(),
     };
+}
+
+/// The endpoint on `port`, for IPv4 and IPv6 peers alike (IPv4 ones appear to quinn IPv4-mapped):
+/// over IPv6 there is no router address to get around, only a firewall that punching opens.
+/// IPv4 alone where IPv6 is off, or when told (`LANKVM_IPV4_ONLY=1`).
+fn bind_network(port: u16, identity: &DeviceIdentity) -> Result<Network> {
+    let v4 = SocketAddr::from(([0, 0, 0, 0], port));
+    if std::env::var("LANKVM_IPV4_ONLY").as_deref() == Ok("1") {
+        return Network::bind(v4, identity);
+    }
+    // macOS lets an IPv6 socket take a port another socket holds for IPv4, which then gets every
+    // IPv4 packet. So the port is taken for IPv4 first, which fails as it always did when it's
+    // in use (LanKVM already running), and gives port 0 one that's free for both; then let go
+    // once the dual-stack socket holds it too.
+    let held = std::net::UdpSocket::bind(v4)?;
+    let port = held.local_addr()?.port();
+    let network = Network::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)), identity);
+    drop(held);
+    match network {
+        Ok(network) => Ok(network),
+        Err(e) => {
+            tracing::info!("IPv4 only: couldn't listen on IPv6: {e:#}");
+            Network::bind(SocketAddr::from(([0, 0, 0, 0], port)), identity)
+        }
+    }
+}
+
+/// `addr` with an IPv4-mapped IPv6 address turned into the IPv4 one: how a peer's address is
+/// shown and stored (the endpoint's socket is dual-stack, so quinn knows IPv4 peers mapped).
+/// Other IPv6 addresses stay as they are, scope included.
+pub(crate) fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or(addr, |v4| SocketAddr::new(v4.into(), v6.port())),
+        SocketAddr::V4(_) => addr,
+    }
+}
+
+/// The IPv6 address this Mac sends from to the internet, if it has a global one: the address
+/// macOS picks (a temporary one, usually), which is where a peer reaches it over IPv6, as the
+/// firewall in front lets in answers to what went out from there.
+pub(crate) fn internet_v6() -> Option<Ipv6Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok()?;
+    // Sends nothing: connecting only picks the route, and the source address with it.
+    socket.connect(SocketAddr::from(([0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888], 53))).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V6(ip) if is_global_v6(ip) => Some(ip),
+        _ => None,
+    }
+}
+
+/// Global unicast (2000::/3), not documentation (2001:db8::/32) or Teredo (2001::/32).
+fn is_global_v6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    s[0] & 0xe000 == 0x2000 && !(s[0] == 0x2001 && (s[1] == 0x0db8 || s[1] == 0))
 }
 
 /// Whether `ip` belongs to this Mac (loopback or one of its interfaces).

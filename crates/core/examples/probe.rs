@@ -4,6 +4,25 @@
 //!
 //!   cargo run --release -p lankvm-core --example probe -- 127.0.0.1:47800 [--seconds 10] [--max 1920x1200]
 //!
+//! Over the internet with no server at all, through the BitTorrent DHT (see `probe host` below):
+//!
+//!   probe lankvm:<host fingerprint> --only-dht [--wait-for-answer]
+//!
+//! reaches a paired host through the DHT and no other way. `--wait-for-answer` connects only once
+//! the host has punched toward this Mac or answered on the DHT, never straight to the address in
+//! its note: the full exchange, even where the address would work at once (the same network).
+//!
+//! A headless host (no window; LanKVM's data in `~/Library/Application Support/lankvm-probe-host`
+//! or `$LANKVM_DATA_DIR`), with internet access on:
+//!
+//!   probe host [--port N] [--no-server] [--no-video] [--seconds N]
+//!
+//! prints its fingerprint (for `lankvm:<fingerprint>`), the PIN when a viewer pairs (on the local
+//! network, the first time), and how it does on the BitTorrent DHT: where DHT nodes see it,
+//! whether its router lets punching through, and when paired Macs can find it there.
+//! `--no-server` leaves the LanKVM server out (the DHT alone); `--no-video` streams nothing (no
+//! Screen Recording permission needed; viewers still connect). Runs until stopped, or --seconds.
+//!
 //! On first contact the host shows a PIN: type it here (one line on stdin). The probe keeps its
 //! own identity in `~/Library/Application Support/lankvm-probe` (or `$LANKVM_DATA_DIR`), so later
 //! runs connect without pairing. Exits 0 if frames were decoded, 1 otherwise.
@@ -121,6 +140,10 @@ struct Args {
     trace: Option<String>,
     /// Have the host play this probe's microphone (a tone, unless told otherwise).
     microphone: bool,
+    /// Reach a paired host through the BitTorrent DHT and no other way.
+    only_dht: bool,
+    /// Through the DHT, connect only once the host punched or answered.
+    wait_for_answer: bool,
 }
 
 enum Barcode {
@@ -171,6 +194,8 @@ fn parse_args() -> Result<Args, String> {
         barcode_scale: None,
         trace: None,
         microphone: false,
+        only_dht: false,
+        wait_for_answer: false,
     };
     let mut target = None;
     let mut arrangement = Arrangement::EXTEND;
@@ -207,12 +232,14 @@ fn parse_args() -> Result<Args, String> {
             }
             "--trace" => a.trace = Some(args.next().ok_or("--trace needs a file")?),
             "--microphone" => a.microphone = true,
+            "--only-dht" => a.only_dht = true,
+            "--wait-for-answer" => a.wait_for_answer = true,
             _ if target.is_none() && !arg.starts_with('-') => target = Some(arg),
             _ => return Err(format!("unexpected argument {arg}")),
         }
     }
     a.target = target.ok_or(
-        "usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--virtual WxH[@2x] [--arrange extend|main|only] [--refresh HZ]] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]] [--barcode-log FILE | --barcode X,Y,W,H [--barcode-scale S]] [--trace FILE] [--microphone]",
+        "usage: probe <host[:port]> [--seconds N] [--max WxH] [--fps N] [--virtual WxH[@2x] [--arrange extend|main|only] [--refresh HZ]] [--control [--script FILE] [--input-latency N --rect X,Y,W,H] [--display WxH]] [--barcode-log FILE | --barcode X,Y,W,H [--barcode-scale S]] [--trace FILE] [--microphone] [--only-dht [--wait-for-answer]]\n       probe host [--port N] [--no-server] [--no-video] [--seconds N]",
     )?;
     if (a.script.is_some() || a.latency.is_some()) && !a.control {
         return Err("--script and --input-latency need --control".into());
@@ -228,6 +255,9 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("host") {
+        return host::main();
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -273,6 +303,8 @@ fn main() -> ExitCode {
     };
     // A test tool leaves the clipboard of the Mac it runs on alone.
     core.set_share_clipboard(false);
+    core.set_dht_only(args.only_dht);
+    core.set_dht_wait_for_answer(args.wait_for_answer);
     let id = core.connect(&args.target, args.max, args.fps);
     let source = match &args.barcode {
         Some(Barcode::Log(path)) => Some(SourceLog::new(path)),
@@ -1776,6 +1808,136 @@ fn key_of(v: &Value) -> Result<(u16, bool), String> {
         return Ok((i as u16, true));
     }
     Err(format!("no key for {c:?}"))
+}
+
+/// `probe host`: a headless host with internet access on.
+mod host {
+    use std::process::ExitCode;
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    use lankvm_core::{AudioBackend, ClipboardBackend, Core, CoreOptions};
+    use serde_json::Value;
+
+    pub fn main() -> ExitCode {
+        let mut args = std::env::args().skip(2);
+        let (mut port, mut no_server, mut video, mut seconds, mut allow_control) = (None, false, true, None, false);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--port" => match args.next().and_then(|p| p.parse::<u16>().ok()) {
+                    Some(p) => port = Some(p),
+                    None => return usage("--port needs a number"),
+                },
+                "--no-server" => no_server = true,
+                "--no-video" => video = false,
+                "--allow-control" => allow_control = true,
+                "--seconds" => match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(s) => seconds = Some(Duration::from_secs(s)),
+                    None => return usage("--seconds needs a number"),
+                },
+                other => return usage(&format!("unexpected argument {other}")),
+            }
+        }
+        // Its own identity, apart from the app's and the viewer probe's. Set before the core
+        // starts any threads.
+        if std::env::var_os("LANKVM_DATA_DIR").is_none() {
+            let home = std::env::var("HOME").unwrap_or_default();
+            unsafe { std::env::set_var("LANKVM_DATA_DIR", format!("{home}/Library/Application Support/lankvm-probe-host")) };
+        }
+        match port {
+            Some(port) => unsafe { std::env::set_var("LANKVM_PORT", port.to_string()) },
+            None if std::env::var_os("LANKVM_PORT").is_none() => unsafe { std::env::set_var("LANKVM_PORT", "0") },
+            None => {}
+        }
+        let mut options = CoreOptions::from_env();
+        options.video = video;
+        // A test host shares neither this Mac's clipboard nor its speakers.
+        options.clipboard = ClipboardBackend::Off;
+        options.audio = AudioBackend::OFF;
+        let data_dir = options.data_dir.clone();
+        let fingerprint = match transport::identity::DeviceIdentity::load_or_create(&data_dir) {
+            Ok(id) => id.fingerprint.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            Err(e) => {
+                eprintln!("identity: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let (tx, events) = mpsc::channel();
+        let core = match Core::start_with(Arc::new(move |e| drop(tx.send(e))), options) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("start: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // Viewers only look, unless told: their input would land on this Mac.
+        core.set_allow_control(allow_control);
+        if no_server {
+            core.set_rendezvous_server("");
+        }
+        core.set_dht(true);
+        core.set_internet_access(true);
+        let this = core.this_mac();
+        println!("host: {} on UDP port {}, data in {}", this.name, this.port, data_dir.display());
+        println!("connect from another Mac: probe lankvm:{fingerprint} --only-dht");
+        println!("(pair first on the same network: probe {}:{})", this.addresses.first().map_or("127.0.0.1", String::as_str), this.port);
+
+        let started = Instant::now();
+        let mut last = String::new();
+        loop {
+            if seconds.is_some_and(|s| started.elapsed() >= s) {
+                break;
+            }
+            // Any event, or a second: then look at the status.
+            let _ = events.recv_timeout(Duration::from_secs(1));
+            let status = serde_json::to_value(core.host_status()).unwrap_or(Value::Null);
+            let line = summary(&status);
+            if line != last {
+                println!("[{:>5.1}s] {line}", started.elapsed().as_secs_f64());
+                last = line;
+            }
+        }
+        core.shutdown();
+        ExitCode::SUCCESS
+    }
+
+    fn usage(problem: &str) -> ExitCode {
+        eprintln!("{problem}\nusage: probe host [--port N] [--no-server] [--no-video] [--allow-control] [--seconds N]");
+        ExitCode::from(2)
+    }
+
+    /// One line on how the host does: the DHT, the LanKVM server, the router, viewers, PINs.
+    fn summary(status: &Value) -> String {
+        let internet = &status["internet"];
+        let dht = &internet["dht"];
+        let mut parts = vec![format!(
+            "DHT {}{}{}",
+            dht["state"].as_str().unwrap_or("?"),
+            dht["observed"].as_str().map(|a| format!(", seen at {a}")).unwrap_or_default(),
+            match (dht["symmetric"].as_bool(), dht["nodes"].as_u64()) {
+                (Some(true), _) => ", router changes ports per destination (punching won't work)".to_string(),
+                (_, Some(n)) if n > 0 => format!(", {n} nodes"),
+                _ => String::new(),
+            }
+        )];
+        let server = internet["server"]["state"].as_str().unwrap_or("off");
+        if server != "off" {
+            parts.push(format!("server {server}"));
+        }
+        parts.push(format!("router {}", internet["problem"].as_str().or(internet["state"].as_str()).unwrap_or("?")));
+        for v in status["viewers"].as_array().into_iter().flatten() {
+            parts.push(format!(
+                "viewer {} at {}{}",
+                v["name"].as_str().unwrap_or("?"),
+                v["address"].as_str().unwrap_or("?"),
+                if v["internet"] == true { " (internet)" } else { "" }
+            ));
+        }
+        for p in status["pairing"].as_array().into_iter().flatten() {
+            parts.push(format!("PAIRING {}: PIN {}", p["name"].as_str().unwrap_or("?"), p["pin"].as_str().unwrap_or("?")));
+        }
+        parts.join(" | ")
+    }
 }
 
 #[cfg(test)]

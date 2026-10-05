@@ -52,6 +52,9 @@ pub struct HostSettings {
     /// The LanKVM server this Mac registers with while internet access is on, so paired Macs
     /// reach it with no router setup ("host:port"). "" turns that off, and stays off.
     pub rendezvous_server: String,
+    /// Whether this Mac meets paired Macs through the BitTorrent DHT too, with no server: as a
+    /// host while internet access is on, and as a viewer.
+    pub dht: bool,
 }
 
 impl Default for HostSettings {
@@ -61,6 +64,7 @@ impl Default for HostSettings {
             internet_access: false,
             public_address: String::new(),
             rendezvous_server: transport::rendezvous::DEFAULT_SERVER.to_string(),
+            dht: true,
         }
     }
 }
@@ -799,11 +803,13 @@ mod tests {
         assert!(HostSettings::load(&path).allow_control);
         assert!(!HostSettings::load(&path).internet_access, "internet access is opt-in");
         assert_eq!(HostSettings::load(&path).rendezvous_server, "178.156.129.211:3478");
+        assert!(HostSettings::load(&path).dht, "the BitTorrent DHT is on with internet access");
         let saved = HostSettings {
             allow_control: false,
             internet_access: true,
             public_address: "home.example.com".into(),
             rendezvous_server: "rendezvous.example.com:3478".into(),
+            dht: false,
         };
         saved.save(&path).unwrap();
         assert_eq!(HostSettings::load(&path), saved);

@@ -1659,6 +1659,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "postcard",
  "protocol",
  "quinn",
  "quinn-proto",
@@ -1671,6 +1672,7 @@ dependencies = [
  "spake2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

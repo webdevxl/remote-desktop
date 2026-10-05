@@ -105,6 +105,8 @@ struct InternetStatus: Equatable {
     var ignored: UInt64 = 0
     /// The LanKVM server that introduces paired Macs to this one, with no router setup.
     var server = InternetServer()
+    /// The BitTorrent DHT, through which paired Macs find this one with no server.
+    var dht = InternetDHT()
 
     /// Paired Macs can reach this one directly: the router forwards the port, or nothing needs
     /// forwarding.
@@ -113,8 +115,13 @@ struct InternetStatus: Equatable {
     /// Paired Macs can reach this one through the LanKVM server, whatever the router does.
     var viaServer: Bool { enabled && server.state == .registered }
 
-    /// Paired Macs can reach this one, one way or the other.
-    var isReachable: Bool { isOpen || viaServer }
+    /// Paired Macs find this one through the BitTorrent DHT and punch through both routers, with
+    /// no server. Not when this Mac's router gives each destination its own port: punching
+    /// through it fails.
+    var viaDHT: Bool { enabled && dht.state == .listed && !dht.symmetric }
+
+    /// Paired Macs can reach this one, one way or another.
+    var isReachable: Bool { isOpen || viaServer || viaDHT }
 
     /// Nothing on this Mac or its router can fix it: the network itself keeps the internet out.
     var isUnreachable: Bool {
@@ -138,7 +145,7 @@ struct InternetStatus: Equatable {
 
 extension InternetStatus: Decodable {
     private enum CodingKeys: String, CodingKey {
-        case enabled, state, problem, externalAddress, routerAddress, localAddress, port, publicAddress, announced, ignored, server
+        case enabled, state, problem, externalAddress, routerAddress, localAddress, port, publicAddress, announced, ignored, server, dht
     }
 
     /// Every field is optional. A state this app doesn't know is shown as a problem it can't name
@@ -158,6 +165,7 @@ extension InternetStatus: Decodable {
         announced = c.lenient([String].self, .announced) ?? []
         ignored = c.lenient(UInt64.self, .ignored) ?? 0
         server = c.lenient(InternetServer.self, .server) ?? InternetServer()
+        dht = c.lenient(InternetDHT.self, .dht) ?? InternetDHT()
     }
 }
 
@@ -199,6 +207,56 @@ extension InternetServer: Decodable {
         let stateName = c.lenient(String.self, .state)
         state = stateName.flatMap(State.init) ?? (stateName != nil && !address.isEmpty ? .other : .off)
         observed = c.lenient(String.self, .observed).flatMap { $0.isEmpty ? nil : $0 }
+    }
+}
+
+/// The BitTorrent DHT (`dht` in `InternetView`, `DhtView` in crates/core): for each paired Mac,
+/// this Mac keeps a note there that only that Mac can read, saying where to find it. No server
+/// takes part.
+struct InternetDHT: Equatable {
+    enum State: String {
+        /// The setting is off, or internet access is.
+        case off
+        /// No paired Mac to keep a note for yet.
+        case idle
+        /// Finding DHT nodes and placing its notes.
+        case joining
+        /// Paired Macs can find this Mac there.
+        case listed
+        /// No DHT node answers (UDP blocked). The core keeps trying.
+        case unreachable
+        /// A state this app doesn't know: nothing is said about the DHT, and the router's status
+        /// and steps show as if it were off.
+        case other
+    }
+
+    /// The setting: this Mac uses the DHT, as host and as viewer.
+    var enabled = false
+    var state = State.off
+    /// Where DHT nodes see this Mac on the internet ("203.0.113.7:47800").
+    var observed: String?
+    /// This Mac's router gives each destination a port of its own: paired Macs can't punch
+    /// through it.
+    var symmetric = false
+    /// DHT nodes that answered lately.
+    var nodes = 0
+}
+
+extension InternetDHT: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case enabled, state, observed, symmetric, nodes
+    }
+
+    /// A state this app doesn't know promises nothing either way, and hides none of the router's
+    /// guidance.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = c.lenient(Bool.self, .enabled) ?? false
+        let stateName = c.lenient(String.self, .state)
+        state = stateName.flatMap(State.init) ?? (stateName != nil && enabled ? .other : .off)
+        observed = c.lenient(String.self, .observed).flatMap { $0.isEmpty ? nil : $0 }
+        symmetric = c.lenient(Bool.self, .symmetric) ?? false
+        nodes = c.lenient(Int.self, .nodes) ?? 0
     }
 }
 
@@ -347,7 +405,7 @@ enum ConnectionType: String, CaseIterable, Identifiable {
     case auto
     /// Only at its address on the local network.
     case local
-    /// Only over the internet: its addresses there and its LanKVM server.
+    /// Only over the internet: its addresses there, its LanKVM server and the BitTorrent DHT.
     case internet
 
     var id: Self { self }

@@ -47,6 +47,7 @@ impl Peer {
             loopback_is_internet: false,
             rendezvous: Some(String::new()),
             force_relay: false,
+            dht_bootstrap: Some(Vec::new()),
             clipboard: ClipboardBackend::Off,
             audio,
         };

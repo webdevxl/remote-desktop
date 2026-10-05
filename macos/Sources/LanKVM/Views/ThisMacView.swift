@@ -394,17 +394,22 @@ private struct MicrophoneCard: View {
     }
 }
 
-/// Whether paired Macs can reach this Mac over the internet: through the LanKVM server, with no
-/// router setup, or directly once the router forwards the port; and what to change on the router
-/// when neither works.
+/// Whether paired Macs can reach this Mac over the internet: through the LanKVM server or the
+/// BitTorrent DHT, with no router setup, or directly once the router forwards the port; and what
+/// to change on the router when none of them works.
 private struct InternetAccessCard: View {
     @EnvironmentObject private var core: CoreModel
 
     private var internet: InternetStatus { core.host.internet }
     private var server: InternetServer { core.host.internet.server }
+    private var dht: InternetDHT { core.host.internet.dht }
 
     private var enabled: Binding<Bool> {
         Binding(get: { core.host.internet.enabled }, set: { core.setInternetAccess($0) })
+    }
+
+    private var dhtEnabled: Binding<Bool> {
+        Binding(get: { core.host.internet.dht.enabled }, set: { core.setDHT($0) })
     }
 
     var body: some View {
@@ -431,6 +436,7 @@ private struct InternetAccessCard: View {
                             .padding(.top, 2)
                         if internet.enabled {
                             serverStatus
+                            dhtStatus
                             progress
                         }
                     }
@@ -445,6 +451,8 @@ private struct InternetAccessCard: View {
                     }
                     CardDivider()
                     AddressFieldRow(field: .publicAddress, saved: internet.publicAddress)
+                    CardDivider()
+                    dhtRow
                     CardDivider()
                     AddressFieldRow(field: .server, saved: server.address)
                 }
@@ -479,24 +487,74 @@ private struct InternetAccessCard: View {
         }
     }
 
-    /// Only the router's way in is left: say whether there is one. The router's status below
-    /// says what's wrong with it.
+    /// How the BitTorrent DHT is doing, when it's on: the way in that needs neither a server nor
+    /// router setup. A router that gives each destination its own port defeats it, unless it
+    /// forwards LanKVM's port.
+    @ViewBuilder private var dhtStatus: some View {
+        switch dht.state {
+        case .joining, .listed:
+            if dht.symmetric && !internet.isOpen {
+                StatusLine(icon: "exclamationmark.triangle.fill", tint: .lkWarning,
+                           text: "Your router gives each connection its own port, so paired Macs can’t reach this Mac directly through it; the LanKVM server’s relay still can.",
+                           detail: server.address.isEmpty ? "Enter a LanKVM server below to use its relay." : nil)
+                    .padding(.top, 2)
+            } else if dht.state == .listed {
+                StatusLine(icon: "checkmark.circle.fill", tint: .lkSuccess,
+                           text: "Reachable from anywhere through the BitTorrent DHT — no server, no router setup.",
+                           detail: dht.observed.map { "DHT nodes see this Mac at \($0)." })
+                    .padding(.top, 2)
+            } else {
+                StatusLine(icon: "arrow.triangle.2.circlepath", text: "Joining the BitTorrent DHT…")
+                    .padding(.top, 2)
+            }
+        case .unreachable:
+            StatusLine(icon: "exclamationmark.triangle.fill", tint: .lkWarning,
+                       text: "No BitTorrent DHT node answers.", detail: "UDP may be blocked on this network. LanKVM keeps trying.")
+                .padding(.top, 2)
+        case .off, .idle, .other:
+            EmptyView()
+        }
+    }
+
+    /// The BitTorrent DHT: a way in that needs neither a server nor router setup.
+    private var dhtRow: some View {
+        HStack(alignment: .top, spacing: 12) {
+            IconBadge(systemName: "point.3.connected.trianglepath.dotted")
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle("Find this Mac through the BitTorrent DHT", isOn: dhtEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .font(.system(size: 13, weight: .medium))
+                Text("No server: this Mac leaves a note only your Macs can read on the network torrent apps use.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.lkSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+    }
+
+    /// The server's way in is gone: say which are left. The router's status below says what's
+    /// wrong with it.
     private var unreachableDetail: String {
         if internet.isOpen { return "LanKVM keeps trying. Meanwhile, paired Macs connect through your router." }
+        if internet.viaDHT { return "LanKVM keeps trying. Meanwhile, paired Macs find this Mac through the BitTorrent DHT." }
         if internet.isManual { return "LanKVM keeps trying. Until it gets through, paired Macs can only connect directly, through your router." }
         return "LanKVM keeps trying. Until it gets through, paired Macs can't connect over the internet."
     }
 
     /// While the router is asked, or what's wrong and how to fix it. Once the LanKVM server
-    /// introduces paired Macs, the router only matters for a direct connection.
+    /// introduces paired Macs, the router only matters for a direct connection; once the
+    /// BitTorrent DHT does, that connection is direct already.
     @ViewBuilder private var progress: some View {
         if internet.isManual {
             Text(manualText)
                 .font(.system(size: 12))
                 .foregroundStyle(Color.lkSecondary)
                 .fixedSize(horizontal: false, vertical: true)
-        } else if server.state == .registered {
-            if !internet.isOpen && internet.state == .problem && internet.canForwardByHand {
+        } else if server.state == .registered || internet.viaDHT {
+            if !internet.viaDHT && !internet.isOpen && internet.state == .problem && internet.canForwardByHand {
                 Text(directText)
                     .font(.system(size: 12))
                     .foregroundStyle(Color.lkSecondary)
@@ -564,6 +622,9 @@ private struct InternetAccessCard: View {
         }
         if internet.viaServer {
             return "Macs that paired with this one on your network can connect over the internet; anyone else gets no answer. The LanKVM server only introduces your Macs to each other. When routers block a direct path, it passes their traffic along, encrypted so that it can't read it."
+        }
+        if internet.viaDHT {
+            return "Macs that paired with this one on your network can connect over the internet; anyone else gets no answer. They find each other through the BitTorrent DHT — the network torrent apps use — with no server: this Mac leaves an encrypted note there that only your Macs can read."
         }
         if internet.isOpen {
             return "Macs that paired with this one on your network can connect over the internet. Anyone else on the internet gets no answer."
@@ -734,11 +795,14 @@ private struct AddressFieldRow: View {
         }
     }
 
-    /// Empty, the server field shows the usual server as its placeholder: say that it's off.
+    /// Empty, the server field shows the usual server as its placeholder: say that it's off, and
+    /// which ways in are left.
     private var note: String {
         switch field {
         case .publicAddress:
             "If your router's address changes, use a dynamic DNS name here. Paired Macs learn it the next time they connect."
+        case .server where saved.isEmpty && core.host.internet.dht.enabled:
+            "Off: paired Macs find this Mac through the BitTorrent DHT or your router. Enter a LanKVM server to connect even when routers block a direct path."
         case .server where saved.isEmpty:
             "Off: paired Macs reach this Mac only through your router. Enter a LanKVM server to connect with no router setup."
         case .server:

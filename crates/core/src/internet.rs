@@ -29,6 +29,7 @@ use transport::knock::{AccessKey, access_key, random_bytes};
 use transport::pairing::TrustStore;
 use transport::rendezvous::RendezvousId;
 
+use crate::dht::{DhtRendezvous, DhtView};
 use crate::rendezvous::{Rendezvous, ServerView};
 use crate::{Event, EventSink, Trust, from_hex, hex};
 
@@ -96,6 +97,8 @@ pub(crate) struct HostInternet {
     router: Router,
     /// The registration with the LanKVM server.
     rendezvous: Arc<Rendezvous>,
+    /// The notes for paired viewers on the BitTorrent DHT.
+    dht: Arc<DhtRendezvous>,
 }
 
 /// Asking the router to forward the port.
@@ -125,6 +128,7 @@ impl HostInternet {
         enabled: bool,
         public_address: String,
         rendezvous: Arc<Rendezvous>,
+        dht: Arc<DhtRendezvous>,
     ) -> Arc<Self> {
         Arc::new(Self {
             secret,
@@ -137,6 +141,7 @@ impl HostInternet {
             keys: Mutex::new(()),
             router: Router::default(),
             rendezvous,
+            dht,
         })
     }
 
@@ -168,6 +173,11 @@ impl HostInternet {
         self.rendezvous.set_host_enabled(on);
     }
 
+    /// Whether this Mac meets paired Macs through the BitTorrent DHT too.
+    pub(crate) fn set_dht(&self, on: bool) {
+        self.dht.set_enabled(on);
+    }
+
     /// The LanKVM server to register with while internet access is on ("host:port"; "" for
     /// none). True if the registration changed.
     pub(crate) fn set_rendezvous_server(&self, server: &str) -> bool {
@@ -185,13 +195,14 @@ impl HostInternet {
     }
 
     /// Lets in the knocks of every trusted viewer while internet access is on, and none while it
-    /// is off. Call whenever either changes.
+    /// is off, and keeps notes on the DHT for the same viewers. Call whenever either changes.
     pub(crate) fn sync_keys(&self) {
         let _one_at_a_time = self.keys.lock().unwrap();
-        let keys = self.enabled().then(|| {
+        let keys: Option<Vec<(Fingerprint, AccessKey)>> = self.enabled().then(|| {
             let viewers = self.trust.viewers.lock().unwrap();
             viewers.entries().iter().map(|(fp, _)| (*fp, self.access_key(fp))).collect()
         });
+        self.dht.set_viewers(keys.clone().unwrap_or_default());
         self.gate.set_keys(keys);
     }
 
@@ -285,7 +296,9 @@ impl HostInternet {
         addresses
     }
 
-    /// [`Self::announced_addresses`] on the internet only.
+    /// [`Self::announced_addresses`] on the internet only. (Not where DHT nodes see this Mac:
+    /// strangers say that, and a viewer knocks at every address it is told. That one goes only
+    /// into this Mac's sealed notes on the DHT, where a viewer looking there finds it.)
     fn internet_addresses(&self) -> Vec<String> {
         if !self.enabled() {
             return Vec::new();
@@ -299,10 +312,18 @@ impl HostInternet {
         addresses
     }
 
+    /// Where this Mac's DHT notes say it is, besides where DHT nodes see it: its addresses on
+    /// the internet that are IPs (the router's forwarded port, the public address set), then
+    /// those on its own network. Empty while internet access is off.
+    pub(crate) fn dht_addresses(&self) -> Vec<SocketAddr> {
+        self.announced_addresses().iter().filter_map(|a| with_port(a, self.port).parse().ok()).collect()
+    }
+
     pub(crate) fn view(&self) -> InternetView {
         let public_address = self.public_address.lock().unwrap().clone();
         let mut view = build_view(self.enabled(), self.map_state(), self.port, public_address, lan_address(), self.gate.stats().ignored);
         view.server = self.rendezvous.host_view();
+        view.dht = self.dht.view(self.enabled());
         view.announced = self.internet_addresses();
         view
     }
@@ -336,6 +357,8 @@ pub struct InternetView {
     pub ignored: u64,
     /// The LanKVM server that introduces paired Macs to this one.
     pub server: ServerView,
+    /// The BitTorrent DHT, through which paired Macs find this one with no server.
+    pub dht: DhtView,
 }
 
 fn build_view(
@@ -358,6 +381,7 @@ fn build_view(
         public_address,
         ignored,
         server: ServerView::default(),
+        dht: DhtView::default(),
     };
     if !enabled {
         return view;
@@ -642,9 +666,10 @@ impl InternetHosts {
     }
 
     /// Whether this Mac knows a way to try `host` over the internet: its LanKVM server, or an
-    /// address.
-    pub(crate) fn reachable(&self, host: &Fingerprint) -> bool {
-        self.hosts.get(host).is_some_and(|h| h.rendezvous.is_some() || !h.used.is_empty() || !h.announced.is_empty())
+    /// address; with `dht` (this Mac looks on the BitTorrent DHT), also its note there, when it
+    /// had internet access on last time (it said where it is on its network only then).
+    pub(crate) fn reachable(&self, host: &Fingerprint, dht: bool) -> bool {
+        self.hosts.get(host).is_some_and(|h| h.rendezvous.is_some() || !h.used.is_empty() || !h.announced.is_empty() || (dht && !h.lan.is_empty()))
     }
 
     /// How to reach `host` over the internet, if it gave this Mac a key.
@@ -838,7 +863,7 @@ mod tests {
         let server = Some(("178.156.129.211:3478".to_string(), [0x5a; 16]));
         assert!(hosts.set_announced(fp(1), key(1), Vec::new(), server.clone()));
         assert!(!hosts.set_announced(fp(1), key(1), Vec::new(), server.clone()), "nothing new");
-        assert!(hosts.reachable(&fp(1)), "through the server, with no address");
+        assert!(hosts.reachable(&fp(1), false), "through the server, with no address");
         assert_eq!(hosts.address(&fp(1)), None);
 
         let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -851,10 +876,17 @@ mod tests {
 
         // Internet access turned off there: no server any more.
         assert!(hosts.set_announced(fp(1), key(1), Vec::new(), None));
-        assert!(!hosts.reachable(&fp(1)));
+        assert!(!hosts.reachable(&fp(1), false));
+        assert!(!hosts.reachable(&fp(1), true), "nor through the DHT: its internet access is off");
+        // On with no server and nothing forwarded: it said where it is on its own network, so
+        // its internet access is on, and its note is on the DHT.
+        assert!(hosts.set_announced(fp(1), key(1), vec!["192.168.1.20:47800".into()], None));
+        assert!(!hosts.reachable(&fp(1), false));
+        assert!(hosts.reachable(&fp(1), true));
+        assert!(hosts.set_announced(fp(1), key(1), Vec::new(), None));
         let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(json[hex(&fp(1))].get("server").is_none(), "{json}");
-        assert!(!hosts.reachable(&fp(2)), "unknown");
+        assert!(!hosts.reachable(&fp(2), true), "unknown");
 
         // A file from before rendezvous loads, and an ID of the wrong size is left out.
         std::fs::write(&path, format!(r#"{{ "{}": {{ "key": "{}", "server": "a.example.com", "id": "5a5a" }} }}"#, hex(&fp(3)), hex(&key(3))))
@@ -882,7 +914,7 @@ mod tests {
         hosts.remember_used(&fp(1), "198.51.100.1");
         let way = hosts.way_to(&fp(1)).unwrap();
         assert_eq!(way.addresses, ["198.51.100.1", "Home.example.com:47800", "203.0.113.7:47800"]);
-        assert!(hosts.reachable(&fp(1)));
+        assert!(hosts.reachable(&fp(1), false));
         assert!(hosts.way_to(&fp(2)).is_none());
     }
 
@@ -1077,7 +1109,8 @@ mod tests {
             serde_json::json!({
                 "enabled": true, "state": "problem", "problem": "noResponse", "externalAddress": null, "routerAddress": null,
                 "localAddress": "192.168.1.20", "port": 47800, "publicAddress": "", "announced": [], "ignored": 3,
-                "server": { "address": "", "state": "off", "observed": null }
+                "server": { "address": "", "state": "off", "observed": null },
+                "dht": { "enabled": false, "state": "off", "observed": null, "symmetric": false, "nodes": 0 }
             })
         );
     }

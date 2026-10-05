@@ -38,7 +38,7 @@ struct MacRow: View {
             Button("Connect", action: connect)
                 .buttonStyle(SecondaryButtonStyle())
                 .disabled(!device.canConnect(device.connection))
-                .help(connectHelp(device))
+                .help(connectHelp(device, dht: core.host.internet.dht.enabled))
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 11)
@@ -64,8 +64,9 @@ struct MacRow: View {
     }
 }
 
-/// Connect's tooltip: the way it goes, or why there is none.
-func connectHelp(_ device: PairedDevice) -> String {
+/// Connect's tooltip: the way it goes, or why there is none. `dht`: this Mac looks for paired
+/// Macs on the BitTorrent DHT too.
+func connectHelp(_ device: PairedDevice, dht: Bool) -> String {
     let name = "“\(device.displayName)”"
     guard device.canConnect(device.connection) else {
         switch device.connection {
@@ -83,7 +84,10 @@ func connectHelp(_ device: PairedDevice) -> String {
     case .local:
         return "Connect to \(name) on the local network, at \(device.localAddress.map(shownAddress) ?? "its address there")"
     case .internet:
-        guard let address = device.internetAddress else { return "Connect to \(name) over the internet, through the LanKVM server" }
+        guard let address = device.internetAddress else {
+            return dht ? "Connect to \(name) over the internet, through the LanKVM server or the BitTorrent DHT"
+                : "Connect to \(name) over the internet, through the LanKVM server"
+        }
         return "Connect to \(name) over the internet (\(shownAddress(address)))"
     }
 }
@@ -91,6 +95,7 @@ func connectHelp(_ device: PairedDevice) -> String {
 /// A Mac's two addresses, on the local network and on the internet. The one its connection type
 /// leaves out is dimmed.
 struct MacAddresses: View {
+    @EnvironmentObject private var core: CoreModel
     let device: PairedDevice
 
     var body: some View {
@@ -99,12 +104,21 @@ struct MacAddresses: View {
                 .help(device.localAddress == nil
                     ? "Type its address in Connect once, on the same network: This Mac in LanKVM on that Mac shows it."
                     : "Where this Mac last reached it on the local network")
-            line("Internet", device.internetAddress.map(shownAddress), unknown: device.reachable ? "Through the LanKVM server" : "Not set up",
+            line("Internet", device.internetAddress.map(shownAddress), unknown: device.reachable ? foundThrough : "Not set up",
                  used: device.connection != .local)
                 .help(device.reachable
-                    ? "Where it was reached over the internet, or said to reach it. The LanKVM server finds it wherever it is."
+                    ? "Where it was reached over the internet, or said to reach it. \(findsIt)"
                     : "Turn on internet access on that Mac (This Mac in LanKVM), then connect to it once on the local network.")
         }
+    }
+
+    /// This Mac looks for paired Macs on the BitTorrent DHT too, when it's on.
+    private var dht: Bool { core.host.internet.dht.enabled }
+
+    private var foundThrough: String { dht ? "Through the server or the DHT" : "Through the LanKVM server" }
+
+    private var findsIt: String {
+        dht ? "The LanKVM server or the BitTorrent DHT finds it wherever it is." : "The LanKVM server finds it wherever it is."
     }
 
     private func line(_ label: String, _ address: String?, unknown: String, used: Bool) -> some View {

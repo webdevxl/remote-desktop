@@ -48,6 +48,11 @@ final class CoreModel: ObservableObject {
         case server
         /// The router didn't answer, and the LanKVM server doesn't either.
         case noServer
+        /// The router didn't answer and no LanKVM server is set, but paired Macs find this one
+        /// through the BitTorrent DHT.
+        case dht
+        /// The same, behind a router that gives each destination its own port.
+        case dhtSymmetric
     }
 
     /// Sample state for UI snapshots (`--snapshot`), without starting the network core.
@@ -126,6 +131,11 @@ final class CoreModel: ObservableObject {
         case .noServer:
             InternetStatus(enabled: true, state: .problem, problem: .noResponse, localAddress: "192.168.1.23",
                            server: InternetServer(address: sampleServer, state: .unreachable))
+        case .dht, .dhtSymmetric:
+            InternetStatus(enabled: true, state: .problem, problem: .noResponse, localAddress: "192.168.1.23", ignored: 3,
+                           server: InternetServer(address: "", state: .off),
+                           dht: InternetDHT(enabled: true, state: .listed, observed: "203.0.113.7:47800",
+                                            symmetric: sample == .dhtSymmetric, nodes: 212))
         }
     }
 
@@ -672,9 +682,16 @@ final class CoreModel: ObservableObject {
     }
 
     /// The LanKVM server ("host:port") that introduces paired Macs to this one over the internet.
-    /// "" turns it off: paired Macs then reach this Mac only through its router.
+    /// "" turns it off: paired Macs then find this Mac through the BitTorrent DHT, or its router.
     func setRendezvousServer(_ address: String) {
         lk_set_rendezvous_server(address)
+        refreshHost()
+    }
+
+    /// Whether this Mac uses the BitTorrent DHT: as host, to be found by paired Macs while
+    /// internet access is on; as viewer, to find them. No server takes part.
+    func setDHT(_ on: Bool) {
+        lk_set_dht(on)
         refreshHost()
     }
 

@@ -515,6 +515,15 @@ pub unsafe extern "C" fn lk_set_rendezvous_server(address: *const c_char) {
     }
 }
 
+/// Whether this Mac meets paired Macs through the BitTorrent DHT too, with no server: as a host
+/// while internet access is on, and as a viewer.
+#[unsafe(no_mangle)]
+pub extern "C" fn lk_set_dht(on: bool) {
+    if let Some(c) = core() {
+        c.set_dht(on);
+    }
+}
+
 /// Whether macOS lets LanKVM post input (Privacy & Security → Accessibility).
 #[unsafe(no_mangle)]
 pub extern "C" fn lk_control_permission() -> bool {

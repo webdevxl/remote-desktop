@@ -252,7 +252,7 @@ impl HostCtx {
                     ViewerView {
                         id: v.id,
                         name: v.name.clone(),
-                        address: addr.ip().to_string(),
+                        address: addr.ip().to_canonical().to_string(),
                         device_id: short_hex(&v.fingerprint),
                         controlling: v.controlling.load(Ordering::Acquire),
                         display_id,
@@ -266,7 +266,7 @@ impl HostCtx {
             pairing: status
                 .pairing
                 .iter()
-                .map(|p| PairPromptView { id: p.id, name: p.name.clone(), address: p.addr.ip().to_string(), pin: p.pin.clone() })
+                .map(|p| PairPromptView { id: p.id, name: p.name.clone(), address: p.addr.ip().to_canonical().to_string(), pin: p.pin.clone() })
                 .collect(),
             screen_capture_allowed,
             allow_control,
@@ -342,6 +342,20 @@ impl HostCtx {
             }
         }
         self.internet.set_public_address(address);
+        self.changed();
+    }
+
+    /// Whether this Mac meets paired Macs through the BitTorrent DHT too, as host and as viewer.
+    /// Sessions that came that way stay: they no longer depend on the DHT.
+    pub fn set_dht(&self, on: bool) {
+        {
+            let mut settings = self.settings.lock().unwrap();
+            settings.dht = on;
+            if let Err(e) = settings.save(&self.settings_path) {
+                tracing::warn!("save host settings: {e:#}");
+            }
+        }
+        self.internet.set_dht(on);
         self.changed();
     }
 

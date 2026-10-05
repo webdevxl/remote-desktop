@@ -161,6 +161,8 @@ void lk_set_internet_access(bool on);
 void lk_set_public_address(const char *address);
 // The LanKVM server ("host:port") that introduces paired Macs over the internet; "" turns the LanKVM server off.
 void lk_set_rendezvous_server(const char *address);
+// Whether this Mac meets paired Macs through the BitTorrent DHT too, with no server (as host and as viewer).
+void lk_set_dht(bool on);
 // Whether macOS lets LanKVM post input (Privacy & Security → Accessibility).
 bool lk_control_permission(void);
 // After installing or removing the LanKVM Microphone driver here: viewers learn whether they can

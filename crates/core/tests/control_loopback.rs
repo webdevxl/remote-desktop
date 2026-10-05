@@ -44,6 +44,7 @@ impl Peer {
             // Never the real LanKVM server.
             rendezvous: Some(String::new()),
             force_relay: false,
+            dht_bootstrap: Some(Vec::new()),
             // Never the user's clipboard.
             clipboard: ClipboardBackend::Off,
             // Never the user's microphone.
@@ -482,6 +483,7 @@ fn same_mac_control_is_refused_without_the_override() {
         // Never the real LanKVM server.
         rendezvous: Some(String::new()),
         force_relay: false,
+        dht_bootstrap: Some(Vec::new()),
         // Never the user's clipboard.
         clipboard: ClipboardBackend::Off,
         // Never the user's microphone.
@@ -510,6 +512,7 @@ fn start_host(dir: &Path, backend: Backend, ttl: Option<Duration>) -> Peer {
         // Never the real LanKVM server.
         rendezvous: Some(String::new()),
         force_relay: false,
+        dht_bootstrap: Some(Vec::new()),
         // Never the user's clipboard.
         clipboard: ClipboardBackend::Off,
         // Never the user's microphone.

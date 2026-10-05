@@ -51,6 +51,7 @@ impl Peer {
             loopback_is_internet: false,
             rendezvous: Some(rendezvous.to_string()),
             force_relay,
+            dht_bootstrap: Some(Vec::new()),
             // Never the user's clipboard.
             clipboard: ClipboardBackend::Off,
             // Never the user's microphone.
